@@ -1,0 +1,17 @@
+$ErrorActionPreference = 'Stop'
+
+$voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_voice_service.c"
+
+@(
+    @{ Pattern = 'static esp_err_t start_wss\(bool foreground_session\)'; Message = 'Voice service must expose a WSS startup helper that separates socket setup from a foreground conversation.' },
+    @{ Pattern = 'static void prewarm_wss\(void\)'; Message = 'Voice service must prewarm the WebSocket before a WakeNet event.' },
+    @{ Pattern = 'prewarm_wss\(\);'; Message = 'Voice initialization must prewarm the WebSocket while internal RAM is still contiguous.' },
+    @{ Pattern = 'if \(s_pending_wake\) \{[\s\S]*?send_detect\(false\);[\s\S]*?s_pending_wake = false;'; Message = 'Cloud hello must only start detection for a real pending wake word without streaming the wake-word tail.' },
+    @{ Pattern = 'start_wss\(true\)'; Message = 'A wake event must promote or create a foreground voice session.' },
+    @{ Pattern = 'start_wss\(false\)'; Message = 'Prewarm must not activate the voice UI or listening state.' },
+    @{ Pattern = 'if \(s_initialized && xiaozhi_activation_service_is_activated\(\)\) \{\s*s_prewarm_retry_us = esp_timer_get_time\(\) \+ XIAOZHI_PREWARM_RETRY_US;'; Message = 'A disconnected voice socket must retry in the background without refreshing credentials.' }
+) | ForEach-Object {
+    if ($voice -notmatch $_.Pattern) { throw $_.Message }
+}
+
+Write-Output 'WebSocket prewarm contract passed.'
