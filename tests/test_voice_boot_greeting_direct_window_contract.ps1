@@ -21,21 +21,17 @@ if ($enterFollowup -notmatch 'boot_greeting_window_active[\s\S]*?s_state\s*=\s*X
 if ($enterFollowup -notmatch 's_boot_greeting_direct_window_active\s*=\s*true;') {
     throw 'Initial boot greeting PCM drain must activate the 3-minute direct-reply window.'
 }
-if ($enterFollowup -notmatch 'boot greeting direct reply window remains active') {
-    throw 'Response TTS drain inside the boot-greeting window must log that the 3-minute window remains active.'
+if ($enterFollowup -notmatch 'boot greeting response PCM drained; direct reply window re-armed=15s') {
+    throw 'Response TTS drain inside the boot-greeting window must re-arm a fresh 15-second idle window.'
 }
-if ($enterFollowup -notmatch 'boot greeting direct window kept after response TTS') {
-    throw 'Response TTS drain inside the boot-greeting window must keep the 3-minute direct window visible in logs.'
+if ($enterFollowup -notmatch 's_boot_greeting_reply_deadline_us\s*=\s*esp_timer_get_time\(\)\s*\+\s*XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US') {
+    throw 'Response TTS drain inside the boot-greeting window must set a fresh reply deadline.'
 }
 
 $processText = Get-Block $voice 'static void process_text' 'static bool receive_uplink_frame'
-if ($processText -match 'if \(response_turn\) s_boot_greeting_reply_deadline_us\s*=\s*0;') {
-    throw 'Response TTS start must not blindly clear the boot-greeting 3-minute reply deadline.'
+if ($processText -notmatch 'if \(response_turn\) \{\s*s_boot_greeting_reply_deadline_us\s*=\s*0') {
+    throw 'Response TTS start must pause the idle-only boot-greeting reply deadline.'
 }
-if ($processText -notmatch 's_boot_greeting_direct_window_active') {
-    throw 'TTS start logic must preserve the boot-greeting window during response turns.'
-}
-
 $sessionTask = Get-Block $voice 'static void voice_session_task' 'static bool wait_for_prewarmed_wss'
 if ($sessionTask -notmatch 's_boot_greeting_direct_window_active\s*=\s*false;[\s\S]*?boot greeting reply window expired') {
     throw 'Boot-greeting direct window must clear only when the 3-minute deadline expires.'

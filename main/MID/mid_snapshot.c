@@ -51,6 +51,7 @@ void mid_snapshot_set_wifi(const wifi_snapshot_t *value) { SNAPSHOT_SET(wifi); }
 void mid_snapshot_set_bluetooth(const bluetooth_snapshot_t *value) { SNAPSHOT_SET(bluetooth); }
 void mid_snapshot_set_voice_activation(const voice_activation_snapshot_t *value) { SNAPSHOT_SET(voice_activation); }
 void mid_snapshot_set_voice_session(const voice_session_snapshot_t *value) { SNAPSHOT_SET(voice_session); }
+void mid_snapshot_set_timer(const timer_snapshot_t *value) { SNAPSHOT_SET(timer); }
 void mid_snapshot_set_time_weather(const time_weather_snapshot_t *value) { SNAPSHOT_SET(time_weather); }
 void mid_snapshot_set_startup_complete(bool complete)
 {

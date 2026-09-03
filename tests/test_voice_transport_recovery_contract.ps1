@@ -7,8 +7,8 @@ if ($voice -notmatch 'send_result\s*>\s*0') {
 if ($voice -notmatch 'voice turn transport failure') {
     throw 'Transport failure must identify the affected voice turn.'
 }
-if ($voice -notmatch 'voice turn ended after Opus transport failure; wake word required') {
-    throw 'A failed Opus packet must end the current turn and return to wake-word mode.'
+if ($voice -notmatch 'voice turn ended after Opus transport failure; requesting generated fallback prompt') {
+    throw 'A failed Opus packet must end the current turn and answer with the generated fallback prompt.'
 }
 if ($voice -notmatch 'discard_uplink_queue\(\)') {
     throw 'A failed turn must discard queued Opus packets before returning to wake mode.'

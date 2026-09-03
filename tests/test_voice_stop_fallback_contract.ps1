@@ -13,8 +13,8 @@ $terminalBlock = $voice.Substring($terminalStart, $finishStart - $terminalStart)
 if ($terminalBlock -notmatch '"bin-tail"' -or
     $terminalBlock -notmatch 's_uplink_tx_operation = "listen-stop"' -or
     $terminalBlock -notmatch 'send_listen_stop\(\)' -or
-    $terminalBlock -notmatch 'close_channel\(false\)') {
-    throw 'One terminal owner must send captured tails then listen/stop and close on either write failure.'
+    $terminalBlock -notmatch 'play_error_tone_then_close\(false\)') {
+    throw 'One terminal owner must send captured tails then listen/stop and answer with the error tone on either write failure.'
 }
 
 $sendPacketStart = $voice.IndexOf('static bool send_uplink_packet')

@@ -25,7 +25,7 @@ if ($ui -notmatch 'main_date = NULL' -or
     $ui -notmatch 'main_weather_text = NULL') {
     throw 'Date and weather labels must be created lazily from valid data.'
 }
-if ($ui -notmatch 'main date label created' -or
+if ($ui -notmatch 'main date labels created' -or
     $ui -notmatch 'main weather label created') {
     throw 'Lazy label creation must be observable in the runtime log.'
 }

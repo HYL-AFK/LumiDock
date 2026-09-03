@@ -23,12 +23,14 @@
 #include "stc_service.h"
 #include "startup_coordinator.h"
 #include "time_service.h"
+#include "timer_service.h"
 #include "weather_service.h"
 #include "wifi_service.h"
 #include "xiaozhi_activation_service.h"
 #include "xiaozhi_voice_service.h"
 #include "ui_service.h"
 #include "watchdog_service.h"
+#include "radio_stream_service.h"
 
 static const char *TAG = "app_manager";
 static SemaphoreHandle_t i2s_audio_driver_init_lock;
@@ -100,6 +102,8 @@ static void handle_button_long_press(void)
 static void handle_button_short_press(void)
 {
     ui_service_note_activity();
+    /* A short press silences a ringing timer (voice or key stop, per design). */
+    timer_service_stop_ringing();
 }
 #endif
 
@@ -308,6 +312,9 @@ esp_err_t app_manager_start(void)
     if ((err = weather_service_init()) != ESP_OK) ESP_LOGW(TAG, "weather init: %s", esp_err_to_name(err));
     if ((err = xiaozhi_activation_service_init()) != ESP_OK) {
         ESP_LOGW(TAG, "XiaoZhi activation init: %s", esp_err_to_name(err));
+    }
+    if ((err = radio_stream_service_init()) != ESP_OK) {
+        ESP_LOGW(TAG, "radio stream init: %s", esp_err_to_name(err));
     }
 #if !LUMIDOCK_AUDIO_TEST_ENABLED
     ESP_LOGI(TAG, "network/UI test profile: deferred audio services disabled");

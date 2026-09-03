@@ -16,12 +16,21 @@ static const char *TAG = "i2s_audio";
 /* esp_codec_dev stores the ES8311 I2C address in 8-bit wire form (0x30),
  * while the ESP-IDF master probe API takes a 7-bit address (0x18). */
 #define ES8311_I2C_ADDRESS_7BIT (ES8311_CODEC_DEFAULT_ADDR >> 1U)
-/* The bench module's ADC input clips at the reference project's 15 dB
- * setting. 6 dB improves normal follow-up speech while retaining headroom;
- * the PCM self-test records the result before WakeNet consumes the stream. */
-#define ES8311_MIC_INPUT_GAIN_DB 6.0f
-/* Requested product playback level; the amplifier path and microphone gain
- * remain unchanged. */
+/* The esp_codec_dev es8311 driver writes the raw gain enum (0-7) into the
+ * whole ADC_REG16 (0x16) register instead of shifting it into the gain
+ * field, which silently leaves the codec at minimum gain. The correct
+ * pattern is applied by a direct register write after the codec is open
+ * (see below). The dB macro stays for the esp_codec_dev API contract.
+ * Field-tested 0x16 patterns:
+ *  - 0x24: the driver's own open-time default (~18 dB step), working
+ *  - 0x02/0x04: written by the buggy gain path, minimum gain (too quiet)
+ *  - 0x28: community table "24 dB" pattern, but the ADC goes fully silent
+ *    (bit3 side effect) - do not use. */
+/* 麦克风输入增益的接口值；打开编解码器后还要写入校准过的 ADC_REG16。 */
+#define ES8311_MIC_INPUT_GAIN_DB 24.0f
+#define ES8311_ADC_REG16 0x16
+#define ES8311_MIC_GAIN_REG16_VALUE 0x24
+/* Requested product playback level; the amplifier path remains unchanged. */
 #define ES8311_OUTPUT_VOLUME_PERCENT 40.0f
 #define ES8311_MUTE_RETRY_COUNT 3U
 #define ES8311_MUTE_RETRY_DELAY_MS 5U
@@ -33,6 +42,7 @@ static i2s_chan_handle_t s_i2s_rx;
 static esp_codec_dev_handle_t s_codec;
 static bool s_ready;
 static bool s_output_muted = true;
+static float s_output_volume_percent = ES8311_OUTPUT_VOLUME_PERCENT;
 static SemaphoreHandle_t s_ctrl_lock;
 static SemaphoreHandle_t s_rx_lock;
 static SemaphoreHandle_t s_tx_lock;
@@ -146,6 +156,7 @@ static esp_err_t init_i2s_channels(void)
 {
     const i2s_chan_config_t channel_cfg =
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* 采集和播放共用 I2S0：GPIO8 读麦克风，GPIO7 输出到 ES8311 的 DIN。 */
     const i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(LUMIDOCK_AUDIO_SAMPLE_RATE_HZ),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
@@ -236,7 +247,7 @@ esp_err_t i2s_audio_driver_init(void)
          * GPIO7 is ES8311 DIN, not a power-amplifier enable line. */
         .pa_pin = GPIO_NUM_NC,
         .use_mclk = true,
-        /* The ZTS6216 microphone output is wired to ES8311 MIC1P. */
+        /* 板载 ZTS6216 麦克风接到 ES8311 的 MIC1P，使用模拟输入路径。 */
         .digital_mic = false,
     };
     const audio_codec_if_t *codec_if = es8311_codec_new(&es8311_cfg);
@@ -263,13 +274,20 @@ esp_err_t i2s_audio_driver_init(void)
         .channel = LUMIDOCK_AUDIO_CHANNELS,
         .bits_per_sample = LUMIDOCK_AUDIO_BITS_PER_SAMPLE,
     };
-    if ((err = esp_codec_dev_set_out_vol(s_codec, ES8311_OUTPUT_VOLUME_PERCENT)) != ESP_OK ||
+    if ((err = esp_codec_dev_set_out_vol(s_codec, s_output_volume_percent)) != ESP_OK ||
         (err = esp_codec_dev_set_in_gain(s_codec, ES8311_MIC_INPUT_GAIN_DB)) != ESP_OK ||
         (err = esp_codec_dev_open(s_codec, &pcm_format)) != ESP_OK) {
         ESP_LOGE(TAG, "ES8311 open failed: %s", esp_err_to_name(err));
         release_codec();
         release_i2s_channels();
         goto failed_locked;
+    }
+    /* esp_codec_dev_open re-applies the cached mic gain through
+     * es8311_set_mic_gain, which writes the raw enum into ADC_REG16 instead
+     * of the gain field; the codec would stay at minimum gain. Override it
+     * with the driver's own open-time default pattern (0x24, ~18 dB). */
+    if (esp_codec_dev_write_reg(s_codec, ES8311_ADC_REG16, ES8311_MIC_GAIN_REG16_VALUE) != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "ES8311 mic gain register write failed; speech pickup stays at minimum gain");
     }
     if (set_codec_output_mute_with_retry(true) != ESP_OK) {
         ESP_LOGE(TAG, "ES8311 initial output mute failed");
@@ -313,6 +331,26 @@ esp_err_t i2s_audio_driver_set_output_muted(bool muted)
     }
     if (s_ctrl_lock != NULL) xSemaphoreGive(s_ctrl_lock);
     return err;
+}
+
+esp_err_t i2s_audio_driver_set_output_volume(float percent)
+{
+    if (!s_ready || s_codec == NULL || percent < 0.0f || percent > 100.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_ctrl_lock != NULL) xSemaphoreTake(s_ctrl_lock, portMAX_DELAY);
+    const int result = esp_codec_dev_set_out_vol(s_codec, percent);
+    if (result == ESP_CODEC_DEV_OK) {
+        s_output_volume_percent = percent;
+        ESP_LOGI(TAG, "ES8311 output volume set: %.0f%%", (double)percent);
+    }
+    if (s_ctrl_lock != NULL) xSemaphoreGive(s_ctrl_lock);
+    return result == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
+}
+
+float i2s_audio_driver_get_output_volume(void)
+{
+    return s_output_volume_percent;
 }
 
 esp_err_t i2s_audio_driver_record(uint8_t *pcm, size_t pcm_bytes, size_t *bytes_read)

@@ -42,7 +42,9 @@ $cmake = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\CMakeLists.txt"
     @{ Content = $wifi; Pattern = 'provisioning_active = ble_provision_is_window_active'; Message = 'Wi-Fi service must publish the BluFi window state.' },
     @{ Content = $manager; Pattern = 'status_led_service_init\(\)'; Message = 'Status LED service must start in the current network/UI test profile.' },
     @{ Content = $cmake; Pattern = 'MID/system/status_led_service\.c'; Message = 'Status LED service must be compiled.' },
-    @{ Content = $cmake; Pattern = '(?m)^\s*esp_driver_rmt\s*$'; Message = 'The RMT driver component must be linked.' }
+    @{ Content = $cmake; Pattern = '(?m)^\s*esp_driver_rmt\s*$'; Message = 'The RMT driver component must be linked.' },
+    @{ Content = $service; Pattern = 'snapshot->voice_session\.state'; Message = 'Voice indication must branch on the snapshot voice sub-state.' },
+    @{ Content = $service; Pattern = 'case VOICE_UI_THINKING:[\s\S]*?case VOICE_UI_SPEAKING:[\s\S]*?case VOICE_UI_LISTENING:'; Message = 'The voice indication must distinguish thinking / speaking / listening.' }
 ) | ForEach-Object {
     if ($_.Content -notmatch $_.Pattern) { throw $_.Message }
 }

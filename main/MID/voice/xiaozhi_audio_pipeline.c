@@ -19,16 +19,40 @@
 
 #include "audio_playback_service.h"
 #include "i2s_audio_driver.h"
+#include "radio_stream_service.h"
 
 #define XIAOZHI_TTS_QUEUE_BYTES (24U * 1024U)
 #define XIAOZHI_TTS_PACKET_MAX_BYTES 2048U
-#define XIAOZHI_TTS_PREBUFFER_FRAMES 40U
+/* Deep prebuffer: the cloud TTS pauses up to ~3 s at sentence boundaries,
+ * so the playout must tolerate that gap without underrunning (see the
+ * 3.06 s sentence gap observed in field logs). */
+#define XIAOZHI_TTS_PREBUFFER_FRAMES 120U
 #define XIAOZHI_AFE_RINGBUF_FRAMES 50U
 #define PCM_FRAME_QUEUE_DEPTH 4U
 #define PCM_FRAME_MAX_BYTES 2048U
 #define AUDIO_CONTROL_QUEUE_DEPTH 8U
 #define VOICE_CODEC_STACK_BYTES (32U * 1024U)
 #define TTS_DECODE_LOG_INTERVAL_US (1000000LL)
+
+/* Energy gate against noise-triggered VAD starts. WebRTC VAD in MODE_0 is
+ * deliberately permissive because the ES8311 input level is low, so a VAD
+ * start is reported only when the peak of the last ~300 ms of microphone
+ * input clears a floor. Real speech clears it by a wide margin while the
+ * measured noise floor stays below it. Recalibrate this floor with the
+ * "AFE input: peak=" logs after the codec mic gain change takes effect:
+ * keep it at 2-3x the quiet-room peak. Field logs on this unit showed the
+ * ambient noise peaks reaching ~860 (838/863 observed) while real speech
+ * stays well above 1500 (VAD_DIRECT_REPLY_PEAK). Raise the floor to 800 so
+ * the noise band (<860) is gated out while real speech keeps a wide margin. */
+#define VAD_START_MIN_RECENT_PEAK 800U
+#define VAD_DIRECT_REPLY_PEAK 1500U
+#define VAD_RECENT_PEAK_SAMPLES 10U /* 10 x 32 ms feed chunks >= 300 ms window */
+/* Debounce against noise spikes: a VAD start is confirmed only after this
+ * many consecutive feed chunks whose current-frame peak clears the energy
+ * floor. A transient spike (1-3 chunks) resets the counter and is discarded,
+ * while real speech (hundreds of ms) always satisfies it; 4 chunks also
+ * rejects the measured multi-frame noise bursts. */
+#define VAD_START_CONFIRM_FRAMES 4U
 
 typedef enum {
     VOICE_AUDIO_CONTROL_START_STREAM = 0,
@@ -72,6 +96,7 @@ typedef struct {
     xiaozhi_vad_state_cb_t vad_cb;
     xiaozhi_opus_frame_cb_t opus_cb;
     xiaozhi_tts_playback_cb_t playback_cb;
+    xiaozhi_capture_complete_cb_t capture_complete_cb;
     void *callback_context;
     volatile bool initialized;
     volatile bool codec_ready;
@@ -87,6 +112,7 @@ typedef struct {
     volatile uint32_t silence_frames_pending;
     volatile uint32_t silence_frames_epoch;
     vad_state_t last_vad_state;
+    bool vad_high_energy_notified;
     uint8_t pcm_partial[PCM_FRAME_MAX_BYTES];
     size_t pcm_partial_len;
     size_t opus_pcm_bytes;
@@ -97,6 +123,25 @@ typedef struct {
     uint32_t tts_decode_failure_count;
     uint32_t tts_queue_full_count;
     bool tts_format_logged;
+    uint32_t capture_frames;
+    uint32_t capture_bytes;
+    uint32_t capture_cache_bytes;
+    uint64_t capture_energy;
+    uint32_t capture_peak;
+    int64_t capture_started_us;
+    /* Sliding window of recent feed peaks used to gate noise-triggered VAD
+     * starts; only the detect task reads it, only the feed task writes it. */
+    uint32_t vad_peak_window[VAD_RECENT_PEAK_SAMPLES];
+    uint32_t vad_peak_index;
+    /* Debounce counter: consecutive feed chunks whose current-frame peak clears
+     * the energy floor. Reset on any sub-threshold chunk so a lone noise spike
+     * cannot confirm a VAD start. Uses the instantaneous chunk peak rather
+     * than the sliding-window max, because a single spike pollutes the window
+     * max for ~300 ms and would otherwise fake a sustained high-energy run. */
+    uint16_t vad_high_energy_frames;
+    /* Latest instantaneous chunk peak, written by the feed task and read by
+     * the detect task to drive the debounce counter above. */
+    volatile uint32_t feed_peak_last;
 } xiaozhi_audio_pipeline_state_t;
 
 static const char *TAG = "xiaozhi_audio";
@@ -129,6 +174,28 @@ static void discard_pcm_frames(void)
     }
 }
 
+static void vad_peak_window_clear(void)
+{
+    memset(s_pipeline.vad_peak_window, 0, sizeof(s_pipeline.vad_peak_window));
+    s_pipeline.vad_peak_index = 0U;
+    s_pipeline.vad_high_energy_frames = 0U;
+}
+
+static void vad_peak_window_push(uint32_t peak)
+{
+    s_pipeline.vad_peak_window[s_pipeline.vad_peak_index % VAD_RECENT_PEAK_SAMPLES] = peak;
+    ++s_pipeline.vad_peak_index;
+}
+
+static uint32_t vad_peak_window_max(void)
+{
+    uint32_t peak = 0U;
+    for (uint32_t index = 0U; index < VAD_RECENT_PEAK_SAMPLES; ++index) {
+        if (s_pipeline.vad_peak_window[index] > peak) peak = s_pipeline.vad_peak_window[index];
+    }
+    return peak;
+}
+
 static void apply_audio_controls(void)
 {
     voice_audio_control_t control;
@@ -138,6 +205,14 @@ static void apply_audio_controls(void)
             s_pipeline.pcm_partial_len = 0U;
             s_pipeline.silence_frames_pending = 0U;
             s_pipeline.wake_latched = true;
+            s_pipeline.capture_frames = 0U;
+            s_pipeline.capture_bytes = 0U;
+            s_pipeline.capture_cache_bytes = 0U;
+            s_pipeline.capture_energy = 0U;
+            s_pipeline.capture_peak = 0U;
+            s_pipeline.capture_started_us = esp_timer_get_time();
+            s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
             discard_pcm_frames();
             if (s_pipeline.afe != NULL && s_pipeline.afe_data != NULL) {
                 s_pipeline.afe->reset_buffer(s_pipeline.afe_data);
@@ -152,7 +227,39 @@ static void apply_audio_controls(void)
             s_pipeline.streaming = false;
             s_pipeline.wake_latched = false;
             s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
+            vad_peak_window_clear();
             s_pipeline.pcm_partial_len = 0U;
+            const int64_t capture_duration_us = s_pipeline.capture_started_us > 0
+                                                    ? esp_timer_get_time() - s_pipeline.capture_started_us : 0;
+            const uint32_t capture_rms = s_pipeline.capture_frames > 0U
+                                             ? (uint32_t)sqrt((double)s_pipeline.capture_energy /
+                                                              (double)s_pipeline.capture_frames /
+                                                              (double)(s_pipeline.afe != NULL && s_pipeline.afe_data != NULL
+                                                                          ? s_pipeline.afe->get_feed_chunksize(s_pipeline.afe_data) : 1))
+                                             : 0U;
+            ESP_LOGI(TAG, "capture diagnostics: duration_us=%lld frames=%u bytes=%u cache_bytes=%u rms=%u peak=%u",
+                     (long long)capture_duration_us, (unsigned)s_pipeline.capture_frames,
+                     (unsigned)s_pipeline.capture_bytes, (unsigned)s_pipeline.capture_cache_bytes,
+                     (unsigned)capture_rms, (unsigned)s_pipeline.capture_peak);
+            if (s_pipeline.capture_frames < 4U) {
+                ESP_LOGW(TAG, "capture_short: frames=%u duration_us=%lld",
+                         (unsigned)s_pipeline.capture_frames, (long long)capture_duration_us);
+            }
+            if (capture_rms < 100U) {
+                ESP_LOGW(TAG, "capture_low_level: rms=%u peak=%u",
+                         (unsigned)capture_rms, (unsigned)s_pipeline.capture_peak);
+            }
+            if (s_pipeline.capture_frames > 0U && s_pipeline.capture_complete_cb != NULL) {
+                s_pipeline.capture_complete_cb(capture_rms, s_pipeline.capture_peak,
+                                                s_pipeline.capture_frames, capture_duration_us,
+                                                s_pipeline.callback_context);
+            }
+            if (s_pipeline.capture_peak >= 30000U) {
+                ESP_LOGW(TAG, "capture_clipping_risk: peak=%u threshold=30000",
+                         (unsigned)s_pipeline.capture_peak);
+            }
+            s_pipeline.capture_started_us = 0;
             s_pipeline.silence_frames_pending = 0U;
             ++s_pipeline.stream_epoch;
             discard_pcm_frames();
@@ -165,6 +272,9 @@ static void apply_audio_controls(void)
             s_pipeline.detect_paused = false;
             s_pipeline.streaming = false;
             s_pipeline.wake_latched = true;
+            s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
+            vad_peak_window_clear();
             s_pipeline.pcm_partial_len = 0U;
             ++s_pipeline.stream_epoch;
             discard_pcm_frames();
@@ -175,6 +285,9 @@ static void apply_audio_controls(void)
             break;
         case VOICE_AUDIO_CONTROL_RESET_AFTER_SILENCE:
             s_pipeline.detect_paused = false;
+            s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
+            vad_peak_window_clear();
             s_pipeline.pcm_partial_len = 0U;
             s_pipeline.silence_frames_pending = 0U;
             discard_pcm_frames();
@@ -188,6 +301,8 @@ static void apply_audio_controls(void)
             s_pipeline.streaming = false;
             s_pipeline.wake_latched = true;
             s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
+            vad_peak_window_clear();
             s_pipeline.pcm_partial_len = 0U;
             discard_pcm_frames();
             if (s_pipeline.afe != NULL && s_pipeline.afe_data != NULL) {
@@ -200,6 +315,8 @@ static void apply_audio_controls(void)
             s_pipeline.streaming = false;
             s_pipeline.wake_latched = false;
             s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
+            vad_peak_window_clear();
             s_pipeline.pcm_partial_len = 0U;
             s_pipeline.silence_frames_pending = 0U;
             discard_pcm_frames();
@@ -268,20 +385,31 @@ static void audio_feed_task(void *arg)
              (unsigned)bytes);
     for (;;) {
         if (i2s_audio_driver_record((uint8_t *)microphone, bytes, NULL) == ESP_OK) {
+            /* Compute one pass of energy/peak for every chunk so the VAD
+             * energy gate sees fresh input even when capture is paused. */
+            uint64_t feed_energy = 0U;
+            uint32_t feed_peak = 0U;
+            const size_t samples = bytes / sizeof(*microphone);
+            for (size_t index = 0; index < samples; ++index) {
+                const int32_t sample = microphone[index];
+                const uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
+                feed_energy += (uint64_t)magnitude * magnitude;
+                if (magnitude > feed_peak) feed_peak = magnitude;
+            }
+            vad_peak_window_push(feed_peak);
+            s_pipeline.feed_peak_last = feed_peak;
+            if (s_pipeline.streaming) {
+                ++s_pipeline.capture_frames;
+                s_pipeline.capture_bytes += (uint32_t)bytes;
+                s_pipeline.capture_energy += feed_energy;
+                if (feed_peak > s_pipeline.capture_peak) s_pipeline.capture_peak = feed_peak;
+            }
             const int accepted = s_pipeline.afe->feed(s_pipeline.afe_data, microphone);
             const int64_t now_us = esp_timer_get_time();
             if (now_us - last_input_diagnostic_us >= 1000000LL) {
-                uint64_t energy = 0;
-                uint32_t peak = 0;
-                for (size_t index = 0; index < bytes / sizeof(*microphone); ++index) {
-                    const int32_t sample = microphone[index];
-                    const uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
-                    energy += (uint64_t)magnitude * magnitude;
-                    if (magnitude > peak) peak = magnitude;
-                }
                 ESP_LOGI(TAG, "AFE input: rms=%u peak=%u feed=%d/%u",
-                         (unsigned)sqrt((double)energy / (double)(bytes / sizeof(*microphone))),
-                         (unsigned)peak, accepted, (unsigned)bytes);
+                         (unsigned)sqrt((double)feed_energy / (double)samples),
+                         (unsigned)feed_peak, accepted, (unsigned)bytes);
                 last_input_diagnostic_us = now_us;
             }
         }
@@ -314,22 +442,71 @@ static void audio_detect_task(void *arg)
                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
             last_afe_diagnostic_us = now_us;
         }
+        /* Wake word stays armed during TTS playback so the user can abort a
+         * long answer.  Wakenet applies its own post-detection cooldown, so a
+         * single detection cannot re-trigger the callback continuously.
+         * VAD below still pauses during playback to keep the speaker echo
+         * from self-triggering speech capture. */
         if (result->wakeup_state == WAKENET_DETECTED) {
-            if (s_pipeline.detect_paused) continue;
             s_pipeline.wake_latched = true;
             s_pipeline.last_vad_state = VAD_SILENCE;
+            s_pipeline.vad_high_energy_notified = false;
             if (s_pipeline.wake_cb != NULL) s_pipeline.wake_cb(s_pipeline.callback_context);
         }
         if (s_pipeline.detect_paused) continue;
         if (!s_pipeline.wake_latched) continue;
+        const bool vad_speech = result->vad_state == VAD_SPEECH;
+        const uint32_t recent_peak = vad_speech ? vad_peak_window_max() : 0U;
+
+        /* Debounce noise-triggered starts using the current frame's peak, not
+         * the sliding-window max (a lone spike would pollute the window max for
+         * ~300 ms and fake a sustained run). A transient spike resets the
+         * counter; real speech always spans enough chunks to confirm. */
+        if (vad_speech && s_pipeline.feed_peak_last >= VAD_START_MIN_RECENT_PEAK) {
+            if (s_pipeline.vad_high_energy_frames < VAD_START_CONFIRM_FRAMES) {
+                ++s_pipeline.vad_high_energy_frames;
+            }
+        } else {
+            s_pipeline.vad_high_energy_frames = 0U;
+        }
+        const bool vad_confirmed = vad_speech &&
+                                   s_pipeline.vad_high_energy_frames >= VAD_START_CONFIRM_FRAMES;
+
         if (result->vad_state != s_pipeline.last_vad_state) {
+            if (vad_speech && recent_peak < VAD_START_MIN_RECENT_PEAK) {
+                /* Keep last_vad_state unchanged so a louder burst later
+                 * in the same speech segment can still open the gate. */
+                ESP_LOGI(TAG, "VAD start gated by energy: recent_peak=%u threshold=%u",
+                         (unsigned)recent_peak, (unsigned)VAD_START_MIN_RECENT_PEAK);
+                continue;
+            }
+            if (vad_speech && !vad_confirmed) {
+                ESP_LOGI(TAG, "VAD start gated by debounce: frames=%u/%u peak=%u",
+                         (unsigned)s_pipeline.vad_high_energy_frames,
+                         (unsigned)VAD_START_CONFIRM_FRAMES,
+                         (unsigned)s_pipeline.feed_peak_last);
+                continue;
+            }
             s_pipeline.last_vad_state = result->vad_state;
+            s_pipeline.vad_high_energy_notified = vad_speech &&
+                                                   recent_peak >= VAD_DIRECT_REPLY_PEAK;
             if (s_pipeline.vad_cb != NULL) {
-                s_pipeline.vad_cb(result->vad_state == VAD_SPEECH, s_pipeline.callback_context);
+                s_pipeline.vad_cb(result->vad_state == VAD_SPEECH, recent_peak,
+                                  s_pipeline.callback_context);
+            }
+        } else if (vad_speech && !s_pipeline.vad_high_energy_notified &&
+                   recent_peak >= VAD_DIRECT_REPLY_PEAK) {
+            /* Echo may put AFE into VAD_SPEECH before the user begins
+             * talking. Emit one high-energy edge so the post-TTS gate can
+             * accept real speech without waiting for that echo to end. */
+            s_pipeline.vad_high_energy_notified = true;
+            if (s_pipeline.vad_cb != NULL) {
+                s_pipeline.vad_cb(true, recent_peak, s_pipeline.callback_context);
             }
         }
         if (!s_pipeline.streaming || result->vad_state != VAD_SPEECH) continue;
         if (result->vad_cache_size > 0) {
+            s_pipeline.capture_cache_bytes += (uint32_t)result->vad_cache_size;
             append_afe_pcm((const uint8_t *)result->vad_cache, (size_t)result->vad_cache_size);
         }
         if (result->data_size > 0) {
@@ -342,6 +519,15 @@ static void playout_event(audio_playback_event_t event, audio_playback_source_t 
                           uint32_t epoch, void *context)
 {
     (void)context;
+    if (source == AUDIO_PLAYOUT_SOURCE_ERROR_TONE) {
+        /* The local error tone is not TTS: only its completion matters, and
+         * it is forwarded so the voice service can close the failed turn. */
+        if (event == AUDIO_PLAYOUT_EVENT_FINISHED && s_pipeline.playback_cb != NULL) {
+            s_pipeline.playback_cb(XIAOZHI_ERROR_TONE_PLAYBACK_FINISHED, epoch,
+                                   s_pipeline.callback_context);
+        }
+        return;
+    }
     if (source != AUDIO_PLAYOUT_SOURCE_TTS || s_pipeline.playback_cb == NULL) return;
     xiaozhi_tts_playback_event_t pipeline_event = XIAOZHI_TTS_PLAYBACK_STARTED;
     if (event == AUDIO_PLAYOUT_EVENT_FINISHED) pipeline_event = XIAOZHI_TTS_PLAYBACK_FINISHED;
@@ -558,7 +744,7 @@ static esp_err_t init_afe(void)
      * microphone level needs normal sensitivity for post-TTS questions. */
     config->vad_mode = VAD_MODE_0;
     config->vad_min_speech_ms = 128;
-    config->vad_min_noise_ms = 1000;
+    config->vad_min_noise_ms = 1500;
     config->wakenet_init = true;
     config->wakenet_mode = DET_MODE_90;
     config->afe_ringbuf_size = XIAOZHI_AFE_RINGBUF_FRAMES;
@@ -628,6 +814,7 @@ esp_err_t xiaozhi_audio_pipeline_init(xiaozhi_wake_word_cb_t wake_cb,
                                       xiaozhi_vad_state_cb_t vad_cb,
                                       xiaozhi_opus_frame_cb_t opus_cb,
                                       xiaozhi_tts_playback_cb_t playback_cb,
+                                      xiaozhi_capture_complete_cb_t capture_complete_cb,
                                       void *context)
 {
     if (s_pipeline.initialized) return ESP_OK;
@@ -642,6 +829,7 @@ esp_err_t xiaozhi_audio_pipeline_init(xiaozhi_wake_word_cb_t wake_cb,
     s_pipeline.vad_cb = vad_cb;
     s_pipeline.opus_cb = opus_cb;
     s_pipeline.playback_cb = playback_cb;
+    s_pipeline.capture_complete_cb = capture_complete_cb;
     s_pipeline.callback_context = context;
     s_pipeline.last_vad_state = VAD_SILENCE;
     s_pipeline.pcm_frames = xQueueCreateWithCaps(PCM_FRAME_QUEUE_DEPTH, sizeof(pcm_frame_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -753,6 +941,9 @@ esp_err_t xiaozhi_audio_pipeline_begin_tts_playback(uint32_t *epoch)
 {
     if (!s_pipeline.initialized || s_pipeline.playback_lock == NULL) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_pipeline.playback_lock, portMAX_DELAY);
+    /* TTS has priority over the radio.  The selected product behavior keeps
+     * the radio stopped after the answer, so it cannot resume unexpectedly. */
+    (void)radio_stream_service_stop();
     discard_tts_queue();
     ++s_pipeline.playback_epoch;
     if (s_pipeline.playback_epoch == 0U) ++s_pipeline.playback_epoch;
@@ -776,6 +967,11 @@ esp_err_t xiaozhi_audio_pipeline_begin_tts_playback(uint32_t *epoch)
 void xiaozhi_audio_pipeline_resume_after_playback(void)
 {
     (void)post_control(VOICE_AUDIO_CONTROL_RESUME_AFTER_PLAYBACK);
+}
+
+void xiaozhi_audio_pipeline_pause_detect(void)
+{
+    (void)post_control(VOICE_AUDIO_CONTROL_PAUSE_DETECT);
 }
 
 esp_err_t xiaozhi_audio_pipeline_enqueue_tts_opus(const uint8_t *opus, size_t opus_bytes)

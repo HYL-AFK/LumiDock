@@ -11,7 +11,7 @@ function Get-Block($content, $startNeedle, $endNeedle) {
 }
 
 $enterFollowup = Get-Block $voice 'static void enter_followup_after_playback(void)' 'static esp_err_t start_wss'
-if ($enterFollowup -notmatch 's_wait_for_turn_silence\s*=\s*true;') {
+if ($enterFollowup -notmatch 'arm_post_playback_silence_gate\(\);') {
     throw 'Playback drain must arm a post-playback silence gate before accepting follow-up speech.'
 }
 if ($enterFollowup -match 's_wait_for_turn_silence\s*=\s*false;') {
@@ -34,8 +34,8 @@ if ($vadEnd -notmatch 's_wait_for_turn_silence[\s\S]*?s_wait_for_turn_silence\s*
     throw 'VAD_END must clear the post-playback silence gate, reset AFE baseline, and log readiness.'
 }
 
-if ($voice -notmatch '#define XIAOZHI_WAIT_RESPONSE_TIMEOUT_US \(10LL \* 1000LL \* 1000LL\)') {
-    throw 'WAIT_RESPONSE must use the 10 second bounded cloud response timeout from the known-good baseline.'
+if ($voice -notmatch '#define XIAOZHI_WAIT_RESPONSE_TIMEOUT_US \(15LL \* 1000LL \* 1000LL\)') {
+    throw 'WAIT_RESPONSE must use the 15 second bounded cloud response timeout.'
 }
 if ($voice -notmatch 'static int64_t s_response_deadline_us;') {
     throw 'Voice service must track a response deadline while waiting for cloud TTS.'
@@ -62,8 +62,41 @@ if ($processText -notmatch 'strcmp\(type->valuestring, "stt"\)[\s\S]*?s_response
 }
 
 $sessionTask = Get-Block $voice 'static void voice_session_task' 'static bool wait_for_prewarmed_wss'
-if ($sessionTask -notmatch 's_state\s*==\s*XIAOZHI_VOICE_WAIT_RESPONSE[\s\S]*?s_response_deadline_us[\s\S]*?cloud response timeout[\s\S]*?close_channel\(false\)') {
-    throw 'WAIT_RESPONSE timeout must publish an error through close_channel(false) and recover to wake state.'
+if ($sessionTask -notmatch 's_state\s*==\s*XIAOZHI_VOICE_WAIT_RESPONSE[\s\S]*?s_response_deadline_us\s*=\s*0;[\s\S]*?cloud data acquisition timeout; requesting generated timeout prompt[\s\S]*?request_cloud_timeout_prompt\(\)') {
+    throw 'Cloud data acquisition timeout must request a cloud-spoken timeout prompt.'
+}
+if ($sessionTask -notmatch 'play_error_tone_then_close\(true\);') {
+    throw 'WAIT_RESPONSE timeout with an unusable WSS must answer with the local error tone before closing.'
+}
+if ($sessionTask -notmatch 'cloud prompt timeout: stage=%s turn=%u; retrying once then playing the local error tone') {
+    throw 'A timed-out cloud prompt must be logged before the retry/error-tone decision.'
+}
+if ($sessionTask -notmatch 's_exit_prompt_retried\s*=\s*true;[\s\S]*?retried\s*=\s*request_cloud_exit_prompt\(\);') {
+    throw 'A timed-out exit prompt must be retried once via request_cloud_exit_prompt.'
+}
+if ($sessionTask -notmatch 's_timeout_prompt_retried\s*=\s*true;[\s\S]*?retried\s*=\s*request_cloud_timeout_prompt\(\);') {
+    throw 'A timed-out timeout prompt must be retried once via request_cloud_timeout_prompt.'
+}
+if ($sessionTask -notmatch 'if \(!retried\) \{[\s\S]*?play_error_tone_then_close\(true\);') {
+    throw 'A prompt timeout that cannot be retried must answer with the local error tone instead of bouncing back to the main page.'
+}
+if ($voice -notmatch 'static bool s_exit_prompt_retried;[\s\S]*?static bool s_timeout_prompt_retried;[\s\S]*?static bool s_fallback_prompt_retried;') {
+    throw 'Each prompt kind must keep a dedicated one-shot retry flag.'
+}
+if ($closeChannel -notmatch 's_exit_prompt_retried\s*=\s*false;[\s\S]*?s_timeout_prompt_retried\s*=\s*false;[\s\S]*?s_fallback_prompt_retried\s*=\s*false;') {
+    throw 'Closing a voice channel must reset all prompt retry flags.'
+}
+if ($voice -match 'XIAOZHI_TIMEOUT_UI_HOLD_US|s_timeout_ui_deadline_us|returning to main after 5s') {
+    throw 'The five second timeout hold that bounced back to the main page must be removed.'
+}
+if ($voice -notmatch 'audio_playback_service_begin\(AUDIO_PLAYOUT_SOURCE_ERROR_TONE') {
+    throw 'The failed turn must play the local error tone through the shared playout.'
+}
+if ($voice -notmatch 'VOICE_EVENT_ERROR_TONE_FINISHED') {
+    throw 'The error tone completion must reach the session task as a dedicated event.'
+}
+if ($voice -notmatch 'audio_playback_service_abort\(AUDIO_PLAYOUT_SOURCE_ERROR_TONE, s_error_tone_epoch\);') {
+    throw 'Closing the session must silence an unfinished local error tone.'
 }
 
 $beginChannel = Get-Block $voice 'static void begin_channel(void)' 'static void process_text'

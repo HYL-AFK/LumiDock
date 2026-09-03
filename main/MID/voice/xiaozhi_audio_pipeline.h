@@ -7,12 +7,19 @@
 #include "esp_err.h"
 
 typedef void (*xiaozhi_wake_word_cb_t)(void *context);
-typedef void (*xiaozhi_vad_state_cb_t)(bool speech, void *context);
+/* recent_peak is the maximum absolute PCM value observed immediately before
+ * the VAD edge.  It lets the session state machine distinguish user speech
+ * from the low-level tail left by speaker playback. */
+typedef void (*xiaozhi_vad_state_cb_t)(bool speech, uint32_t recent_peak, void *context);
+typedef void (*xiaozhi_capture_complete_cb_t)(uint32_t rms, uint32_t peak,
+                                              uint32_t frames, int64_t duration_us,
+                                              void *context);
 typedef void (*xiaozhi_opus_frame_cb_t)(const uint8_t *opus, size_t opus_bytes, void *context);
 typedef enum {
     XIAOZHI_TTS_PLAYBACK_STARTED = 0,
     XIAOZHI_TTS_PLAYBACK_FINISHED,
     XIAOZHI_TTS_PLAYBACK_UNDERRUN,
+    XIAOZHI_ERROR_TONE_PLAYBACK_FINISHED,
 } xiaozhi_tts_playback_event_t;
 typedef void (*xiaozhi_tts_playback_cb_t)(xiaozhi_tts_playback_event_t event,
                                           uint32_t epoch, void *context);
@@ -23,6 +30,7 @@ esp_err_t xiaozhi_audio_pipeline_init(xiaozhi_wake_word_cb_t wake_cb,
                                       xiaozhi_vad_state_cb_t vad_cb,
                                       xiaozhi_opus_frame_cb_t opus_cb,
                                       xiaozhi_tts_playback_cb_t playback_cb,
+                                      xiaozhi_capture_complete_cb_t capture_complete_cb,
                                       void *context);
 /* Opens the Opus encoder before WSS/TLS and AFE allocations fragment the
  * internal heap. The encode task itself is still created on demand in PSRAM. */
@@ -41,6 +49,9 @@ void xiaozhi_audio_pipeline_reset_after_silence(void);
 void xiaozhi_audio_pipeline_reset_after_transport_failure(void);
 void xiaozhi_audio_pipeline_abort_playback(void);
 void xiaozhi_audio_pipeline_finish_playback(void);
+/* Pauses AFE/VAD detection while keeping WakeNet armed (the timer chime
+ * plays through the shared playout).  Call resume_after_playback to restore. */
+void xiaozhi_audio_pipeline_pause_detect(void);
 esp_err_t xiaozhi_audio_pipeline_begin_tts_playback(uint32_t *epoch);
 void xiaozhi_audio_pipeline_resume_after_playback(void);
 esp_err_t xiaozhi_audio_pipeline_enqueue_tts_opus(const uint8_t *opus, size_t opus_bytes);

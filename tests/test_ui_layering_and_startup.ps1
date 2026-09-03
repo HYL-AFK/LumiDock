@@ -135,13 +135,13 @@ if ($ui -match 'LV_OPA_35') {
 if ($ui -notmatch 'UI_BOOT_MIN_DURATION_US' -or
     $ui -notmatch 'UI_BOOT_MAX_DURATION_US' -or
     $ui -notmatch 'boot_started_us' -or
-    $ui -notmatch 'UI boot complete -> main') {
-    throw 'The startup page must use a monotonic 5-8 second window and log its transition to the main page.'
+    $ui -notmatch 'UI boot complete -> network decision') {
+    throw 'The startup page must use a monotonic window and log its transition to the network decision.'
 }
 if ($ui -notmatch 'UI_BOOT_FADE_OUT_US \(80000LL\)' -or
     $ui -notmatch 'UI_BOOT_FADE_IN_US \(160000LL\)' -or
-    $ui -notmatch 'UI_BOOT_TRANSITION_WAIT_MAIN_FRAME' -or
-    $ui -notmatch 'main first frame flushed' -or
+    $ui -notmatch 'UI_BOOT_TRANSITION_WAIT_NETWORK_FRAME' -or
+    $ui -notmatch 'network first frame flushed' -or
     $ui -notmatch 'boot transition fade in complete' -or
     $ui -notmatch 'st7789_fade_backlight_percent\(0U' -or
     $ui -notmatch 'st7789_fade_backlight_percent\(100U') {
@@ -158,19 +158,19 @@ if ($ui -notmatch 'ui_time_font_64' -or
     $ui -notmatch 'layout_main_weather_group') {
     throw 'The main page must use the fixed time font and dynamically lay out the compact weather label.'
 }
-if ($ui -notmatch 'lv_obj_align\(s_scene\.main_time, LV_ALIGN_TOP_MID, 0, 29\)') {
-    throw 'The main time must use a 29px top inset.'
+if ($ui -notmatch 'lv_obj_set_style_translate_y\(s_scene\.main_time, 14, 0\)') {
+    throw 'The main time must keep its 14px vertical offset within the header flex row.'
 }
 if ($ui -notmatch 'lv_obj_set_pos\(s_scene\.main_weather_layer, 0, 0\)') {
     throw 'The weather background must cover the full screen behind the status bar.'
 }
 $clearWeather = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\assets\ui\weather_clear_scene.svg"
 $rainWeather = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\assets\ui\weather_rain_scene.svg"
-if ($clearWeather -notmatch 'circle cx="82" cy="39"') {
-    throw 'The clear-weather illustration must move 8px left without moving the full background.'
+if ($clearWeather -match 'circle cx="82" cy="39"') {
+    throw 'The clear-weather scene must not embed the sun illustration; it lives in the iconfont layer.'
 }
-if ($rainWeather -notmatch 'translate\(-78 90\)') {
-    throw 'The rain-weather illustration must move 8px left inside its full-width background.'
+if ($rainWeather -match 'translate\(-78 90\)') {
+    throw 'The rain-weather scene must not embed the old translated illustration group.'
 }
 if ($ui -notmatch 'UI_PAGE_CHARGING' -or
     $ui -notmatch 'UI_PAGE_STANDBY' -or
@@ -187,17 +187,15 @@ if ($snapshotHeader -notmatch 'mid_snapshot_read_acquire' -or
     $snapshotSource -notmatch 'mid_snapshot_read_release') {
     throw 'The UI must be able to use a protected read-only snapshot pointer.'
 }
-if ($ui -notmatch 'mid_snapshot_read_acquire\(&snapshot\)' -or
-    $ui -match 'mid_snapshot_get\(&snapshot\)') {
-    throw 'The UI task must read snapshots through the protected pointer interface.'
+if ($ui -notmatch 'lumidock_snapshot_t\s+snapshot_copy' -or
+    $ui -notmatch 'mid_snapshot_get\(&snapshot_copy\)') {
+    throw 'The UI task must copy snapshots before rendering.'
 }
-if ($ui.IndexOf('update_boot_page()') -gt $ui.IndexOf('mid_snapshot_read_acquire(&snapshot)')) {
-    throw 'The startup animation frame must advance before attempting to acquire the snapshot pointer.'
+if ($ui -match 'snapshot read unavailable; skipping UI data frame') {
+    throw 'The UI must not skip an entire data frame when snapshot writers are active.'
 }
-if ($ui -notmatch 'snapshot read unavailable; skipping UI data frame') {
-    throw 'The UI must log a skipped data frame instead of blocking on an unavailable snapshot.'
-}
-if ($ui -notmatch 'if \(s_scene\.page == UI_PAGE_BOOT\) return;') {
+if ($ui -notmatch 'if \(s_scene\.page == UI_PAGE_BOOT\)' -or
+    $ui -notmatch 'update_boot_page\(now_us\)') {
     throw 'Incoming snapshots must not replace the startup page before its complete animation duration.'
 }
 if ($manager.IndexOf('watchdog_service_init()') -gt $manager.IndexOf('ui_service_init()')) {
@@ -207,7 +205,7 @@ if ($ui -match 'lv_obj_invalidate\(lv_screen_active\(\)\)' -or
     $ui -match 'lv_refr_now\(s_display\)') {
     throw 'Page transitions must not force a synchronous full-screen refresh.'
 }
-if ($ui -notmatch 's_scene\.main_time = make_label\(s_scene\.main_page, "00:00",' -or
+if ($ui -notmatch 's_scene\.main_time = make_label\(s_scene\.main_header_group, "00:00",' -or
     $ui -notmatch 's_scene\.main_temperature = make_label\(s_scene\.main_page, "0°",') {
     throw 'Offline main-page UI placeholders must use 00:00 and 0 degrees instead of dashes.'
 }

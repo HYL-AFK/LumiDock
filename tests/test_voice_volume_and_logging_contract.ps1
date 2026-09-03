@@ -5,7 +5,7 @@ $voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_
 
 @(
     @{ Content = $driver; Pattern = '#define ES8311_OUTPUT_VOLUME_PERCENT 40\.0f'; Message = 'ES8311 playback must use the requested 40 percent codec-volume target.' },
-    @{ Content = $driver; Pattern = 'esp_codec_dev_set_out_vol\(s_codec, ES8311_OUTPUT_VOLUME_PERCENT\)'; Message = 'The codec must use the named conservative output volume constant.' },
+    @{ Content = $driver; Pattern = 'esp_codec_dev_set_out_vol\(s_codec, s_output_volume_percent\)'; Message = 'The codec must use the runtime output volume value.' },
     @{ Content = $driver; Pattern = 'output %.0f%%, muted'; Message = 'Codec startup log must identify the configured output volume.' },
     @{ Content = $voice; Pattern = 'voice uplink: frames=%u bytes=%u'; Message = 'Voice service must report rate-limited Opus uplink frame and byte totals.' },
     @{ Content = $voice; Pattern = 'cloud TTS: frames=%u bytes=%u'; Message = 'Voice service must report rate-limited cloud TTS frame and byte totals.' },

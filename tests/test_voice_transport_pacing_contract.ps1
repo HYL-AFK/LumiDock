@@ -4,12 +4,12 @@ $voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_
 $defaults = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\sdkconfig.defaults"
 $config = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\sdkconfig"
 
-if ($defaults -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y$' -or
-    $config -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y$') {
+if ($defaults -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y\r?$' -or
+    $config -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y\r?$') {
     throw 'WebSocket TX must use a separate lock so sending cannot block the receive task.'
 }
-if ($defaults -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000$' -or
-    $config -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000$') {
+if ($defaults -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000\r?$' -or
+    $config -notmatch '(?m)^CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000\r?$') {
     throw 'WebSocket TX lock needs the documented 2 second acquisition timeout.'
 }
 if ($voice -match 'esp_websocket_client_send_bin\([\s\S]*?pdMS_TO_TICKS\(100\)') {
@@ -27,7 +27,7 @@ if ($voice -notmatch 'voice_uplink_tx_task[\s\S]*s_next_uplink_deadline_us[\s\S]
 if ($voice -notmatch 'voice_uplink_tx_task[\s\S]*send_uplink_packet\([\s\S]*?\)[\s\S]*advance_uplink_pacing\(\)') {
     throw 'The send deadline must advance only after a successful Opus packet send.'
 }
-if ($voice -notmatch 'send_listen_start\(\)\)\s*\{[\s\S]{0,300}reset_uplink_pacing\(\)') {
+if ($voice -notmatch 'send_listen_start\(\)\)\s*\{[\s\S]{0,600}reset_uplink_pacing\(\)') {
     throw 'A new listen/start turn must reset the previous uplink deadline.'
 }
 Write-Output 'Voice transport pacing contract passed.'

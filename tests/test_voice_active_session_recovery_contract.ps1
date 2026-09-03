@@ -36,11 +36,11 @@ $vadBlock = $voice.Substring($vadStart, $vadEnd - $vadStart)
 if ($vadBlock -match 'publish_ui_state\(VOICE_UI_CONNECTING\)|start_wss\(') {
     throw 'Speech inside the active boot greeting window must not enter connecting or start a new WSS session.'
 }
-if ($vadBlock -match 's_boot_greeting_reply_deadline_us\s*=\s*0') {
-    throw 'Starting the direct-reply turn must retain the three-minute deadline.'
+if ($vadBlock -notmatch 's_boot_greeting_reply_deadline_us\s*=\s*0;\s*s_state\s*=\s*XIAOZHI_VOICE_WAIT_SPEECH') {
+    throw 'Starting the direct-reply turn must pause its idle-only deadline before capture begins.'
 }
-if ($voice -notmatch 's_boot_greeting_reply_deadline_us != 0[\s\S]{0,260}s_state == XIAOZHI_VOICE_LISTENING') {
-    throw 'The three-minute deadline must remain active while a direct-reply turn is streaming.'
+if ($voice -notmatch 's_boot_greeting_reply_deadline_us != 0[\s\S]{0,260}s_state == XIAOZHI_VOICE_BOOT_GREETING_WAIT_REPLY') {
+    throw 'The boot-greeting deadline must run only while the session is idle and waiting for a reply.'
 }
 
 Write-Output 'Active single-session contract passed.'

@@ -40,8 +40,8 @@ if ($voice -match 'if \(is_followup_reconnect_state\(\)\s*&&') {
     throw 'The session task must not repeatedly enter a follow-up reconnect path.'
 }
 
-if ($voice -notmatch 'boot greeting PCM drained; direct reply window=3min') {
-    throw 'The active greeting must still open its three-minute direct reply window.'
+if ($voice -notmatch 'boot greeting PCM drained; direct reply window=15s') {
+    throw 'The active greeting must open its configured 15-second direct reply window.'
 }
 
 Write-Output 'Single-connection voice contract passed.'

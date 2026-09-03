@@ -16,7 +16,7 @@ $cmake = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\main\CMakeLi
 
 @(
     @{ Content = $playout; Pattern = '#define AUDIO_PLAYOUT_PCM_CHUNK_BYTES 960U'; Message = 'PCM playout must use 30 ms chunks.' },
-    @{ Content = $playout; Pattern = '#define AUDIO_PLAYOUT_TTS_PREBUFFER_FRAMES 40U'; Message = 'Cloud TTS must prebuffer about 1.2 seconds before unmuting.' },
+    @{ Content = $playout; Pattern = '#define AUDIO_PLAYOUT_TTS_PREBUFFER_FRAMES 120U'; Message = 'Cloud TTS must prebuffer about 3.6 seconds to absorb cloud sentence pauses.' },
     @{ Content = $playout; Pattern = '#define AUDIO_PLAYOUT_QUEUE_DEPTH 128U'; Message = 'PCM playout needs about four seconds of bounded PSRAM headroom.' },
     @{ Content = $playout; Pattern = 'AUDIO_PLAYOUT_EVENT_STARTED'; Message = 'The playout service must report the first committed PCM frame.' },
     @{ Content = $playout; Pattern = 'AUDIO_PLAYOUT_EVENT_FINISHED'; Message = 'The playout service must report drain completion after DAC mute.' },

@@ -8,7 +8,11 @@ idf_component_register(
         "APP/ui_service.c"
         "APP/ui_assets.c"
         "APP/ui_cjk_font.c"
+        "APP/ui_cjk_font_24.c"
+        "APP/ui_cjk_font_34.c"
+        "APP/ui_cjk_font_48.c"
         "APP/ui_time_font.c"
+        "APP/ui_time_font_54.c"
         "MID/protocol/bms_protocol.c"
         "MID/protocol/bms_service.c"
         "MID/protocol/stc_protocol.c"
@@ -29,7 +33,10 @@ idf_component_register(
         "MID/system/watchdog_service.c"
         "MID/system/audio_playback_service.c"
         "MID/system/status_led_service.c"
+        "MID/system/timer_service.c"
+        "MID/system/timer_chime_audio.c"
         "MID/system/voice_iot_command_service.c"
+        "MID/system/radio_stream_service.c"
         "COM/app_config.c"
         "COM/location_snapshot.c"
         "COM/runtime_event_log.c"
@@ -47,6 +54,13 @@ idf_component_register(
         "assets/ui/wifi.rgb565"
         "assets/ui/bluetooth.rgb565"
         "assets/ui/battery.rgb565"
+        "assets/ui/mic_error.rgb565"
+        "assets/ui/timer_icon.rgb565a8"
+        "assets/ui/alarm_icon.rgb565a8"
+        "assets/ui/weather_icon_sunny.rgb565a8"
+        "assets/ui/weather_icon_cloudy.rgb565a8"
+        "assets/ui/weather_icon_rain.rgb565a8"
+        "assets/ui/weather_icon_snow.rgb565a8"
         "assets/ui/weather_clear_scene.i8"
         "assets/ui/weather_cloudy_scene.i8"
         "assets/ui/weather_fog_scene.i8"
@@ -59,6 +73,7 @@ idf_component_register(
         "assets/ui/voice_speaking.i4"
         "assets/ui/voice_error.i4"
         "assets/audio/startup_ready_16k_mono_s16le.pcm"
+        "assets/audio/error_tone_16k_mono_s16le.pcm"
     INCLUDE_DIRS
         "."
         "APP"
@@ -85,6 +100,7 @@ idf_component_register(
         esp_timer
         esp_wifi
         esp_codec_dev
+        esp_audio_codec
         esp_websocket_client
         esp-sr
         json

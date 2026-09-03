@@ -36,6 +36,19 @@ $cmake = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\CMakeLists.txt"
     if ($_.Content -notmatch $_.Pattern) { throw $_.Message }
 }
 
+if ($ui -match 'case VOICE_UI_IDLE:\s*default:\s*return "休眠"') {
+    throw 'The XiaoZhi page must not label its idle state as sleep.'
+}
+if ($ui -match 'voice_status_text|voice_text_for_state|lv_label_set_text\(s_scene\.voice_status_text') {
+    throw 'The XiaoZhi page must not render voice state text.'
+}
+if ($ui -notmatch 'UI_VOICE_LISTEN_EYE_WIDTH' -or $ui -notmatch 'UI_VOICE_SPEAK_EYE_WIDTH') {
+    throw 'The XiaoZhi voice states must use explicit awake eye geometry.'
+}
+if ($ui -notmatch 'VOICE_UI_THINKING[\s\S]*?UI_VOICE_THINK_EYE_HEIGHT') {
+    throw 'The XiaoZhi thinking state must use distinct narrow eyes.'
+}
+
 if ($ui -match 'xQueueReceive\(' -or $ui -match 'xiaozhi_voice_service_') {
     throw 'The UI must consume voice state only through the protected snapshot.'
 }

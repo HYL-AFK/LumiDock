@@ -61,6 +61,13 @@ static bool double_blink(int64_t now_us)
     return phase < 90U || (phase >= 180U && phase < 270U);
 }
 
+/* Scale a base color channel by a breath alpha in [0,96] so the whole palette
+ * shares one brightness ladder while keeping each state's hue distinct. */
+static uint8_t color_scale(uint8_t base, uint8_t alpha)
+{
+    return (uint8_t)(((uint32_t)base * alpha) / 96U);
+}
+
 static status_led_state_t choose_state(const lumidock_snapshot_t *snapshot, int64_t now_us)
 {
     if (s_critical_fault) return STATUS_LED_FAULT;
@@ -96,7 +103,7 @@ static void render_success_strip(int64_t now_us)
     const int64_t elapsed_us = now_us - s_success_started_us;
     const int64_t phase_us = elapsed_us % (STATUS_LED_SUCCESS_ON_US + STATUS_LED_SUCCESS_OFF_US);
     if (phase_us < STATUS_LED_SUCCESS_ON_US) {
-        (void)ws2812_driver_set_all(0U, 96U, 12U);
+        (void)ws2812_driver_set_all(60U, 255U, 120U);
     } else {
         ws2812_driver_clear();
     }
@@ -113,41 +120,57 @@ static void render_state(status_led_state_t state, const lumidock_snapshot_t *sn
             const uint8_t index = (uint8_t)((head + LUMIDOCK_WS2812_LED_COUNT - tail) %
                                             LUMIDOCK_WS2812_LED_COUNT);
             const uint8_t level = (uint8_t)(112U - tail * 14U);
-            set_pixel(index, (status_led_color_t){0U, level, (uint8_t)(level / 10U)});
+            set_pixel(index, (status_led_color_t){0U, level, (uint8_t)(level * 168U / 112U)});
         }
         break;
     }
     case STATUS_LED_FAULT:
-        if (double_blink(now_us)) (void)ws2812_driver_set_all(112U, 0U, 0U);
+        if (double_blink(now_us)) (void)ws2812_driver_set_all(255U, 40U, 40U);
         break;
-    case STATUS_LED_ACTIVATION:
-        (void)ws2812_driver_set_all(breathe(96U, now_us), breathe(64U, now_us), 0U);
+    case STATUS_LED_ACTIVATION: {
+        const uint8_t k = breathe(110U, now_us);
+        (void)ws2812_driver_set_all(color_scale(255U, k), color_scale(200U, k), color_scale(60U, k));
         break;
+    }
     case STATUS_LED_PROVISIONING: {
         const uint8_t step = (uint8_t)((now_us / 90000LL) % (LUMIDOCK_WS2812_LED_COUNT * 2U - 2U));
         const uint8_t index = step < LUMIDOCK_WS2812_LED_COUNT ? step : (uint8_t)(LUMIDOCK_WS2812_LED_COUNT * 2U - 2U - step);
-        set_pixel(index, (status_led_color_t){0U, 76U, 92U});
+        set_pixel(index, (status_led_color_t){0U, 190U, 210U});
         break;
     }
     case STATUS_LED_WIFI_CONNECTING:
-        set_pixel((uint8_t)((now_us / 70000LL) % LUMIDOCK_WS2812_LED_COUNT), (status_led_color_t){0U, 24U, 104U});
+        set_pixel((uint8_t)((now_us / 70000LL) % LUMIDOCK_WS2812_LED_COUNT), (status_led_color_t){0U, 110U, 255U});
         break;
     case STATUS_LED_VOICE: {
         const uint8_t center = LUMIDOCK_WS2812_LED_COUNT / 2U;
-        const uint8_t level = breathe(96U, now_us);
-        set_pixel((uint8_t)(center - 1U), (status_led_color_t){level, 0U, level});
-        set_pixel(center, (status_led_color_t){level, 0U, level});
-        set_pixel((uint8_t)(center - 4U), (status_led_color_t){18U, 0U, 24U});
-        set_pixel((uint8_t)(center + 3U), (status_led_color_t){18U, 0U, 24U});
+        uint8_t r = 0U, g = 150U, b = 255U, reach = 2U;
+        switch (snapshot->voice_session.state) {
+        case VOICE_UI_THINKING:
+            r = 230U; g = 180U; b = 80U; reach = 2U; break;
+        case VOICE_UI_SPEAKING:
+            r = 200U; g = 90U; b = 255U; reach = 3U; break;
+        case VOICE_UI_LISTENING:
+        default:
+            r = 0U; g = 150U; b = 255U; reach = 2U; break;
+        }
+        const uint8_t k = breathe(96U, now_us);
+        for (uint8_t off = 0U; off < reach; ++off) {
+            const uint8_t amp = (uint8_t)(96U - off * 24U);
+            const uint8_t alpha = (uint8_t)(((uint32_t)k * amp) / 96U);
+            const status_led_color_t c = {color_scale(r, alpha), color_scale(g, alpha), color_scale(b, alpha)};
+            set_pixel((uint8_t)(center - 1U - off), c);
+            set_pixel((uint8_t)(center + off), c);
+        }
         break;
     }
     case STATUS_LED_WARNING:
-        if (double_blink(now_us)) (void)ws2812_driver_set_all(112U, 38U, 0U);
+        if (double_blink(now_us)) (void)ws2812_driver_set_all(255U, 140U, 0U);
         break;
     case STATUS_LED_CHARGING: {
         const uint8_t filled = (uint8_t)(((uint32_t)snapshot->bms.soc_percent * LUMIDOCK_WS2812_LED_COUNT + 99U) / 100U);
+        const uint8_t k = breathe(96U, now_us);
         for (uint8_t index = 0; index < filled && index < LUMIDOCK_WS2812_LED_COUNT; ++index) {
-            set_pixel(index, (status_led_color_t){0U, breathe(80U, now_us), 8U});
+            set_pixel(index, (status_led_color_t){color_scale(60U, k), color_scale(230U, k), color_scale(120U, k)});
         }
         break;
     }
@@ -155,8 +178,13 @@ static void render_state(status_led_state_t state, const lumidock_snapshot_t *sn
         render_success_strip(now_us);
         break;
     case STATUS_LED_NORMAL:
-    default:
-        return;
+    default: {
+        const uint8_t k = breathe(36U, now_us);
+        const status_led_color_t idle = {color_scale(28U, k), color_scale(34U, k), color_scale(42U, k)};
+        for (uint8_t i = 0U; i < LUMIDOCK_WS2812_LED_COUNT; ++i)
+            set_pixel(i, idle);
+        break;
+    }
     }
 }
 

@@ -53,13 +53,14 @@ static void startup_coordinator_task(void *arg)
         }
 
         if (!greeting_requested && ui_service_boot_transition_complete() &&
+            ui_service_boot_cloud_ready() &&
             xiaozhi_activation_service_is_activated() && xiaozhi_voice_service_is_ready()) {
             const esp_err_t err = xiaozhi_voice_service_start_boot_greeting();
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "boot greeting request rejected: %s", esp_err_to_name(err));
             } else {
                 greeting_requested = true;
-                ESP_LOGI(TAG, "boot greeting requested after tested voice pipeline became ready");
+                ESP_LOGI(TAG, "boot greeting requested after network decision and tested voice pipeline became ready");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(STARTUP_COORDINATOR_POLL_MS));

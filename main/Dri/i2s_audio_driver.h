@@ -28,3 +28,7 @@ esp_err_t i2s_audio_driver_stop_output(void);
 /* Keep the ES8311 DAC muted except while cloud TTS is actually playing.
  * This leaves the microphone RX path available for WakeNet. */
 esp_err_t i2s_audio_driver_set_output_muted(bool muted);
+
+/* 设置 ES8311 DAC 音量，范围 0..100，调用过程由驱动锁保护。 */
+esp_err_t i2s_audio_driver_set_output_volume(float percent);
+float i2s_audio_driver_get_output_volume(void);

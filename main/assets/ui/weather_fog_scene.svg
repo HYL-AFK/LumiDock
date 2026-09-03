@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="320" height="170" viewBox="0 0 320 170">
   <defs><linearGradient id="mist" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#e5ecea" stop-opacity=".28"/><stop offset=".5" stop-color="#b9cec7" stop-opacity=".92"/><stop offset="1" stop-color="#e5ecea" stop-opacity=".28"/></linearGradient></defs>
   <rect width="320" height="170" fill="#eef5f1"/>
-  <g transform="translate(-8 90)"><circle cx="84" cy="30" r="45" fill="#dae9df" fill-opacity=".48"/><path d="M0 18C50 4 86 30 143 13c49-15 89 13 177-4v18C229 42 185 16 132 34 73 54 39 28 0 41Z" fill="url(#mist)"/><path d="M0 43C42 26 98 55 155 35c46-16 85 8 165-5v19c-46 13-82-10-132 8C131 77 45 49 0 63Z" fill="url(#mist)"/><path d="M0 63C57 47 112 68 174 48c41-13 78 2 146-7v39H0Z" fill="#bdd8c7" fill-opacity=".66"/></g>
+  <g transform="translate(-8 90)"><path d="M0 18C50 4 86 30 143 13c49-15 89 13 177-4v18C229 42 185 16 132 34 73 54 39 28 0 41Z" fill="url(#mist)"/><path d="M0 43C42 26 98 55 155 35c46-16 85 8 165-5v19c-46 13-82-10-132 8C131 77 45 49 0 63Z" fill="url(#mist)"/><path d="M0 63C57 47 112 68 174 48c41-13 78 2 146-7v39H0Z" fill="#bdd8c7" fill-opacity=".66"/></g>
 </svg>
