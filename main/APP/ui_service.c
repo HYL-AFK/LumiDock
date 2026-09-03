@@ -664,7 +664,7 @@ static void create_main_page(lv_obj_t *root)
     lv_obj_set_style_translate_y(s_scene.main_time, 14, 0);
     s_scene.main_calendar_group = lv_obj_create(s_scene.main_header_group);
     lv_obj_remove_style_all(s_scene.main_calendar_group);
-    lv_obj_set_size(s_scene.main_calendar_group, 110, UI_MAIN_HEADER_HEIGHT);
+    lv_obj_set_size(s_scene.main_calendar_group, 120, UI_MAIN_HEADER_HEIGHT);
     lv_obj_set_flex_flow(s_scene.main_calendar_group, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_scene.main_calendar_group, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
