@@ -9,6 +9,7 @@ idf_component_register(
         "APP/ui_assets.c"
         "APP/ui_cjk_font.c"
         "APP/ui_cjk_font_24.c"
+        "APP/ui_cjk_font_34_black.c"
         "APP/ui_cjk_font_34.c"
         "APP/ui_cjk_font_48.c"
         "APP/ui_time_font.c"

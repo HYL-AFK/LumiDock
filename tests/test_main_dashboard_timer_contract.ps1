@@ -32,7 +32,7 @@ $alarmSvg = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\assets\ui\alarm
     @{ Content = $ui; Pattern = 'lv_obj_set_style_translate_x\(s_scene\.main_weekday, 8, 0\)'; Message = 'Weekday label must shift right by 8px.' },
     @{ Content = $ui; Pattern = 'main_weekday'; Message = 'Date and weekday must have dedicated labels.' },
     @{ Content = $ui; Pattern = 'main_calendar_group'; Message = 'Date and weekday must share a vertical calendar group.' },
-    @{ Content = $ui; Pattern = '&ui_cjk_font_34'; Message = 'Date and weekday must use the native 34px CJK font.' },
+    @{ Content = $ui; Pattern = '&ui_cjk_font_34_black'; Message = 'Date and weekday must use the 34px bold (Hei) CJK font.' },
     @{ Content = $cjkHeader; Pattern = 'ui_cjk_font_34'; Message = 'The 34px CJK font must be declared to the UI.' },
     @{ Content = $ui; Pattern = 'main_timer_group'; Message = 'Timer icon and time must share a fixed-size container.' },
     @{ Content = $ui; Pattern = 'UI_MAIN_TIMER_GROUP_WIDTH 136'; Message = 'Timer group must have fixed width.' },

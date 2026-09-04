@@ -5,8 +5,11 @@ $preview = Get-Content -Raw -Encoding UTF8 -LiteralPath "$PSScriptRoot\..\previe
 $asset = Get-Item -LiteralPath "$PSScriptRoot\..\main\assets\ui\weather_icon_cloudy.rgb565a8"
 
 foreach ($content in @($svg, $preview)) {
-    if ($content -notmatch 'fill="#FFFFFF"' -or $content -notmatch 'fill="#C1C1C1"') {
-        throw 'Cloudy weather icon must use the approved white and light-gray layered artwork.'
+    if ($content -match 'fill="#FFFFFF"' -or $content -match 'fill="white"') {
+        throw 'Cloudy weather icon must not contain a white cloud layer.'
+    }
+    if ($content -notmatch 'fill="#A8A8A8"' -or $content -notmatch 'fill="#C1C1C1"') {
+        throw 'Cloudy weather icon must use the approved medium-gray and light-gray layers.'
     }
     if ($content -match '<rect|<background|fill="white"') {
         throw 'Cloudy weather icon must not add an opaque background canvas.'

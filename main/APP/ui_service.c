@@ -578,8 +578,9 @@ static uint32_t decode_utf8_codepoint(const char *text)
 
 static void create_main_date_labels(const char *date, const char *weekday)
 {
-    s_scene.main_date = make_label(s_scene.main_calendar_group, date, &ui_cjk_font_34, color(UI_INK));
-    s_scene.main_weekday = make_label(s_scene.main_calendar_group, weekday, &ui_cjk_font_34, color(UI_INK));
+    /* 日期和星期统一使用黑体字库，并向右偏移 8 像素对齐主页面布局。 */
+    s_scene.main_date = make_label(s_scene.main_calendar_group, date, &ui_cjk_font_34_black, color(UI_INK));
+    s_scene.main_weekday = make_label(s_scene.main_calendar_group, weekday, &ui_cjk_font_34_black, color(UI_INK));
     lv_obj_set_style_translate_x(s_scene.main_date, 8, 0);
     lv_obj_set_style_translate_x(s_scene.main_weekday, 8, 0);
     s_scene.text_flush_log_budget = 8U;
@@ -600,7 +601,8 @@ static void format_main_date(char *date, size_t date_size, char *weekday, size_t
 {
     static const char *const weekdays[] = {"日", "一", "二", "三", "四", "五", "六"};
     const int weekday_index = (value->tm_wday >= 0 && value->tm_wday <= 6) ? value->tm_wday : 0;
-    (void)snprintf(date, date_size, "%02d-%02d", value->tm_mon + 1, value->tm_mday);
+    /* 使用“月日”格式，避免日期标签在头部容器中被自动换行。 */
+    (void)snprintf(date, date_size, "%d月%d日", value->tm_mon + 1, value->tm_mday);
     (void)snprintf(weekday, weekday_size, "星期%s", weekdays[weekday_index]);
 }
 
@@ -664,7 +666,7 @@ static void create_main_page(lv_obj_t *root)
     lv_obj_set_style_translate_y(s_scene.main_time, 14, 0);
     s_scene.main_calendar_group = lv_obj_create(s_scene.main_header_group);
     lv_obj_remove_style_all(s_scene.main_calendar_group);
-    lv_obj_set_size(s_scene.main_calendar_group, 120, UI_MAIN_HEADER_HEIGHT);
+    lv_obj_set_size(s_scene.main_calendar_group, 130, UI_MAIN_HEADER_HEIGHT);
     lv_obj_set_flex_flow(s_scene.main_calendar_group, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_scene.main_calendar_group, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
