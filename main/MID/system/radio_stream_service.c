@@ -1,6 +1,8 @@
 #include "radio_stream_service.h"
 
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_audio_dec_default.h"
@@ -34,7 +36,34 @@
  * 供给为 0），队列从 130 帧耗到 14 帧。那段要靠放宽容许丢的 WiFi 接收缓冲，
  * 不是这里的值。 */
 #define RADIO_PREBUFFER_FRAMES 40U
-#define RADIO_URL "http://lhttp.qtfm.cn/live/20500038/64k.mp3"
+
+/* 电台源。两种取流方式共用下面同一套解码/转换/入队/背压循环，差别只在“字节从哪来”：
+ *   MP3 —— 一条长连接，读到的字节就是 MP3 帧。蜻蜓FM 的静态直播流是这种。
+ *   HLS —— 先读 .m3u8 播放列表，再一片片顺序拉 .ts 分片。央广网等官方源都是这种。
+ * 蜻蜓FM 已经下架了中国之声的静态 MP3 源（live/386 实测 404，而同域名的 20500038
+ * 仍正常吐流，所以是单个 ID 下架而不是域名失效）。要听“正规”电台就只剩 HLS 一条路。
+ * 切回旧的只要改 RADIO_SOURCE 这一个宏。 */
+#define RADIO_URL_MP3 "http://lhttp.qtfm.cn/live/20500038/64k.mp3"
+#define RADIO_URL_HLS "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8"
+
+typedef enum {
+    RADIO_SOURCE_MP3 = 0,
+    RADIO_SOURCE_HLS,
+} radio_source_kind_t;
+#define RADIO_SOURCE RADIO_SOURCE_HLS
+
+/* HLS 参数。CNR 实测：播放列表里保留 6 个分片、每个 10 s（TARGETDURATION=10），
+   窗口整体滑动；片名是连续整数 + ".ts"；无鉴权；纯 HTTP（不用碰 TLS）。 */
+/* 从窗口里取倒数第二片开始播：落后直播约 20 s，换来同量级的抖动余量。
+   取最后一片只剩 10 s 余量；取最旧一片虽然余量最大，但落后 60 s 太夸张。
+   取片和直播都以实时速度推进，所以这个落后量不会越拉越大；真掉出滑动窗口时
+   分片会 404，那时自动重拉列表重新对齐。 */
+#define RADIO_HLS_PLAYLIST_MAX 1024U
+#define RADIO_HLS_URL_MAX 224U
+/* 一次 hls_read 里最多连续换这么多片。超过就说明分片拿得到却读不出数据
+   （循环里每轮都要发一次 HTTP 请求），必须交给外层重连，不能在这里空转。 */
+#define RADIO_HLS_MAX_ADVANCE_PER_READ 4U
+
 #define RADIO_MAX_RECONNECTS 3U
 /* 输入缓冲已满而解析器一口都不吃，连续这么多轮才判定真卡死。 */
 #define RADIO_MAX_STALL_ROUNDS 8U
@@ -140,6 +169,126 @@ static size_t radio_to_16k_mono(const uint8_t *src, size_t src_bytes, uint32_t s
     return written * 2U;
 }
 
+/* ------------------------------------------------------------------ HLS 取流 */
+typedef struct {
+    esp_http_client_handle_t http; /* 整段会话复用同一个 handle */
+    char base[RADIO_HLS_URL_MAX];  /* 分片目录，含结尾的 '/' */
+    uint64_t next_index;           /* 下一个要拉的分片序号 */
+    bool segment_open;             /* 当前分片的响应还没读完 */
+} radio_hls_t;
+
+/* 读一次播放列表，解析出分片目录和起始序号。列表约 200 字节，一次读完。
+ *
+ * CNR 实测格式：
+ *   #EXTM3U / #EXT-X-VERSION:3 / #EXT-X-MEDIA-SEQUENCE:15907434
+ *   #EXT-X-TARGETDURATION:10 / #EXTINF:10.006, / 15907434.ts / ...
+ * 片名是连续整数，所以记住目录 + 序号之后直接加号就能推下一片，不必每片都重拉列表。
+ *
+ * reopen=false 用在刚连上时：那时的响应就是列表本身，直接用。
+ * reopen=true 用在掉出滑动窗口后的重新对齐：列表和正在读的分片不是一条流，
+ * 必须先 close() 才能开新的（不分片必须重开连接，这种重同步很少发生）。 */
+static bool hls_read_playlist(radio_hls_t *hls, bool reopen)
+{
+    if (reopen) {
+        esp_http_client_set_url(hls->http, RADIO_URL_HLS);
+        esp_http_client_close(hls->http);
+        if (esp_http_client_open(hls->http, 0) != ESP_OK) return false;
+        (void)esp_http_client_fetch_headers(hls->http);
+    }
+    char body[RADIO_HLS_PLAYLIST_MAX];
+    size_t used = 0U;
+    while (used < sizeof(body) - 1U) {
+        const int n = esp_http_client_read(hls->http, body + used,
+                                           (int)(sizeof(body) - 1U - used));
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    body[used] = '\0';
+
+    /* 分片目录 = 播放列表 URL 去掉最后一个路径段。 */
+    strncpy(hls->base, RADIO_URL_HLS, sizeof(hls->base) - 1U);
+    hls->base[sizeof(hls->base) - 1U] = '\0';
+    char *slash = strrchr(hls->base, '/');
+    if (slash == NULL) return false;
+    slash[1] = '\0';
+
+    /* 扫出最后两个分片行，取倒数第二片。 */
+    uint64_t last_index = 0U;
+    uint64_t prev_index = 0U;
+    char *cursor = body;
+    while (*cursor != '\0') {
+        char *nl = strchr(cursor, '\n');
+        if (nl != NULL) *nl = '\0';
+        const size_t len = strlen(cursor);
+        if (len > 0U && cursor[0] != '#') {
+            const uint64_t index = strtoull(cursor, NULL, 10);
+            /* 非数字片名推不出下一片，本实现不支持；跳过而不是当成序号 0。 */
+            if (index != 0U) {
+                prev_index = last_index;
+                last_index = index;
+            }
+        }
+        if (nl == NULL) break;
+        cursor = nl + 1U;
+    }
+    if (last_index == 0U) return false;
+    hls->next_index = prev_index != 0U ? prev_index : last_index;
+    hls->segment_open = false;
+    ESP_LOGI(TAG, "HLS 列表就绪：窗口 %llu..%llu，从 %llu 开始",
+             (unsigned long long)prev_index, (unsigned long long)last_index,
+             (unsigned long long)hls->next_index);
+    return true;
+}
+
+static bool hls_open_segment(radio_hls_t *hls, uint64_t index)
+{
+    char url[RADIO_HLS_URL_MAX];
+    const int written = snprintf(url, sizeof(url), "%s%llu.ts", hls->base,
+                                 (unsigned long long)index);
+    if (written <= 0 || (size_t)written >= sizeof(url)) return false;
+
+    /* 不调 esp_http_client_close()：IDF 的 esp_http_client_connect() 只在
+       state < HTTP_STATE_CONNECTED 时才真的重连（esp_http_client.c:1469），所以
+       换 URL 再 open() 就是在原 socket 上发下一个 GET。每 10 s 一次的分片请求因此
+       不用重做 TCP 握手——上次实测首次建连要 7.3 s，那个代价每片付一次就完了。 */
+    esp_http_client_set_url(hls->http, url);
+    if (esp_http_client_open(hls->http, 0) != ESP_OK) {
+        /* 服务端可能在上一个响应里关了连接（Connection: close）：重开一条。 */
+        esp_http_client_close(hls->http);
+        esp_http_client_set_url(hls->http, url);
+        if (esp_http_client_open(hls->http, 0) != ESP_OK) return false;
+    }
+    (void)esp_http_client_fetch_headers(hls->http);
+    hls->segment_open = true;
+    return true;
+}
+
+/* HLS 的字节源：把当前分片的响应体当成一个会结束的流，读完了就换下一片。
+   返回 >0 为拿到的字节数；返回 0 表示这一轮彻底没进展，交给外层按网络停顿处理。 */
+static int hls_read(radio_hls_t *hls, uint8_t *buf, size_t len)
+{
+    for (uint8_t attempt = 0U; attempt < RADIO_HLS_MAX_ADVANCE_PER_READ; ++attempt) {
+        if (!hls->segment_open) {
+            if (!hls_open_segment(hls, hls->next_index)) {
+                /* 拉不到多半是已经落后到滑动窗口之外了。重拉列表拿新序号。 */
+                ESP_LOGW(TAG, "HLS 分片 %llu 拉不到；重拉播放列表重新对齐",
+                         (unsigned long long)hls->next_index);
+                if (!hls_read_playlist(hls, true)) return 0;
+                if (!hls_open_segment(hls, hls->next_index)) return 0;
+            }
+        }
+        const int n = esp_http_client_read(hls->http, (char *)buf, (int)len);
+        if (n > 0) return n;
+        /* 这一片读完（或读出错）：收流，下一轮换下一片。读出错也走这条路——
+           下一片的 open() 会失败，进而触发上面那次列表重拉。 */
+        hls->segment_open = false;
+        ++hls->next_index;
+    }
+    ESP_LOGW(TAG, "HLS 连续 %u 片都没读出数据；按网络停顿处理",
+             (unsigned)RADIO_HLS_MAX_ADVANCE_PER_READ);
+    return 0;
+}
+
 static void radio_task(void *arg)
 {
     (void)arg;
@@ -166,7 +315,12 @@ static void radio_task(void *arg)
         }
 
         ESP_LOGI(TAG, "radio state=CONNECTING epoch=%u", (unsigned)epoch);
-        esp_http_client_config_t cfg = {.url = RADIO_URL, .timeout_ms = 12000, .buffer_size = RADIO_HTTP_BUFFER_BYTES};
+        radio_hls_t hls = {0};
+        esp_http_client_config_t cfg = {
+            .url = RADIO_SOURCE == RADIO_SOURCE_HLS ? RADIO_URL_HLS : RADIO_URL_MP3,
+            .timeout_ms = 12000,
+            .buffer_size = RADIO_HTTP_BUFFER_BYTES,
+        };
         esp_http_client_handle_t http = esp_http_client_init(&cfg);
         esp_err_t open_err = http == NULL ? ESP_ERR_NO_MEM : esp_http_client_open(http, 0);
         if (open_err != ESP_OK) {
@@ -177,6 +331,17 @@ static void radio_task(void *arg)
             continue;
         }
         (void)esp_http_client_fetch_headers(http);
+        /* HLS：刚打开的就是播放列表本身，直接在这个响应上解析，不用再连一次。 */
+        if (RADIO_SOURCE == RADIO_SOURCE_HLS) {
+            hls.http = http;
+            if (!hls_read_playlist(&hls, false)) {
+                record_failure("hls_playlist", ESP_ERR_INVALID_RESPONSE, 0);
+                esp_http_client_close(http); esp_http_client_cleanup(http);
+                xSemaphoreTake(s_lock, portMAX_DELAY); s_play_requested = false; xSemaphoreGive(s_lock);
+                audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_RADIO, epoch);
+                continue;
+            }
+        }
         /* MP3 is a bare decoder, so two registries are involved:
          * esp_audio_simple_dec_register_default() only registers the container
          * parsers (WAV/M4A/TS/OGG).  The decoder registry the simple decoder
@@ -191,7 +356,18 @@ static void radio_task(void *arg)
             (void)esp_audio_simple_dec_register_default();
             decoders_registered = true;
         }
-        esp_audio_simple_dec_cfg_t dec_cfg = {.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3, .use_frame_dec = false};
+        /* TS 里的音频是 AAC。解码器注册表由 esp_audio_dec_register_default() 填，
+           前提是 menuconfig 里 CONFIG_AUDIO_DECODER_AAC_SUPPORT 为 y（当前为 y，
+           并已写进 sdkconfig.defaults 防重新生成时静默回退）。aac_plus_enable 一起
+           打开：分片里是 HE-AAC 时不开会解不出声。 */
+        esp_ts_dec_cfg_t ts_cfg = {.aac_plus_enable = true};
+        esp_audio_simple_dec_cfg_t dec_cfg = {
+            .dec_type = RADIO_SOURCE == RADIO_SOURCE_HLS ? ESP_AUDIO_SIMPLE_DEC_TYPE_TS
+                                                         : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
+            .dec_cfg = RADIO_SOURCE == RADIO_SOURCE_HLS ? &ts_cfg : NULL,
+            .cfg_size = RADIO_SOURCE == RADIO_SOURCE_HLS ? sizeof(ts_cfg) : 0U,
+            .use_frame_dec = false,
+        };
         esp_audio_simple_dec_handle_t decoder = NULL;
         const esp_audio_err_t dec_open_err = esp_audio_simple_dec_open(&dec_cfg, &decoder);
         if (dec_open_err != ESP_AUDIO_ERR_OK) {
@@ -251,7 +427,12 @@ static void radio_task(void *arg)
                 input_len = 0U;
                 continue;
             }
-            int n = esp_http_client_read(http, (char *)input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len);
+            /* 唯一的“字节从哪来”分歧点：MP3 是长连接直读，HLS 是分片响应体、读完
+               一片自动换下一片。往下的解码/重采样/入队/背压处理完全共用。 */
+            int n = RADIO_SOURCE == RADIO_SOURCE_HLS
+                        ? hls_read(&hls, input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len)
+                        : esp_http_client_read(http, (char *)input + input_len,
+                                               (int)(RADIO_INPUT_BUFFER_BYTES - input_len));
             if (n == 0) {
                 if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
                 else record_failure("http_read_eof", 0, s_reconnects);

@@ -69,3 +69,8 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
 CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
 CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000
+# HLS 电台（央广中国之声）的分片是 TS 容器装 AAC。这两个开关缺任何一个，电台都会
+# 连得上、播放列表也解析通过，然后一片都解不出声——最难查的那种失败。两者在组件的
+# Kconfig 里默认都是 y，写进 defaults 是为了重新生成 sdkconfig 时不会静默回退。
+CONFIG_AUDIO_DECODER_AAC_SUPPORT=y
+CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT=y

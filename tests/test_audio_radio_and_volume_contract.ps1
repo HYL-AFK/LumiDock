@@ -32,6 +32,13 @@ foreach ($config in @($sdkconfig, $sdkconfigDefaults)) {
     if ($config -notmatch '(?m)^CONFIG_ESP_WIFI_RX_BA_WIN=4\s*$') {
         throw 'The WiFi AMPDU RX window must sit at its ceiling; the RX path is the radio bottleneck.'
     }
+    # HLS 分片是 TS 容器装 AAC：一个是容器解析器、一个是解码器，两个开关都在
+    # menuconfig 里。缺任何一个，电台都会连得上、列表也解析通过，然后一片都解不出声。
+    foreach ($switch in @('CONFIG_AUDIO_DECODER_AAC_SUPPORT', 'CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT')) {
+        if ($config -notmatch "(?m)^$switch=y\s*$") {
+            throw "$switch must be compiled in: HLS puts AAC inside a TS container."
+        }
+    }
 }
 if ($radio -notmatch 'RADIO_MAX_RECONNECTS') { throw 'radio reconnect bound missing' }
 if ($radio -notmatch 'audio_playback_service_abort') { throw 'radio failure cleanup missing' }
@@ -181,5 +188,53 @@ if ($ui -notmatch '(?s)if \(!radio_stream_service_is_requested\(\)\)[\s\S]{0,120
 # 已经收尾，voice_session.state 回落成 IDLE，必须在这里把“电台出声中”当成说话。
 if ($ui -notmatch 'state == VOICE_UI_IDLE && radio_stream_service_is_requested\(\)[\s\S]{0,60}?state = VOICE_UI_SPEAKING;') {
     throw 'The voice page must show the speaking face while the radio is playing.'
+}
+# ---------------------------------------------------------------- HLS 电台
+# 蜻蜓FM 已经下架中国之声的静态 MP3 源（live/386 实测 404，而同域名的 20500038 仍正常
+# 吐流，所以是单个 ID 下架、不是域名失效）。官方源是 HLS，想听“正规”电台就只剩这一条
+# 路。两条取流路径都留在文件里，切回去只改 RADIO_SOURCE 一个宏。
+if ($radio -notmatch '#define RADIO_SOURCE RADIO_SOURCE_HLS') {
+    throw 'The radio must prefer the HLS source unless the Qtfm static stream is restored.'
+}
+if ($radio -notmatch '#define RADIO_URL_HLS "http://ngcdn001\.cnr\.cn/live/zgzs/index\.m3u8"') {
+    throw 'The HLS playlist URL must point at the CNR stream that was verified on the bench.'
+}
+if ($radio -notmatch '#define RADIO_URL_MP3 "http://lhttp\.qtfm\.cn/live/20500038/64k\.mp3"') {
+    throw 'Keep the verified Qtfm URL in the file so switching back stays a one-line change.'
+}
+if ($radio -notmatch 'RADIO_SOURCE == RADIO_SOURCE_HLS \? ESP_AUDIO_SIMPLE_DEC_TYPE_TS') {
+    throw 'HLS carries AAC inside a TS container; the MP3 decoder cannot read it.'
+}
+if ($radio -notmatch 'esp_ts_dec_cfg_t ts_cfg = \{\.aac_plus_enable = true\}') {
+    throw 'Open the TS decoder with AAC+ enabled: HE-AAC segments stay silent otherwise.'
+}
+if ($radio -notmatch 'RADIO_HLS_PLAYLIST_MAX 1024U') {
+    throw 'The playlist is tiny but must stay bounded; never allocate it per fetch.'
+}
+# 每 10 s 一个分片。IDF 的 esp_http_client_connect() 只在 state < HTTP_STATE_CONNECTED
+# 时才真的重连（esp_http_client.c:1469），所以只要不提前 close()，换 URL 再 open() 就是
+# 在原 socket 上发下一个 GET。实测首次建连要 7.3 s，每片付一次根本来不及。
+if ($radio -notmatch '(?s)hls_open_segment[\s\S]{0,900}?esp_http_client_set_url\(hls->http, url\);[\s\S]{0,120}?esp_http_client_open\(hls->http, 0\)') {
+    throw 'Segment requests must reuse the open socket instead of reconnecting every 10 seconds.'
+}
+# 分片会随滑动窗口过期。拉不到就重拉列表拿新序号，否则电台会卡在窗口外面再也不出声。
+if ($radio -notmatch '(?s)hls_open_segment\(hls, hls->next_index\)[\s\S]{0,400}?hls_read_playlist\(hls, true\)') {
+    throw 'A segment that aged out of the sliding window must trigger a playlist re-read.'
+}
+if ($radio -notmatch '\+\+hls->next_index;') {
+    throw 'Finishing a segment must advance to the next one.'
+}
+# 换片是有界的：循环里每轮都要发一次 HTTP 请求，无界重试会把任务转死在网络错误上。
+if ($radio -notmatch 'RADIO_HLS_MAX_ADVANCE_PER_READ') {
+    throw 'Segment advancing must be bounded so a dead stream cannot spin the task.'
+}
+# 取窗口里倒数第二片：落后直播约 20 s，换来同量级的抖动余量。取最后一片只剩 10 s，
+# 一抖就掉出窗口；取最旧一片虽然余量最大，但落后 60 s 太夸张。
+if ($radio -notmatch 'hls->next_index = prev_index != 0U \? prev_index : last_index;') {
+    throw 'Start from the second-newest segment: the newest one leaves no jitter margin.'
+}
+# 解码/重采样/入队/背压必须完全共用，分歧只允许出现在“字节从哪来”这一处。
+if ($radio -notmatch '(?s)RADIO_SOURCE == RADIO_SOURCE_HLS\s*\?\s*hls_read\(&hls,') {
+    throw 'Both sources must share one decode path; only the byte source may differ.'
 }
 Write-Output 'Audio radio and volume contract passed.'
