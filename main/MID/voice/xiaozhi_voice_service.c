@@ -2595,7 +2595,14 @@ static esp_err_t start_wss(bool foreground_session)
         .reconnect_timeout_ms = 2000,
         .network_timeout_ms = 5000,
         .ping_interval_sec = 10,
-        .pingpong_timeout_sec = 20,
+        /* 40 而不是 20。实测日志 89256：上行推到一半连接被判死，
+           uplink failure context 里 last_pong_age_us=15022881——最后一次 PONG
+           已经过去 15 秒。ping_interval 是 10 秒，也就是说连续两拍没等到回应。
+           但公网穿透下的 PONG 延迟本身就能到 20~40 秒，电台在拉流时 CPU 和
+           网络都在抢，回包更慢。20 秒的超时会把“只是慢”误判成“已经死了”：
+           断开 → 本轮上行失败 → 播故障音收场，用户看到的就是“报错闪退”。
+           心跳超时不等于连接不可用，宁可多等一拍也别把正在说话的一轮砍掉。 */
+        .pingpong_timeout_sec = 40,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     ++s_wss_connection_seq;
