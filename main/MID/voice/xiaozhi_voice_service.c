@@ -4078,15 +4078,17 @@ static void voice_session_task(void *arg)
             }
             else if (s_boot_greeting_question)
             {
-                /* 开机问候后的那段聆听窗口没等到人接话，就到此为止：不播“我没听清”
-                   重试提示音，也不再开第二轮。问候是设备主动说的，用户不接是最正常
-                   的情况，追着再问一遍反而打扰人。
-                   实测：不拦这一下，日志会走出 33567 插重试音 → 35507 再开一个 6.4
-                   秒窗口，用户听到的是“问候完还在盯着我听”。 */
+                /* 开机问候后的那段聆听窗口没等到人接话：跳过“我没听清”那句重试提示音，
+                   直接走告别语收场。
+                   跳过的理由：问候是设备主动说的，用户不接是最正常的情况，追着再问一遍
+                   反而像在盯着人听。实测不拦这一下，日志会走出 33567 插重试音 → 35507
+                   再开一个 6.4 秒窗口。
+                   但收场必须照常——用户应该听到一句“再见”，而不是话说到一半突然退回
+                   主页面。所以这里跟下面 else 分支一样走 exit prompt，只是不经重试。 */
                 s_boot_greeting_question = false;
-                s_session_exit_clean = true;
-                ESP_LOGI(TAG, "boot greeting follow-up silent; closing quietly without a retry");
-                close_channel(false);
+                ESP_LOGI(TAG, "boot greeting follow-up silent; skipping the retry, saying goodbye");
+                if (!request_cloud_exit_prompt())
+                    play_error_tone_then_close(false);
             }
             else if (!s_followup_retry_used)
             {
