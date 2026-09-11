@@ -72,6 +72,17 @@ static const radio_station_t k_stations[RADIO_STATION_COUNT] = {
 /* 一次 hls_read 里最多连续换这么多片。超过就说明分片拿得到却读不出数据
    （循环里每轮都要发一次 HTTP 请求），必须交给外层重连，不能在这里空转。 */
 #define RADIO_HLS_MAX_ADVANCE_PER_READ 4U
+/* 单次 read 的字节上限。
+ *
+ * 原来这里直接用输入缓冲的剩余空间（16 KB）当上限，一次就拉 16 KB。旧 MP3 长连接
+ * 没这个问题，因为服务端按实时供流、一次 read 通常只有一两 KB（见下面循环里的注释）。
+ * HLS 的分片响应体在 socket 里是现成的，一次 16 KB 会把 WiFi 接收缓冲瞬间占满，
+ * WSS 的包只能排在后面——实测电台播放中 PONG 从正常的 10 秒拖到 21~40 秒，云端对
+ * 唤醒的回应几十秒上不来。
+ *
+ * 限到 2 KB 是回到旧路径的读取节奏：总量不变，但摊到更多轮里，每轮之间都留给 WSS
+ * 一次机会。代价是多几次 read 调用，相对解码开销可以忽略。 */
+#define RADIO_HLS_READ_CHUNK_MAX 2048U
 
 #define RADIO_MAX_RECONNECTS 3U
 /* 输入缓冲已满而解析器一口都不吃，连续这么多轮才判定真卡死。 */
@@ -460,7 +471,11 @@ static void radio_task(void *arg)
             if (input_len == 0U || last_consumed == 0U) {
                 /* HLS 的分片响应体：读完一片自动换下一片。往下的解码/重采样/入队/
                    背压处理完全共用。 */
-                int n = hls_read(&hls, input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len);
+                /* 单次不超过 2 KB：见 RADIO_HLS_READ_CHUNK_MAX 的说明。 */
+                size_t want = RADIO_INPUT_BUFFER_BYTES - input_len;
+                if (want > RADIO_HLS_READ_CHUNK_MAX)
+                    want = RADIO_HLS_READ_CHUNK_MAX;
+                int n = hls_read(&hls, input + input_len, want);
                 if (n == 0) {
                     if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
                     else record_failure("http_read_eof", 0, s_reconnects);
