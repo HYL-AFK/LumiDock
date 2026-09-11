@@ -297,7 +297,7 @@ static void radio_task(void *arg)
     /* 解码输出是源采样率和源声道数，送进 I2S 前要转成 16 kHz 单声道，单独给块缓冲。 */
     uint8_t *conv = heap_caps_malloc(RADIO_CONV_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (input == NULL || pcm == NULL || conv == NULL) {
-        ESP_LOGE(TAG, "MP3 buffers allocation failed");
+        ESP_LOGE(TAG, "radio buffers allocation failed");
         vTaskDelete(NULL);
         return;
     }
@@ -342,11 +342,12 @@ static void radio_task(void *arg)
                 continue;
             }
         }
-        /* MP3 is a bare decoder, so two registries are involved:
+        /* The container parser is what varies by source: MP3 is a bare decoder, while
+         * HLS feeds TS packets.  Either way two registries are involved:
          * esp_audio_simple_dec_register_default() only registers the container
          * parsers (WAV/M4A/TS/OGG).  The decoder registry the simple decoder
-         * looks MP3 up in is filled by esp_audio_dec_register_default(), and
-         * without that call the stream opens and then dies with "Decoder MP3 not
+         * looks the codec up in is filled by esp_audio_dec_register_default(), and
+         * without that call the stream opens and then dies with "Decoder ... not
          * registered" (AUDIO_DEC), leaving the radio silent.  Both are one-off
          * global registrations, so they are guarded instead of being repeated on
          * every reconnect. */
@@ -422,7 +423,7 @@ static void radio_task(void *arg)
                     record_failure("parser_stall", ESP_ERR_INVALID_STATE, s_reconnects);
                     break;
                 }
-                ESP_LOGW(TAG, "MP3 input buffer full with no progress; dropped %u bytes to resync (%u/%u)",
+                ESP_LOGW(TAG, "radio input buffer full with no progress; dropped %u bytes to resync (%u/%u)",
                          (unsigned)input_len, (unsigned)stall_rounds, (unsigned)RADIO_MAX_STALL_ROUNDS);
                 input_len = 0U;
                 continue;
@@ -523,7 +524,7 @@ static void radio_task(void *arg)
                     }
                 }
             } else if (dec_err == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                ESP_LOGW(TAG, "MP3 decode output buffer too small: needed=%u have=%u",
+                ESP_LOGW(TAG, "decode output buffer too small: needed=%u have=%u",
                          (unsigned)out.needed_size, (unsigned)RADIO_PCM_BUFFER_BYTES);
                 if (++decode_failures >= 3U) {
                     record_failure("pcm_buffer", ESP_ERR_NO_MEM, s_reconnects);
@@ -531,7 +532,7 @@ static void radio_task(void *arg)
                 }
             } else if (dec_err != ESP_AUDIO_ERR_OK) {
                 if (++decode_failures >= 3U) {
-                    record_failure("mp3_decode", dec_err, s_reconnects);
+                    record_failure("radio_decode", dec_err, s_reconnects);
                     break;
                 }
             } else {
