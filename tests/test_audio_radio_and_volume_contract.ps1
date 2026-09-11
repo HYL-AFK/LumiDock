@@ -237,4 +237,20 @@ if ($radio -notmatch 'hls->next_index = prev_index != 0U \? prev_index : last_in
 if ($radio -notmatch '(?s)RADIO_SOURCE == RADIO_SOURCE_HLS\s*\?\s*hls_read\(&hls,') {
     throw 'Both sources must share one decode path; only the byte source may differ.'
 }
+# 读和消化必须解耦。esp_audio_simple_dec_process 一次只消化能填满输出缓冲的那几帧：
+# 输出缓冲 8 KB，而 48 kHz 立体声 AAC 一帧就是 4 KB，所以一次只吃得下约两帧（几百
+# 字节）；而 HLS 的分片响应体在 socket 里已经就绪，一次 esp_http_client_read 能把整个
+# 16 KB 输入缓冲拉满。只喂一次就回头再读的话，读入是消化的三十几倍，输入缓冲必然一直
+# 满、一直整块丢掉——实机就是响一两秒之后再也没有声音，而且这个循环会持续烧 core 1
+# 和 PSRAM 带宽（AFE 也在 PSRAM 里跑）。旧的 MP3 长连接没暴露它，只因为服务端按实时
+# 供流，一次 read 通常只有一两 KB。
+if ($radio -notmatch 'size_t last_consumed = 0U;') {
+    throw 'The parser must be drained between reads: one process call consumes only a couple of frames.'
+}
+if ($radio -notmatch '\(input_len == 0U \|\| last_consumed == 0U\)') {
+    throw 'Reads must be gated on the parser having drained its buffer.'
+}
+if ($radio -notmatch '(?s)last_consumed = raw\.consumed;') {
+    throw 'The drain decision needs the byte count the parser actually consumed.'
+}
 Write-Output 'Audio radio and volume contract passed.'

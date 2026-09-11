@@ -394,6 +394,8 @@ static void radio_task(void *arg)
         }
         xSemaphoreTake(s_lock, portMAX_DELAY); s_active = true; xSemaphoreGive(s_lock);
         size_t input_len = 0U;
+        /* 上一轮解析器实际消化的字节数，决定这一轮是接着喂还是去读。 */
+        size_t last_consumed = 0U;
         uint8_t decode_failures = 0U;
         uint8_t stall_rounds = 0U;
         uint8_t queue_full_rounds = 0U;
@@ -426,21 +428,33 @@ static void radio_task(void *arg)
                 ESP_LOGW(TAG, "radio input buffer full with no progress; dropped %u bytes to resync (%u/%u)",
                          (unsigned)input_len, (unsigned)stall_rounds, (unsigned)RADIO_MAX_STALL_ROUNDS);
                 input_len = 0U;
+                last_consumed = 0U;
                 continue;
             }
-            /* 唯一的“字节从哪来”分歧点：MP3 是长连接直读，HLS 是分片响应体、读完
-               一片自动换下一片。往下的解码/重采样/入队/背压处理完全共用。 */
-            int n = RADIO_SOURCE == RADIO_SOURCE_HLS
-                        ? hls_read(&hls, input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len)
-                        : esp_http_client_read(http, (char *)input + input_len,
-                                               (int)(RADIO_INPUT_BUFFER_BYTES - input_len));
-            if (n == 0) {
-                if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
-                else record_failure("http_read_eof", 0, s_reconnects);
-                break;
+            /* 上一轮解析器还消化了字节，就接着把它喂完，这一轮不去读新的。
+             *
+             * esp_audio_simple_dec_process 一次只消化能填满输出缓冲的那几帧（输出
+             * 8 KB，而 48 kHz 立体声 AAC 一帧就是 1024×2 ch×2 B = 4 KB，所以一次
+             * 约两帧、几百字节），而 HLS 的分片响应体在 socket 里已经就绪，一次
+             * esp_http_client_read 能把整个 16 KB 输入缓冲拉满。只喂一次就回头再读的话，
+             * 读入是消化的三十几倍，输入缓冲必然一直满、一直整块丢掉——实机就是响一两秒
+             * 之后再也没有声音，而且这个循环会持续烧 core 1 和 PSRAM 带宽。旧的 MP3 长
+             * 连接没暴露它，只因为服务端按实时供流，一次 read 通常只有一两 KB。 */
+            if (input_len == 0U || last_consumed == 0U) {
+                /* 唯一的“字节从哪来”分歧点：MP3 是长连接直读，HLS 是分片响应体、读完
+                   一片自动换下一片。往下的解码/重采样/入队/背压处理完全共用。 */
+                int n = RADIO_SOURCE == RADIO_SOURCE_HLS
+                            ? hls_read(&hls, input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len)
+                            : esp_http_client_read(http, (char *)input + input_len,
+                                                   (int)(RADIO_INPUT_BUFFER_BYTES - input_len));
+                if (n == 0) {
+                    if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
+                    else record_failure("http_read_eof", 0, s_reconnects);
+                    break;
+                }
+                if (n < 0) { record_failure("http_read", n, s_reconnects); break; }
+                input_len += (size_t)n;
             }
-            if (n < 0) { record_failure("http_read", n, s_reconnects); break; }
-            input_len += (size_t)n;
             esp_audio_simple_dec_raw_t raw = {.buffer = input, .len = input_len};
             esp_audio_simple_dec_out_t out = {.buffer = pcm, .len = RADIO_PCM_BUFFER_BYTES};
             const esp_audio_err_t dec_err = esp_audio_simple_dec_process(decoder, &raw, &out);
@@ -541,6 +555,7 @@ static void radio_task(void *arg)
                 decode_failures = 0U;
                 stall_rounds = 0U;
             }
+            last_consumed = raw.consumed;
             if (raw.consumed > 0U) stall_rounds = 0U;
             if (raw.consumed > 0U && raw.consumed < input_len) memmove(input, input + raw.consumed, input_len - raw.consumed);
             input_len = raw.consumed <= input_len ? input_len - raw.consumed : 0U;
