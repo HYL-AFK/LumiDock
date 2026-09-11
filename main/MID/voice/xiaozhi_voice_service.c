@@ -2221,6 +2221,8 @@ static void send_detect(bool start_current_speech)
     if (s_turn_id == 0U)
         ++s_turn_id;
     s_greeting_turn_id = s_turn_id;
+    /* 真人醒了就是要自己接管这一轮，开机问候那段“答完不回话”的约定到此为止。 */
+    s_boot_greeting_question = false;
     s_waiting_turn_id = 0U;
     s_playing_turn_id = 0U;
     s_state = XIAOZHI_VOICE_WAIT_SPEECH;
@@ -2400,25 +2402,11 @@ static void enter_followup_after_playback(void)
                      (long long)(XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US / 1000LL));
         }
     }
-    else if (s_boot_greeting_question)
-    {
-        /* 开机那轮主动问候：云端答完就结束，不开接话窗口。
-         *
-         * 问候不是用户提的问题，他没有任何话要接着说；开一个 6.4 秒的听音窗口
-         * 反而害事——实测日志：27147 开窗，33567 窗口沉默又播了一次超时提示音，
-         * 35507 再开一次。这期间喊“你好小智”会被当成接话内容吞掉，听起来就是
-         * “第一次喊没反应、第二次才有”。所以直接收场回到等唤醒。 */
-        s_boot_greeting_question = false;
-        s_state = XIAOZHI_VOICE_WAIT_WAKE;
-        s_followup_deadline_us = 0;
-        s_ui_idle_deadline_us = 0;
-        s_session_exit_clean = true;
-        ESP_LOGI(TAG, "boot greeting finished; ending the turn without a follow-up window");
-        close_channel(false);
-        return;
-    }
     else
     {
+        /* 开机问候也留这一轮窗口：用户听完问候很可能接着问一句，不给他这个机会
+           反而别扭。但只留这一轮——窗口沉默后由 tick 里的 s_boot_greeting_question
+           分支直接收场，不播“我没听清”重试音、也不开第二轮。 */
         s_state = XIAOZHI_VOICE_WAIT_FOLLOWUP;
         s_followup_deadline_us = esp_timer_get_time() + XIAOZHI_FOLLOWUP_WINDOW_US;
         s_ui_idle_deadline_us = 0;
@@ -4084,6 +4072,18 @@ static void voice_session_task(void *arg)
             {
                 ESP_LOGI(TAG, "电台让位窗口到期；直接归还扬声器恢复直播");
                 s_session_exit_clean = true;
+                close_channel(false);
+            }
+            else if (s_boot_greeting_question)
+            {
+                /* 开机问候后的那段聆听窗口没等到人接话，就到此为止：不播“我没听清”
+                   重试提示音，也不再开第二轮。问候是设备主动说的，用户不接是最正常
+                   的情况，追着再问一遍反而打扰人。
+                   实测：不拦这一下，日志会走出 33567 插重试音 → 35507 再开一个 6.4
+                   秒窗口，用户听到的是“问候完还在盯着我听”。 */
+                s_boot_greeting_question = false;
+                s_session_exit_clean = true;
+                ESP_LOGI(TAG, "boot greeting follow-up silent; closing quietly without a retry");
                 close_channel(false);
             }
             else if (!s_followup_retry_used)
