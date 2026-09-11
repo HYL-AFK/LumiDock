@@ -12,6 +12,7 @@ typedef enum {
     AUDIO_PLAYOUT_SOURCE_RADIO,
     AUDIO_PLAYOUT_SOURCE_TIMER_CHIME,
     AUDIO_PLAYOUT_SOURCE_ERROR_TONE,
+    AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT,
 } audio_playback_source_t;
 
 typedef enum {

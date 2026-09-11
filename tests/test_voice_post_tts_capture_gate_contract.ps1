@@ -44,11 +44,12 @@ $gateStart = $voice.IndexOf('static bool consume_post_playback_vad_start')
 $gateEnd = $voice.IndexOf('static void finish_wake_greeting_after_playback', $gateStart)
 if ($gateStart -lt 0 -or $gateEnd -lt 0) { throw 'Post-TTS VAD gate helper is missing.' }
 $gateBlock = $voice.Substring($gateStart, $gateEnd - $gateStart)
-if ($gateBlock -notmatch 'recent_peak < XIAOZHI_DIRECT_REPLY_BYPASS_PEAK' -or
+if ($gateBlock -notmatch 'const uint32_t bypass_peak = followup_reply \? XIAOZHI_FOLLOWUP_DIRECT_REPLY_MIN_PEAK\s*:\s*XIAOZHI_DIRECT_REPLY_BYPASS_PEAK;' -or
+    $gateBlock -notmatch 'recent_peak < bypass_peak' -or
     $gateBlock -notmatch 'recent_peak < XIAOZHI_POST_PLAYBACK_SILENCE_RESET_PEAK' -or
     $gateBlock -notmatch 'start_listen\(true\)' -or
     $gateBlock -notmatch 'start_followup_listen\(\)') {
-    throw 'High-energy direct replies must bypass silence waiting while only >=500 peaks extend the echo guard.'
+    throw 'High-energy direct replies must bypass silence waiting while only >=500 peaks extend the echo guard; a follow-up must clear the higher floor.'
 }
 
 Write-Output 'Post-TTS capture gate contract passed.'

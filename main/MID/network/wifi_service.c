@@ -91,12 +91,12 @@ esp_err_t wifi_service_init(void)
         return err;
     }
     if (s_config.has_wifi && s_config.wifi_count > 0) {
-        ESP_LOGI(TAG, "saved Wi-Fi profile found; connecting STA before network services");
-        ble_provision_init(&s_config, false);
+        ESP_LOGI(TAG, "saved Wi-Fi profile found; opening boot re-provision window, connecting STA");
+        ble_provision_init(&s_config, true, BLE_WINDOW_BOOT);
         wifi_manager_connect_sta(&s_config);
     } else {
         ESP_LOGI(TAG, "no saved Wi-Fi profile; starting BluFi provisioning");
-        ble_provision_init(&s_config, true);
+        ble_provision_init(&s_config, true, BLE_WINDOW_PROVISION);
     }
     update_snapshot();
     ESP_LOGI(TAG, "APSTA Wi-Fi state machine started");

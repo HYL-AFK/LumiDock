@@ -29,6 +29,12 @@ if ($ble -notmatch 'xTimer') {
 if ($wifi -notmatch 'ble_provision_open_window\(\)') {
     throw 'Wi-Fi failure and button flow must be able to open BLE provisioning'
 }
+if ($ble -notmatch 'BLE_BOOT_WINDOW_MS\s+\(30\s*\*\s*1000\)') {
+    throw 'BLE boot re-provision window must be defined (30 seconds).'
+}
+if ($wifi -notmatch 'BLE_WINDOW_BOOT') {
+    throw 'Saved-Wi-Fi boot path must open the boot re-provision window.'
+}
 if ($app -notmatch 'runtime_event_log_init\(\)') {
     throw 'runtime event log must be initialized during application startup'
 }

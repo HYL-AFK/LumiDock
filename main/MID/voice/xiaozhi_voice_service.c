@@ -26,17 +26,33 @@
 #include "timer_chime_audio.h"
 #include "timer_service.h"
 #include "voice_iot_command_service.h"
+#include "mcp_service.h"
 #include "radio_stream_service.h"
 
 #define XIAOZHI_EVENT_QUEUE_DEPTH 12U
 #define XIAOZHI_UPLINK_QUEUE_BYTES (64U * 1024U)
 #define XIAOZHI_TEXT_MAX_BYTES 1024U
 #define XIAOZHI_BINARY_MAX_BYTES 2048U
+/* An MCP reply is the JSON-RPC object plus this envelope; the widest one is the
+ * tools/list answer (its 13-tool catalogue alone is ~2.9 KB), so the frame
+ * buffer below is sized with that headroom on top of the session id.  It must
+ * stay larger than MCP_REPLY_MAX_BYTES in mcp_service.c. */
+#define XIAOZHI_MCP_FRAME_MAX_BYTES 5120U
 #define XIAOZHI_HELLO_TIMEOUT_US (8LL * 1000LL * 1000LL)
 #define XIAOZHI_PREWARM_READY_TIMEOUT_US (30LL * 1000LL * 1000LL)
 #define XIAOZHI_UI_ERROR_HOLD_US (2LL * 1000LL * 1000LL)
 #define XIAOZHI_PREWARM_RETRY_US (5LL * 1000LL * 1000LL)
+/* 电台在播时用户随时可能打断，等 5 秒等于让每一次唤醒都落在“没有热连接”的窗口
+ * 里，只能现建 TLS+握手（实测 1.0~2.5 秒）。电台一开播就先把 WSS 建好并保温，
+ * 唤醒时直接复用这条连接。 */
+#define XIAOZHI_PREWARM_RADIO_DELAY_US (300LL * 1000LL)
 #define XIAOZHI_PREWARM_RETRY_MAX_US (30LL * 1000LL * 1000LL)
+/* 电台让位是异步的：yield() 只置位，拉流任务要等自己那一轮循环退出才会关掉 HTTP/TLS
+ * 并归还内部 RAM。而 WSS 的 websocket task 要 4096 字节连续内部 RAM，实测电台拉流时
+ * 只剩 4631 字节 / 最大连续块 1920（"internal contiguous block below requested
+ * stack"），所以唤醒后必须等电台真的停稳再建连，否则每一次"电台在播时唤醒"都直接
+ * 吃一个连接失败。上限 300 ms，等不到就照常尝试，不把唤醒拖长。 */
+#define XIAOZHI_RADIO_PARK_WAIT_US (300LL * 1000LL)
 #define XIAOZHI_TRAFFIC_LOG_INTERVAL_US (1LL * 1000LL * 1000LL)
 #define XIAOZHI_OPUS_FRAME_INTERVAL_US (60LL * 1000LL)
 #define XIAOZHI_UPLINK_TAIL_FLUSH_FRAMES 2U
@@ -44,10 +60,13 @@
 #define XIAOZHI_UPLINK_MAIN_WRITE_WAIT_TIMEOUT_US (1200LL * 1000LL)
 #define XIAOZHI_WAKE_PRIMER_FRAMES 35U
 #define XIAOZHI_WAKE_PRIMER_TIMEOUT_US (10LL * 1000LL * 1000LL)
-#define XIAOZHI_FOLLOWUP_WINDOW_US (15LL * 1000LL * 1000LL)
-/* The vicp.fun tunnel server can exceed 10 s (PONG ages of 20-40 s were
- * observed in the field); 15 s avoids false "didn't catch that" timeouts
- * while the cloud ASR is merely slow. */
+/* Post-turn listening window.  6.4 s is enough for a speaker who wants
+ * another turn to start talking, and a longer hold only keeps the session and
+ * its UI alive for no benefit. */
+#define XIAOZHI_FOLLOWUP_WINDOW_US (6400LL * 1000LL)
+/* The official xiaozhi.me backend can take longer than 10 s before the first
+ * frame of a turn arrives; 15 s avoids a false "didn't catch that" timeout
+ * while the cloud is merely slow. */
 #define XIAOZHI_WAIT_RESPONSE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 #define XIAOZHI_EXIT_TTS_START_TIMEOUT_US (20LL * 1000LL * 1000LL)
 #define XIAOZHI_EXIT_TTS_FIRST_PACKET_TIMEOUT_US (8LL * 1000LL * 1000LL)
@@ -55,13 +74,56 @@
 /* Watchdog for the local error tone that answers a failed turn before the
  * session closes; the tone itself is 2 s, so 5 s leaves ample slack. */
 #define XIAOZHI_ERROR_TONE_DEADLINE_US (5LL * 1000LL * 1000LL)
+/* The local intent confirmation prompt is a very short (< 1.5 s) phrase; the
+ * 3 s watchdog only unblocks a queued cloud reply if the playout stalls. */
+#define XIAOZHI_LOCAL_PROMPT_DEADLINE_US (3LL * 1000LL * 1000LL)
+/* 云端音频到达时，本地提示音只剩这么多就不再硬切，让它把最后两个字说完。
+ *
+ * 让位走的是 audio_playback_service_abort()：discard_frames() + 直接静音 codec，
+ * 没有淡出。切在“正在执”和“行”之间就是一声闷响加半句话。实测云端首个音频包
+ * 平均 1.39 s 就位（23 个样本，中位数 1.07 s，最快 0.32 s），而提示音只有 0.95 s：
+ * 多数时候它能先放完，但总有一部分场景正巧切在句子中间。
+ *
+ * 250 ms 是折中：比一个汉字的时长大一点，够把最后一两个字收干净；代价上限也只有
+ * 250 ms，且只发生在“贴着尾声到达”这一种情况下。剩余更多时照旧立即让位——
+ * 让云端早出声仍然是优先级，这里只是不让它切出一句半截话。 */
+#define XIAOZHI_LOCAL_PROMPT_GRACE_US (250LL * 1000LL)
+/* 本地提示音统一为 16 kHz 单声道 s16le：每毫秒 32 字节。用来把 PCM 字节数换算成
+ * 墙上时间—— s_local_prompt_deadline_us 是 3 秒看门狗，不是音频结束点，两者不能混用。 */
+#define XIAOZHI_LOCAL_PROMPT_BYTES_PER_MS 32
+/* Embedded session prompts (boot greeting / exit / timeout / fallback) share
+ * the same playout.  The boot greeting is the longest: it concatenates four
+ * segments (period + spoken clock + weather copy + help offer).  The longest
+ * asset of each table measures about 5.2 s combined (0.75 greeting + 1.60
+ * clock + 1.36 weather + 1.52 offer).  The assets sit at TTS_RATE = +18% on
+ * purpose: at the original rate the four segments dragged and pushed the
+ * combined clip past 7.6 s, which sounded sluggish next to the cloud reply.
+ * Regenerating the PCMs with scripts/generate_prompt_tones.py is the only way
+ * these numbers move, so keep this comment in step with that script.  The
+ * total still fits inside the ten-second session watchdog below with room to
+ * spare. */
+#define XIAOZHI_LOCAL_SESSION_PROMPT_DEADLINE_US (10LL * 1000LL * 1000LL)
 #define XIAOZHI_BOOT_GREETING_TTS_TIMEOUT_US (8LL * 1000LL * 1000LL)
-#define XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US (15LL * 1000LL * 1000LL)
+/* The boot greeting hands over to exactly the same wait a normal turn uses. */
+#define XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US (6400LL * 1000LL)
 /* After a playback underrun, if the server sends neither more TTS audio nor
  * a tts stop frame within this window, the stream is declared stalled and
  * playback finishes locally instead of hanging until the WSS heartbeat
- * timeout kills the whole session (server-side turn loss). */
-#define XIAOZHI_TTS_STALL_TIMEOUT_US (16LL * 1000LL * 1000LL)
+ * timeout kills the whole session (server-side turn loss).
+ *
+ * 实测：云端把一段话拆成多句合成，两句之间最长能停 12.1~12.8 s（整段停顿期间设备
+ * 靠 underrun 补静音撑着）。5 s 的窗口撑不到那个洞，会在第二句到达之前就本地收尾，
+ * 第二句随后被当作 late TTS packet 丢掉——听感就是“话说到一半没了”，用户把它
+ * 描述成“卡顿丢字”。用户明确要求不丢字优先，所以取 15 s 盖住这个已测到的上限。
+ * 代价：云端真的丢了这一轮时，用户要等满 15 s 才回到可说话状态；真正死掉的连接
+ * 由 WSS 心跳（ping 10 s / pong 20 s）作最后兜底。 */
+#define XIAOZHI_TTS_STALL_TIMEOUT_US (15LL * 1000LL * 1000LL)
+/* 受理了云端 TTS 却一帧 PCM 都没出声的兜底。停顿看门狗只在“开播后又断流”
+   （UNDERRUN）时布防，如果播放根本没开播就永远不布防，而电台还停在“让位保活”
+   上，整机会卡在静音+无监听的状态里。实测：云端只发了 13 帧（780 ms）就静了
+   12.7 s，开播门槛永远凑不满，串口连开播日志都没有。只要首帧 PCM 到这个
+   时限还没出现，就本地收尾，把扬声器还给电台并结束这一轮。 */
+#define XIAOZHI_TTS_FIRST_PCM_TIMEOUT_US (10LL * 1000LL * 1000LL)
 /* The post-TTS echo guard is bounded.  VAD starts below 500 are treated as
  * residual speaker audio; strong user speech bypasses it immediately. */
 #define XIAOZHI_POST_PLAYBACK_SILENCE_GUARD_US (1500LL * 1000LL)
@@ -75,9 +137,17 @@
  * higher floor keeps ambient noise from opening a turn the user never asked
  * for, while clear close-mic speech still clears it. */
 #define XIAOZHI_BOOT_GREETING_DIRECT_REPLY_MIN_PEAK 700U
+/* The follow-up window is the session's last chance to stay alive, so a
+ * spurious VAD start there is worse than anywhere else: every ambient burst
+ * opens a fresh cloud turn and re-arms the window, so the device never reaches
+ * its follow-up timeout and sits in the listening state forever (observed
+ * 1268/2029/2229 peak bursts while the user stayed silent).  The user has just
+ * been talking to the device, so real speech is close-mic loud: require that
+ * level before the bounded window is consumed.  Anything below it keeps the
+ * window running so it can expire and close the session normally. */
+#define XIAOZHI_FOLLOWUP_DIRECT_REPLY_MIN_PEAK 2500U
 #define XIAOZHI_CAPTURE_LOW_LEVEL_RMS 200U
 #define XIAOZHI_MAX_OPUS_FRAME_BYTES 4096U
-#define XIAOZHI_BOOT_GREETING_TEXT_MAX_BYTES 384U
 #define XIAOZHI_SESSION_ID_MAX_BYTES 128U
 #define XIAOZHI_PIPELINE_INIT_STACK_BYTES 4096U
 
@@ -121,6 +191,7 @@ typedef enum
     VOICE_EVENT_TIMER_RING,
     VOICE_EVENT_TIMER_STOPPED,
     VOICE_EVENT_ERROR_TONE_FINISHED,
+    VOICE_EVENT_LOCAL_PROMPT_FINISHED,
 } voice_event_type_t;
 
 typedef struct
@@ -149,6 +220,18 @@ static int64_t s_last_timer_tick_us;
 /* Local error tone epoch and its closing watchdog deadline. */
 static uint32_t s_error_tone_epoch;
 static int64_t s_error_tone_deadline_us;
+/* Local intent confirmation prompt: epoch, active flag and its watchdog.
+ * The pending fields hold a cloud TTS start that arrived while the prompt
+ * was still playing, so the reply is released on prompt FINISHED instead of
+ * being dropped or interrupting the prompt. */
+static uint32_t s_local_prompt_epoch;
+static int64_t s_local_prompt_deadline_us;
+/* 提示音预计播完的墙上时刻。与上面的 3 秒看门狗是两回事：看门狗只防播放卡死，
+   这个才是“还剩多少音频没放”，优雅让位靠它判断。 */
+static int64_t s_local_prompt_end_us;
+static bool s_local_prompt_active;
+static bool s_pending_cloud_tts_after_prompt;
+static uint32_t s_pending_cloud_tts_turn_id;
 /* Set when "play radio" is acknowledged: the radio starts once the cloud
  * acknowledgement TTS finishes (see VOICE_EVENT_TTS_PLAYBACK_FINISHED). */
 static bool s_pending_radio_play;
@@ -202,6 +285,18 @@ static int64_t s_prewarm_retry_us;
  * start or when a foreground session begins. */
 static int64_t s_prewarm_retry_delay_us;
 static int64_t s_followup_deadline_us;
+/* 第一段聆听窗口没等到人说话时，已经播过一次“我没听清，可以再说一遍吗？”并重开。
+   第二次到期仍走原来的退出流程——不设这个标记就会无限重开，设备永远不回待机。
+   用户在窗口里真正开口（follow-up VAD start 过了峰值门限）或整段会话关闭时复位。 */
+static bool s_followup_retry_used;
+/* 唤醒那一刻是不是已经是电台模式（在放、或在重连路上）。收场时靠它区分两种
+   "电台在播"：
+   - 用户打断电台：答完要先把 XIAOZHI_FOLLOWUP_WINDOW_US 的听音窗口留满，
+     窗口期间电台继续让位（哑的，不存在自激），让用户能直接接话；
+   - 用户这一轮才下的"开电台"命令：他要的就是电台出声，不能压着窗口。
+   follow-up 续轮不经过唤醒事件，所以这个标记在整段对话里保持不变，直到
+   close_channel() 归还扬声器、或电台在本轮被拉起来时才清掉。 */
+static bool s_radio_on_before_turn;
 static int64_t s_response_deadline_us;
 /* True while the local error tone is answering a failed turn (wake words are
  * ignored then, and close_channel returns to the idle UI without flashing the
@@ -233,6 +328,7 @@ static int64_t s_tts_log_us;
 static int64_t s_tts_start_us;
 static int64_t s_tts_last_packet_us;
 static int64_t s_tts_stall_deadline_us;
+static int64_t s_tts_first_pcm_deadline_us;
 static bool s_tts_first_packet_seen;
 static bool s_tts_first_pcm_seen;
 static int64_t s_tts_packet_log_us;
@@ -257,6 +353,10 @@ static bool s_boot_greeting_direct_window_active;
 static int64_t s_boot_greeting_tts_deadline_us;
 static int64_t s_boot_greeting_reply_deadline_us;
 static bool s_discard_tts_stream;
+/* Set when the session ends because the exchange was complete: the server closed
+ * a delivered turn ("终止对话") or the farewell prompt drained.  The teardown
+ * then returns to the main page quietly - a normal exit is not a fault. */
+static bool s_session_exit_clean;
 static bool s_exit_prompt_pending;
 static bool s_playing_exit_prompt;
 static uint32_t s_exit_prompt_turn_id;
@@ -274,6 +374,27 @@ static int64_t s_exit_tts_playback_deadline_us;
 static bool s_exit_prompt_retried;
 static bool s_timeout_prompt_retried;
 static bool s_fallback_prompt_retried;
+/* Which prompt the shared AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT stream currently
+ * carries.  The official xiaozhi.me server rejects the [device_call] direct-TTS
+ * prefix, so the boot greeting, the exit farewell, the response-timeout hint
+ * and the uplink-failure fallback all play from embedded PCM assets; this kind
+ * decides what the session does once they drain. */
+typedef enum
+{
+    LOCAL_PROMPT_NONE = 0,
+    LOCAL_PROMPT_INTENT,
+    LOCAL_PROMPT_BOOT_GREETING,
+    LOCAL_PROMPT_EXIT,
+    LOCAL_PROMPT_TIMEOUT,
+    LOCAL_PROMPT_FALLBACK,
+} local_prompt_kind_t;
+static local_prompt_kind_t s_local_prompt_kind = LOCAL_PROMPT_NONE;
+/* Plays a single embedded PCM prompt through the shared playout.  The exit,
+ * timeout and fallback paths call this hundreds of lines before its definition,
+ * which sits next to the boot-greeting segment player, so it needs a forward
+ * declaration here. */
+static bool play_local_prompt_pcm(local_prompt_kind_t kind, const uint8_t *start,
+                                  const uint8_t *end, uint32_t *epoch_out);
 static uint32_t s_wss_connection_seq;
 static int s_last_uplink_send_result;
 static bool s_last_uplink_send_connected;
@@ -307,29 +428,22 @@ static void log_wss_wifi_state(void)
 }
 static char s_session_id[XIAOZHI_SESSION_ID_MAX_BYTES];
 static char s_authorization[600];
+/* MCP replies live here instead of on the session task stack: a tools/list
+ * answer can reach ~3 KB and that task only has 6 KB total.  process_text()
+ * is the only writer, so one buffer is enough. */
+static char s_mcp_tx_frame[XIAOZHI_MCP_FRAME_MAX_BYTES];
 static websocket_accumulator_t s_rx;
 
-/* 对话静默窗口到期后，从这里随机选择一条固定告别语发送给云端。 */
-static const char *const s_exit_phrases[] = {
-    "那我们今天先到这里啦，下次有需要随时找我～祝你一切顺利；",
-    "本次对话结束，期待下次再见，愿你今天过得愉快；",
-};
-
-/* Spoken when the cloud turn times out.  The user can replace these with
- * their own wording; each entry is wrapped in [device_call] and sent to the
- * server, which answers with TTS that plays back locally. */
-static const char *const s_timeout_phrases[] = {
-    "抱歉，我刚才没有听清你说的话，可以再和我说一遍吗；",
-    "刚刚好像没听清楚，你再说一次好吗；",
-};
-
-/* Spoken when a local turn fails (send failure, transport failure, playout
- * unavailable) so the user always hears an answer even on error paths.
- * Editable wording, same [device_call] mechanism as the timeout prompt. */
-static const char *const s_fallback_phrases[] = {
-    "抱歉，刚刚出了点小状况，我们再说一次吧；",
-    "好像遇到了一点问题，没关系，再和我说一次；",
-};
+/* The exit / timeout / fallback wording used to be cloud text wrapped in
+ * [device_call].  The official xiaozhi.me server rejects that prefix, so the
+ * copy is now frozen into pre-rendered PCM assets generated by
+ * scripts/generate_prompt_tones.py:
+ *
+ *   prompt_exit_16k_mono_s16le.pcm      <- 对话静默窗口到期后的固定告别语
+ *   prompt_timeout_16k_mono_s16le.pcm   <- 云端应答超时的提示语
+ *   prompt_fallback_16k_mono_s16le.pcm  <- 本地回合失败时的兜底提示语
+ *
+ * Re-run that script (and rebuild) to change the wording. */
 
 static void notify_uplink_task(void)
 {
@@ -817,20 +931,15 @@ static bool send_text(const char *text)
     return send_ws_text_raw(text);
 }
 
+/* The official server rejects [device_call], so the farewell is an embedded
+ * PCM asset instead of a cloud TTS request.  The function name is kept so the
+ * surrounding session state machine and its contracts stay stable. */
 static bool request_cloud_exit_prompt(void)
 {
-    if (!s_hello_ready || s_session_id[0] == '\0' || s_client == NULL ||
-        !esp_websocket_client_is_connected(s_client))
-    {
-        ESP_LOGW(TAG, "exit prompt unavailable: WSS session is not ready");
-        return false;
-    }
-    const uint32_t phrase_count = (uint32_t)(sizeof(s_exit_phrases) / sizeof(s_exit_phrases[0]));
-    const uint32_t index = (uint32_t)(esp_random() % phrase_count);
-    char request[512];
-    (void)snprintf(request, sizeof(request),
-                   "{\"type\":\"listen\",\"state\":\"detect\",\"text\":\"[device_call]%s\"}",
-                   s_exit_phrases[index]);
+    extern const uint8_t prompt_exit_pcm_start[] asm(
+        "_binary_prompt_exit_16k_mono_s16le_pcm_start");
+    extern const uint8_t prompt_exit_pcm_end[] asm(
+        "_binary_prompt_exit_16k_mono_s16le_pcm_end");
     ++s_turn_id;
     if (s_turn_id == 0U)
         ++s_turn_id;
@@ -841,128 +950,112 @@ static bool request_cloud_exit_prompt(void)
     s_fallback_prompt_pending = false;
     s_fallback_prompt_turn_id = 0U;
     s_state = XIAOZHI_VOICE_EXITING;
-    const int64_t now_us = esp_timer_get_time();
     s_response_deadline_us = 0;
-    /* The original speaking turn is superseded by the generated exit prompt;
-     * a late cloud reply for it must not collide with the exit TTS slot. */
+    /* The original speaking turn is superseded by the local farewell; a late
+     * cloud reply for it must not collide with the prompt slot. */
     s_waiting_turn_id = 0U;
-    s_exit_tts_start_deadline_us = now_us + XIAOZHI_EXIT_TTS_START_TIMEOUT_US;
+    s_exit_tts_start_deadline_us = 0;
     s_exit_tts_first_packet_deadline_us = 0;
     s_exit_tts_playback_deadline_us = 0;
     s_wait_for_turn_silence = false;
     xiaozhi_audio_pipeline_reset_after_silence();
     (void)discard_uplink_queue();
-    if (!send_text(request))
+    if (!play_local_prompt_pcm(LOCAL_PROMPT_EXIT, prompt_exit_pcm_start,
+                               prompt_exit_pcm_end, NULL))
     {
         s_exit_prompt_pending = false;
         s_exit_prompt_turn_id = 0U;
-        s_exit_tts_start_deadline_us = 0;
-        ESP_LOGW(TAG, "exit prompt request failed: stage=request_send; ending voice session");
+        ESP_LOGW(TAG, "exit prompt unavailable: local farewell PCM failed to play");
         return false;
     }
-    ESP_LOGI(TAG, "exit prompt selected: index=%u text=%s", (unsigned)index, s_exit_phrases[index]);
-    ESP_LOGI(TAG, "exit prompt request sent: turn=%u", (unsigned)s_exit_prompt_turn_id);
     s_exit_prompt_retried = false;
+    ESP_LOGI(TAG, "exit prompt selected: local PCM bytes=%u",
+             (unsigned)(prompt_exit_pcm_end - prompt_exit_pcm_start));
+    ESP_LOGI(TAG, "exit prompt playing: turn=%u", (unsigned)s_exit_prompt_turn_id);
     publish_ui_state(VOICE_UI_THINKING);
     return true;
 }
 
 static bool request_cloud_timeout_prompt(void)
 {
-    if (!s_hello_ready || s_session_id[0] == '\0' || s_client == NULL ||
-        !esp_websocket_client_is_connected(s_client))
-    {
-        ESP_LOGW(TAG, "timeout prompt unavailable: WSS session is not ready");
-        return false;
-    }
-    const uint32_t phrase_count = (uint32_t)(sizeof(s_timeout_phrases) / sizeof(s_timeout_phrases[0]));
-    const uint32_t index = (uint32_t)(esp_random() % phrase_count);
-    char request[512];
-    (void)snprintf(request, sizeof(request),
-                   "{\"type\":\"listen\",\"state\":\"detect\",\"text\":\"[device_call]%s\"}",
-                   s_timeout_phrases[index]);
+    extern const uint8_t prompt_timeout_pcm_start[] asm(
+        "_binary_prompt_timeout_16k_mono_s16le_pcm_start");
+    extern const uint8_t prompt_timeout_pcm_end[] asm(
+        "_binary_prompt_timeout_16k_mono_s16le_pcm_end");
     ++s_turn_id;
     if (s_turn_id == 0U)
         ++s_turn_id;
     s_timeout_prompt_turn_id = s_turn_id;
     s_timeout_prompt_pending = true;
     s_state = XIAOZHI_VOICE_EXITING;
-    const int64_t now_us = esp_timer_get_time();
     s_response_deadline_us = 0;
-    /* The timed-out turn is superseded by the generated timeout prompt; a
-     * late cloud reply for it must not collide with the prompt TTS slot. */
+    /* The timed-out turn is superseded by the local hint; a late cloud reply
+     * for it must not collide with the prompt slot. */
     s_waiting_turn_id = 0U;
     s_exit_prompt_pending = false;
     s_exit_prompt_turn_id = 0U;
     s_fallback_prompt_pending = false;
     s_fallback_prompt_turn_id = 0U;
-    s_exit_tts_start_deadline_us = now_us + XIAOZHI_EXIT_TTS_START_TIMEOUT_US;
+    s_exit_tts_start_deadline_us = 0;
     s_exit_tts_first_packet_deadline_us = 0;
     s_exit_tts_playback_deadline_us = 0;
     s_wait_for_turn_silence = false;
     xiaozhi_audio_pipeline_reset_after_silence();
     (void)discard_uplink_queue();
-    if (!send_text(request))
+    if (!play_local_prompt_pcm(LOCAL_PROMPT_TIMEOUT, prompt_timeout_pcm_start,
+                               prompt_timeout_pcm_end, NULL))
     {
         s_timeout_prompt_pending = false;
         s_timeout_prompt_turn_id = 0U;
-        s_exit_tts_start_deadline_us = 0;
-        ESP_LOGW(TAG, "timeout prompt request failed: stage=request_send; falling back to timeout UI");
+        ESP_LOGW(TAG, "timeout prompt unavailable: local PCM failed to play; falling back to timeout UI");
         return false;
     }
-    ESP_LOGI(TAG, "timeout prompt selected: index=%u text=%s", (unsigned)index, s_timeout_phrases[index]);
-    ESP_LOGI(TAG, "timeout prompt request sent: turn=%u", (unsigned)s_timeout_prompt_turn_id);
     s_timeout_prompt_retried = false;
+    ESP_LOGI(TAG, "timeout prompt selected: local PCM bytes=%u",
+             (unsigned)(prompt_timeout_pcm_end - prompt_timeout_pcm_start));
+    ESP_LOGI(TAG, "timeout prompt playing: turn=%u", (unsigned)s_timeout_prompt_turn_id);
     publish_ui_state(VOICE_UI_THINKING);
     return true;
 }
 
 static bool request_cloud_fallback_prompt(void)
 {
-    if (!s_hello_ready || s_session_id[0] == '\0' || s_client == NULL ||
-        !esp_websocket_client_is_connected(s_client))
-    {
-        ESP_LOGW(TAG, "fallback prompt unavailable: WSS session is not ready");
-        return false;
-    }
-    const uint32_t phrase_count = (uint32_t)(sizeof(s_fallback_phrases) / sizeof(s_fallback_phrases[0]));
-    const uint32_t index = (uint32_t)(esp_random() % phrase_count);
-    char request[512];
-    (void)snprintf(request, sizeof(request),
-                   "{\"type\":\"listen\",\"state\":\"detect\",\"text\":\"[device_call]%s\"}",
-                   s_fallback_phrases[index]);
+    extern const uint8_t prompt_fallback_pcm_start[] asm(
+        "_binary_prompt_fallback_16k_mono_s16le_pcm_start");
+    extern const uint8_t prompt_fallback_pcm_end[] asm(
+        "_binary_prompt_fallback_16k_mono_s16le_pcm_end");
     ++s_turn_id;
     if (s_turn_id == 0U)
         ++s_turn_id;
     s_fallback_prompt_turn_id = s_turn_id;
     s_fallback_prompt_pending = true;
     s_state = XIAOZHI_VOICE_EXITING;
-    const int64_t now_us = esp_timer_get_time();
     s_response_deadline_us = 0;
-    /* The failed turn is superseded by the generated fallback prompt; a late
-     * cloud reply for it must not collide with the prompt TTS slot. */
+    /* The failed turn is superseded by the local fallback hint; a late cloud
+     * reply for it must not collide with the prompt slot. */
     s_waiting_turn_id = 0U;
     s_exit_prompt_pending = false;
     s_exit_prompt_turn_id = 0U;
     s_timeout_prompt_pending = false;
     s_timeout_prompt_turn_id = 0U;
-    s_exit_tts_start_deadline_us = now_us + XIAOZHI_EXIT_TTS_START_TIMEOUT_US;
+    s_exit_tts_start_deadline_us = 0;
     s_exit_tts_first_packet_deadline_us = 0;
     s_exit_tts_playback_deadline_us = 0;
     s_wait_for_turn_silence = false;
     xiaozhi_audio_pipeline_reset_after_silence();
     (void)discard_uplink_queue();
-    if (!send_text(request))
+    if (!play_local_prompt_pcm(LOCAL_PROMPT_FALLBACK, prompt_fallback_pcm_start,
+                               prompt_fallback_pcm_end, NULL))
     {
         s_fallback_prompt_pending = false;
         s_fallback_prompt_turn_id = 0U;
-        s_exit_tts_start_deadline_us = 0;
-        ESP_LOGW(TAG, "fallback prompt request failed: stage=request_send; ending voice session");
+        ESP_LOGW(TAG, "fallback prompt unavailable: local PCM failed to play; ending voice session");
         return false;
     }
-    ESP_LOGI(TAG, "fallback prompt selected: index=%u text=%s", (unsigned)index, s_fallback_phrases[index]);
-    ESP_LOGI(TAG, "fallback prompt request sent: turn=%u", (unsigned)s_fallback_prompt_turn_id);
     s_fallback_prompt_retried = false;
+    ESP_LOGI(TAG, "fallback prompt selected: local PCM bytes=%u",
+             (unsigned)(prompt_fallback_pcm_end - prompt_fallback_pcm_start));
+    ESP_LOGI(TAG, "fallback prompt playing: turn=%u", (unsigned)s_fallback_prompt_turn_id);
     publish_ui_state(VOICE_UI_THINKING);
     return true;
 }
@@ -983,6 +1076,8 @@ static bool begin_error_tone(void)
     if (s_error_tone_epoch == 0U)
         ++s_error_tone_epoch;
     const uint32_t epoch = s_error_tone_epoch;
+    /* 抢扬声器之前先让电台退开：让位和停止不是一回事，电台的整体流程要活着。 */
+    (void)radio_stream_service_yield();
     if (audio_playback_service_begin(AUDIO_PLAYOUT_SOURCE_ERROR_TONE, epoch, 8U) != ESP_OK)
     {
         ESP_LOGW(TAG, "error tone begin failed: epoch=%u", (unsigned)epoch);
@@ -1007,6 +1102,163 @@ static bool begin_error_tone(void)
     ESP_LOGI(TAG, "local error tone queued: epoch=%u bytes=%u", (unsigned)epoch,
              (unsigned)pcm_bytes);
     return true;
+}
+
+/* Heuristic that decides which confirmation prompt to play when the utterance
+ * is not a local IoT command: query keywords (weather/time/date/temperature)
+ * choose "正在查询", anything else is treated as chat and plays "正在思考".
+ * The plan accepts the rare mis-hit because it only changes the prompt copy,
+ * never the eventual cloud reply. */
+static bool is_query_intent(const char *text)
+{
+    if (text == NULL) return false;
+    static const char *const query_keywords[] = {
+        "天气", "几点", "时间", "日期", "星期", "温度", "多少度", "预报",
+        "今天", "明天", "现在几点", "几点钟", "何时", "多久", "多长时间",
+        "几月", "几号", "几时", "下雨", "晴天", "阴天", "下雪", "气温",
+        "湿度", "穿衣", "风向",
+    };
+    for (size_t i = 0U; i < sizeof(query_keywords) / sizeof(query_keywords[0]); ++i) {
+        if (strstr(text, query_keywords[i]) != NULL) return true;
+    }
+    return false;
+}
+
+/* One embedded PCM segment.  A composite prompt such as the boot greeting is a
+ * sequence of these; the shared playout is a streaming producer/consumer, so
+ * concatenating short assets costs flash but no extra RAM. */
+typedef struct
+{
+    const uint8_t *start;
+    const uint8_t *end;
+} local_pcm_segment_t;
+
+/* Plays an embedded PCM prompt through the shared playout.  Mirrors
+ * begin_error_tone() but uses AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT so its FINISHED
+ * is dispatched by kind: an intent prompt releases a queued cloud reply, while
+ * the session prompts (boot greeting / exit / timeout / fallback) resume their
+ * own part of the state machine.
+ *
+ * Every segment is enqueued back to back before finish() is called, so the
+ * playout task never runs dry between them: audio_playback_service_enqueue_pcm()
+ * blocks on the frame queue instead of dropping the tail of a segment. */
+static bool play_local_prompt_segments(local_prompt_kind_t kind,
+                                       const local_pcm_segment_t *segments,
+                                       size_t segment_count, uint32_t *epoch_out)
+{
+    if (segments == NULL || segment_count == 0U)
+    {
+        ESP_LOGW(TAG, "local prompt rejected: no segment supplied");
+        return false;
+    }
+    size_t total_bytes = 0U;
+    for (size_t index = 0U; index < segment_count; ++index)
+    {
+        if (segments[index].start == NULL || segments[index].end <= segments[index].start)
+        {
+            ESP_LOGW(TAG, "local prompt rejected: segment %u is empty", (unsigned)index);
+            return false;
+        }
+        total_bytes += (size_t)(segments[index].end - segments[index].start);
+    }
+    ++s_local_prompt_epoch;
+    if (s_local_prompt_epoch == 0U) ++s_local_prompt_epoch;
+    const uint32_t epoch = s_local_prompt_epoch;
+    /* 抢扬声器之前先让电台退开：让位和停止不是一回事，电台的整体流程要活着。 */
+    (void)radio_stream_service_yield();
+    if (audio_playback_service_begin(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, epoch, 8U) != ESP_OK) {
+        ESP_LOGW(TAG, "local prompt begin failed: epoch=%u", (unsigned)epoch);
+        return false;
+    }
+    for (size_t index = 0U; index < segment_count; ++index)
+    {
+        const uint8_t *segment = segments[index].start;
+        const size_t segment_bytes = (size_t)(segments[index].end - segment);
+        size_t offset = 0U;
+        while (offset < segment_bytes)
+        {
+            const size_t chunk = (segment_bytes - offset) > 2048U ? 2048U : (segment_bytes - offset);
+            if (audio_playback_service_enqueue_pcm(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, epoch,
+                                                  segment + offset, chunk) != ESP_OK)
+            {
+                ESP_LOGW(TAG, "local prompt enqueue failed: epoch=%u segment=%u offset=%u",
+                         (unsigned)epoch, (unsigned)index, (unsigned)offset);
+                audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, epoch);
+                return false;
+            }
+            offset += chunk;
+        }
+    }
+    (void)audio_playback_service_finish(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, epoch);
+    if (epoch_out != NULL) *epoch_out = epoch;
+    s_local_prompt_active = true;
+    s_local_prompt_kind = kind;
+    const int64_t deadline_us =
+        kind == LOCAL_PROMPT_INTENT ? XIAOZHI_LOCAL_PROMPT_DEADLINE_US
+                                    : XIAOZHI_LOCAL_SESSION_PROMPT_DEADLINE_US;
+    const int64_t queued_us = esp_timer_get_time();
+    s_local_prompt_deadline_us = queued_us + deadline_us;
+    /* 排队时播放可能已经开始了几十毫秒，所以这个估值偏晚。偏晚意味着更容易走
+       “让它说完”——正是我们想要的方向。 */
+    s_local_prompt_end_us =
+        queued_us + (int64_t)(total_bytes / XIAOZHI_LOCAL_PROMPT_BYTES_PER_MS) * 1000LL;
+    ESP_LOGI(TAG, "local prompt queued: kind=%d epoch=%u segments=%u bytes=%u", (int)kind,
+             (unsigned)epoch, (unsigned)segment_count, (unsigned)total_bytes);
+    return true;
+}
+
+/* Single-asset wrapper: the intent, exit, timeout and fallback prompts are
+ * still one embedded file each. */
+static bool play_local_prompt_pcm(local_prompt_kind_t kind, const uint8_t *start,
+                                  const uint8_t *end, uint32_t *epoch_out)
+{
+    const local_pcm_segment_t single = {
+        .start = start,
+        .end = end,
+    };
+    return play_local_prompt_segments(kind, &single, 1U, epoch_out);
+}
+
+/* Starts the cloud TTS reply that was held behind a still-playing local prompt.
+ * This is the response-turn subset of the tts start handling in process_text;
+ * it must only be called after the prompt FINISHED so begin_tts_playback does
+ * not truncate it. */
+static void resume_deferred_cloud_tts(void)
+{
+    s_discard_tts_stream = false;
+    s_playing_turn_id = s_pending_cloud_tts_turn_id;
+    s_waiting_turn_id = 0U;
+    s_greeting_turn_id = 0U;
+    s_boot_greeting_id = 0U;
+    s_playing_boot_greeting = false;
+    s_playing_wake_greeting = false;
+    s_playing_exit_prompt = false;
+    s_playing_timeout_prompt = false;
+    s_playing_fallback_prompt = false;
+    s_exit_prompt_pending = false;
+    s_timeout_prompt_pending = false;
+    s_fallback_prompt_pending = false;
+    if (xiaozhi_audio_pipeline_begin_tts_playback(&s_tts_playback_epoch) != ESP_OK) {
+        s_discard_tts_stream = true;
+        s_playing_turn_id = 0U;
+        ESP_LOGW(TAG, "deferred cloud TTS rejected: shared PCM playout unavailable");
+        s_state = XIAOZHI_VOICE_WAIT_WAKE;
+        publish_ui_state(VOICE_UI_ERROR);
+        schedule_ui_idle_after(XIAOZHI_UI_ERROR_HOLD_US);
+        return;
+    }
+    s_state = XIAOZHI_VOICE_TTS_BUFFERING;
+    s_followup_deadline_us = 0;
+    s_response_deadline_us = 0;
+    s_boot_greeting_tts_deadline_us = 0;
+    s_tts_start_us = esp_timer_get_time();
+    s_tts_last_packet_us = 0;
+    s_tts_stall_deadline_us = 0;
+    s_tts_first_pcm_deadline_us = s_tts_start_us + XIAOZHI_TTS_FIRST_PCM_TIMEOUT_US;
+    s_tts_first_packet_seen = false;
+    s_tts_first_pcm_seen = false;
+    ESP_LOGI(TAG, "deferred cloud TTS started after local prompt: turn=%u",
+             (unsigned)s_playing_turn_id);
 }
 
 /* A generated prompt could not be requested (WSS dead) or its cloud TTS
@@ -1095,8 +1347,58 @@ static void log_tts_traffic(size_t bytes)
     s_tts_log_us = now_us;
 }
 
+/* A deferred media start can outlive the acknowledgement that raised it: the
+ * cloud may call the tool after its TTS already drained, or the turn may have
+ * moved on before the request arrived.  This is the backstop run from the idle
+ * 1 s tick so such a request is never silently dropped. */
+static void consume_deferred_media_starts(void)
+{
+    /* While the cloud still owns the speaker, starting either one here would be
+     * cut off by (or would fight) the TTS that is about to play, so the turn
+     * handlers keep that job. */
+    const bool cloud_owns_speaker =
+        s_state == XIAOZHI_VOICE_WAIT_RESPONSE ||
+        s_state == XIAOZHI_VOICE_TTS_BUFFERING ||
+        s_state == XIAOZHI_VOICE_SPEAKING ||
+        s_state == XIAOZHI_VOICE_TTS_DRAINING ||
+        s_state == XIAOZHI_VOICE_BOOT_GREETING_WAIT_TTS ||
+        s_state == XIAOZHI_VOICE_BOOT_GREETING_WAIT_REPLY ||
+        s_state == XIAOZHI_VOICE_ERROR_TONE;
+    if (cloud_owns_speaker)
+        return;
+    /* 没有活跃会话才归还扬声器：LISTENING/WAIT_SPEECH 阶段归还等于对着麦克风放
+       电台，立刻又会被自己的声音触发一轮上行（AEC 关闭，这是报错的根因）。 */
+    if (!s_session_active)
+        (void)radio_stream_service_regain();
+    if (s_pending_countdown_start || mcp_service_pending_countdown())
+    {
+        s_pending_countdown_start = false;
+        mcp_service_clear_pending_countdown();
+        const timer_service_cmd_result_t result = timer_service_start_pending_countdowns();
+        ESP_LOGI(TAG, "deferred countdown finalized by the idle tick: result=%d", (int)result);
+    }
+    if (s_pending_radio_play || mcp_service_pending_radio())
+    {
+        s_pending_radio_play = false;
+        mcp_service_clear_pending_radio();
+        /* 电台是这一轮才要求的，收场时不该为它留听音窗口。 */
+        s_radio_on_before_turn = false;
+        ESP_LOGI(TAG, "deferred radio start released by the idle tick");
+        if (radio_stream_service_play_default() != ESP_OK)
+        {
+            ESP_LOGW(TAG, "radio start failed from the idle tick");
+        }
+    }
+}
+
 static void close_channel(bool refresh_credentials)
 {
+    /* Consumed up front: a duplicate close must not leave the flag set and
+     * swallow the error face of a later, real fault. */
+    const bool clean_exit = s_session_exit_clean;
+    s_session_exit_clean = false;
+    /* 会话收尾：下一次唤醒重新拥有一次“没听清”重开。 */
+    s_followup_retry_used = false;
     if (s_client_cleanup_in_progress)
     {
         ESP_LOGW(TAG, "WSS cleanup already owned; duplicate close ignored");
@@ -1104,12 +1406,22 @@ static void close_channel(bool refresh_credentials)
     }
     s_client_cleanup_in_progress = true;
     const bool had_active_session = s_session_active;
-    if (s_pending_countdown_start)
+    /* A deferred "play radio" must survive this teardown: the stream is
+     * independent of the voice session, so it is released at the end of the
+     * function instead of being dropped with the rest of the turn state. */
+    const bool release_radio_after_close =
+        s_pending_radio_play || mcp_service_pending_radio();
+    /* 用户拍板：唤醒时电台就已经在播的那段对话，一旦收场就把电台一并结束，
+       下次要听重新说"打开电台"。本轮自己打开的不算——启动电台时会把
+       s_radio_on_before_turn 清掉，那是用户当场要听的结果，收场只归还扬声器。 */
+    const bool radio_played_through_turn = s_radio_on_before_turn;
+    if (s_pending_countdown_start || mcp_service_pending_countdown())
     {
+        s_pending_countdown_start = false;
+        mcp_service_clear_pending_countdown();
         const timer_service_cmd_result_t result = timer_service_start_pending_countdowns();
         ESP_LOGI(TAG, "deferred countdown finalized on voice chain exit: result=%d",
                  (int)result);
-        s_pending_countdown_start = false;
     }
     s_uplink_enabled = false;
     s_uplink_terminal_active = true;
@@ -1131,7 +1443,22 @@ static void close_channel(bool refresh_credentials)
         audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_ERROR_TONE, s_error_tone_epoch);
     }
     s_error_tone_deadline_us = 0;
+    /* A closing session must also silence a local confirmation prompt (e.g. the
+     * watchdog or a timer ring closed the turn before it finished). */
+    if (s_local_prompt_epoch != 0U)
+    {
+        audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, s_local_prompt_epoch);
+    }
+    s_local_prompt_active = false;
+    s_local_prompt_deadline_us = 0;
+    s_local_prompt_end_us = 0;
+    s_local_prompt_kind = LOCAL_PROMPT_NONE;
+    s_pending_cloud_tts_after_prompt = false;
+    s_pending_cloud_tts_turn_id = 0U;
     s_pending_radio_play = false;
+    mcp_service_clear_pending_radio();
+    /* 本地电台命令的屏蔽只服务本轮：下一轮从头判断云端该不该碰电台。 */
+    mcp_service_set_radio_tools_blocked(false);
     s_hello_ready = false;
     s_pending_wake = false;
     s_wait_for_turn_silence = false;
@@ -1177,6 +1504,7 @@ static void close_channel(bool refresh_credentials)
     s_tts_start_us = 0;
     s_tts_last_packet_us = 0;
     s_tts_stall_deadline_us = 0;
+    s_tts_first_pcm_deadline_us = 0;
     s_tts_first_packet_seen = false;
     reset_uplink_pacing();
     s_state = XIAOZHI_VOICE_WAIT_WAKE;
@@ -1187,7 +1515,7 @@ static void close_channel(bool refresh_credentials)
         s_timeout_ui_active = false;
         publish_ui_state(VOICE_UI_IDLE);
     }
-    else if (had_active_session)
+    else if (had_active_session && !clean_exit)
     {
         publish_ui_state(VOICE_UI_ERROR);
         schedule_ui_idle_after(XIAOZHI_UI_ERROR_HOLD_US);
@@ -1226,11 +1554,42 @@ static void close_channel(bool refresh_credentials)
         xiaozhi_activation_service_refresh_credentials();
     if (s_initialized && xiaozhi_activation_service_is_activated())
     {
-        s_prewarm_retry_us = esp_timer_get_time() + XIAOZHI_PREWARM_RETRY_US;
+        /* 电台（含让位/暂停）在播期间保持热连接。release_radio_after_close 说明
+           电台是在本次关闭之后才启动的，所以它也要算进来。 */
+        const bool prewarm_radio_on =
+            release_radio_after_close || radio_stream_service_is_requested();
+        const int64_t prewarm_delay_us =
+            prewarm_radio_on ? XIAOZHI_PREWARM_RADIO_DELAY_US : XIAOZHI_PREWARM_RETRY_US;
+        s_prewarm_retry_us = esp_timer_get_time() + prewarm_delay_us;
         s_prewarm_retry_delay_us = 0; /* fresh schedule: reset the backoff ramp */
-        ESP_LOGI(TAG, "WSS idle prewarm scheduled: delay_ms=%u", (unsigned)(XIAOZHI_PREWARM_RETRY_US / 1000LL));
+        ESP_LOGI(TAG, "WSS idle prewarm scheduled: delay_ms=%lld radio=%d",
+                 (long long)(prewarm_delay_us / 1000LL), (int)prewarm_radio_on);
+    }
+    /* Released last: every playback abort above would have killed a stream that
+     * had been started earlier in this teardown. */
+    if (release_radio_after_close)
+    {
+        ESP_LOGI(TAG, "deferred radio start released after the voice chain closed");
+        if (radio_stream_service_play_default() != ESP_OK)
+        {
+            ESP_LOGW(TAG, "radio start failed after the voice chain closed");
+        }
+        (void)radio_stream_service_regain();
+    }
+    else if (radio_played_through_turn)
+    {
+        ESP_LOGI(TAG, "voice session over; the radio that played through it stops here");
+        (void)radio_stream_service_stop();
+    }
+    else
+    {
+        /* 会话收尾必须归还扬声器：错误音、超时关闭、唤醒后没说话就退出等路径都会
+           走到这里，让位不解除的话电台就一直是静音的。 */
+        (void)radio_stream_service_regain();
     }
     s_client_cleanup_in_progress = false;
+    /* 这段对话结束，下一次唤醒重新判定"电台是不是已经在放"。 */
+    s_radio_on_before_turn = false;
 }
 
 static bool send_uplink_packet(const uint8_t *opus, size_t opus_len, const char *operation)
@@ -1429,6 +1788,17 @@ static void finish_boot_greeting_failure(const char *reason)
 {
     xiaozhi_audio_pipeline_abort_playback();
     xiaozhi_audio_pipeline_reset_wake_word();
+    /* The greeting is a local prompt now; drop its bookkeeping so a late
+     * FINISHED event cannot re-enter the reply window after the failure. */
+    if (s_local_prompt_kind == LOCAL_PROMPT_BOOT_GREETING)
+    {
+        s_local_prompt_active = false;
+        s_local_prompt_deadline_us = 0;
+        s_local_prompt_end_us = 0;
+        s_local_prompt_kind = LOCAL_PROMPT_NONE;
+        if (s_local_prompt_epoch != 0U)
+            audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, s_local_prompt_epoch);
+    }
     s_boot_greeting_id = 0U;
     s_playing_boot_greeting = false;
     s_boot_greeting_direct_window_active = false;
@@ -1447,83 +1817,223 @@ static void finish_boot_greeting_failure(const char *reason)
     schedule_ui_idle_after(XIAOZHI_UI_ERROR_HOLD_US);
 }
 
-static const char *boot_greeting_salutation(int hour)
+/* Declares the _binary_* start/end pair of one embedded asset.  The naming
+ * rule (<symbol>_16k_mono_s16le.pcm) is shared with generate_prompt_tones.py. */
+#define DECLARE_EMBEDDED_PCM(symbol)                                             \
+    extern const uint8_t symbol##_pcm_start[] asm(                               \
+        "_binary_" #symbol "_16k_mono_s16le_pcm_start");                         \
+    extern const uint8_t symbol##_pcm_end[] asm(                                 \
+        "_binary_" #symbol "_16k_mono_s16le_pcm_end")
+
+DECLARE_EMBEDDED_PCM(prompt_greet_forenoon);
+DECLARE_EMBEDDED_PCM(prompt_greet_noon);
+DECLARE_EMBEDDED_PCM(prompt_greet_afternoon);
+DECLARE_EMBEDDED_PCM(prompt_greet_evening);
+DECLARE_EMBEDDED_PCM(prompt_greet_night);
+DECLARE_EMBEDDED_PCM(prompt_greet_generic);
+DECLARE_EMBEDDED_PCM(prompt_greet_closing);
+
+DECLARE_EMBEDDED_PCM(prompt_hour_00);
+DECLARE_EMBEDDED_PCM(prompt_hour_01);
+DECLARE_EMBEDDED_PCM(prompt_hour_02);
+DECLARE_EMBEDDED_PCM(prompt_hour_03);
+DECLARE_EMBEDDED_PCM(prompt_hour_04);
+DECLARE_EMBEDDED_PCM(prompt_hour_05);
+DECLARE_EMBEDDED_PCM(prompt_hour_06);
+DECLARE_EMBEDDED_PCM(prompt_hour_07);
+DECLARE_EMBEDDED_PCM(prompt_hour_08);
+DECLARE_EMBEDDED_PCM(prompt_hour_09);
+DECLARE_EMBEDDED_PCM(prompt_hour_10);
+DECLARE_EMBEDDED_PCM(prompt_hour_11);
+DECLARE_EMBEDDED_PCM(prompt_hour_12);
+DECLARE_EMBEDDED_PCM(prompt_hour_13);
+DECLARE_EMBEDDED_PCM(prompt_hour_14);
+DECLARE_EMBEDDED_PCM(prompt_hour_15);
+DECLARE_EMBEDDED_PCM(prompt_hour_16);
+DECLARE_EMBEDDED_PCM(prompt_hour_17);
+DECLARE_EMBEDDED_PCM(prompt_hour_18);
+DECLARE_EMBEDDED_PCM(prompt_hour_19);
+DECLARE_EMBEDDED_PCM(prompt_hour_20);
+DECLARE_EMBEDDED_PCM(prompt_hour_21);
+DECLARE_EMBEDDED_PCM(prompt_hour_22);
+DECLARE_EMBEDDED_PCM(prompt_hour_23);
+
+DECLARE_EMBEDDED_PCM(prompt_wx_clear);
+DECLARE_EMBEDDED_PCM(prompt_wx_cloudy);
+DECLARE_EMBEDDED_PCM(prompt_wx_fog);
+DECLARE_EMBEDDED_PCM(prompt_wx_rain);
+DECLARE_EMBEDDED_PCM(prompt_wx_snow);
+DECLARE_EMBEDDED_PCM(prompt_wx_thunder);
+DECLARE_EMBEDDED_PCM(prompt_wx_unknown);
+
+/* One embedded asset plus the bucket name used in COM6 diagnostics. */
+typedef struct
 {
-    if (hour < 11)
-        return "早上好";
-    if (hour < 14)
-        return "中午好";
-    if (hour < 18)
-        return "下午好";
-    return "晚上好";
+    const uint8_t *start;
+    const uint8_t *end;
+    const char *name;
+} boot_greeting_asset_t;
+
+/* Period greeting.  The value is the index into s_boot_period_pcm. */
+typedef enum
+{
+    BOOT_PERIOD_FORENOON = 0, /* 05:00 - 11:59 */
+    BOOT_PERIOD_NOON,         /* 12:00 - 12:59 */
+    BOOT_PERIOD_AFTERNOON,    /* 13:00 - 17:59 */
+    BOOT_PERIOD_EVENING,      /* 18:00 - 22:59 */
+    BOOT_PERIOD_NIGHT,        /* 23:00 - 04:59 */
+    BOOT_PERIOD_GENERIC,      /* clock not refreshed yet */
+    BOOT_PERIOD_COUNT,
+} boot_period_t;
+
+/* Weather copy.  The value is the index into s_boot_weather_pcm. */
+typedef enum
+{
+    BOOT_WEATHER_CLEAR = 0,
+    BOOT_WEATHER_CLOUDY,
+    BOOT_WEATHER_FOG,
+    BOOT_WEATHER_RAIN,
+    BOOT_WEATHER_SNOW,
+    BOOT_WEATHER_THUNDER,
+    BOOT_WEATHER_UNKNOWN,
+    BOOT_WEATHER_COUNT,
+} boot_weather_t;
+
+static const boot_greeting_asset_t s_boot_period_pcm[BOOT_PERIOD_COUNT] = {
+    {prompt_greet_forenoon_pcm_start, prompt_greet_forenoon_pcm_end, "forenoon"},
+    {prompt_greet_noon_pcm_start, prompt_greet_noon_pcm_end, "noon"},
+    {prompt_greet_afternoon_pcm_start, prompt_greet_afternoon_pcm_end, "afternoon"},
+    {prompt_greet_evening_pcm_start, prompt_greet_evening_pcm_end, "evening"},
+    {prompt_greet_night_pcm_start, prompt_greet_night_pcm_end, "night"},
+    {prompt_greet_generic_pcm_start, prompt_greet_generic_pcm_end, "generic"},
+};
+
+/* Indexed by struct tm::tm_hour, so the live hour is a direct table index. */
+static const boot_greeting_asset_t s_boot_hour_pcm[24] = {
+    {prompt_hour_00_pcm_start, prompt_hour_00_pcm_end, "hour_00"},
+    {prompt_hour_01_pcm_start, prompt_hour_01_pcm_end, "hour_01"},
+    {prompt_hour_02_pcm_start, prompt_hour_02_pcm_end, "hour_02"},
+    {prompt_hour_03_pcm_start, prompt_hour_03_pcm_end, "hour_03"},
+    {prompt_hour_04_pcm_start, prompt_hour_04_pcm_end, "hour_04"},
+    {prompt_hour_05_pcm_start, prompt_hour_05_pcm_end, "hour_05"},
+    {prompt_hour_06_pcm_start, prompt_hour_06_pcm_end, "hour_06"},
+    {prompt_hour_07_pcm_start, prompt_hour_07_pcm_end, "hour_07"},
+    {prompt_hour_08_pcm_start, prompt_hour_08_pcm_end, "hour_08"},
+    {prompt_hour_09_pcm_start, prompt_hour_09_pcm_end, "hour_09"},
+    {prompt_hour_10_pcm_start, prompt_hour_10_pcm_end, "hour_10"},
+    {prompt_hour_11_pcm_start, prompt_hour_11_pcm_end, "hour_11"},
+    {prompt_hour_12_pcm_start, prompt_hour_12_pcm_end, "hour_12"},
+    {prompt_hour_13_pcm_start, prompt_hour_13_pcm_end, "hour_13"},
+    {prompt_hour_14_pcm_start, prompt_hour_14_pcm_end, "hour_14"},
+    {prompt_hour_15_pcm_start, prompt_hour_15_pcm_end, "hour_15"},
+    {prompt_hour_16_pcm_start, prompt_hour_16_pcm_end, "hour_16"},
+    {prompt_hour_17_pcm_start, prompt_hour_17_pcm_end, "hour_17"},
+    {prompt_hour_18_pcm_start, prompt_hour_18_pcm_end, "hour_18"},
+    {prompt_hour_19_pcm_start, prompt_hour_19_pcm_end, "hour_19"},
+    {prompt_hour_20_pcm_start, prompt_hour_20_pcm_end, "hour_20"},
+    {prompt_hour_21_pcm_start, prompt_hour_21_pcm_end, "hour_21"},
+    {prompt_hour_22_pcm_start, prompt_hour_22_pcm_end, "hour_22"},
+    {prompt_hour_23_pcm_start, prompt_hour_23_pcm_end, "hour_23"},
+};
+
+static const boot_greeting_asset_t s_boot_weather_pcm[BOOT_WEATHER_COUNT] = {
+    {prompt_wx_clear_pcm_start, prompt_wx_clear_pcm_end, "clear"},
+    {prompt_wx_cloudy_pcm_start, prompt_wx_cloudy_pcm_end, "cloudy"},
+    {prompt_wx_fog_pcm_start, prompt_wx_fog_pcm_end, "fog"},
+    {prompt_wx_rain_pcm_start, prompt_wx_rain_pcm_end, "rain"},
+    {prompt_wx_snow_pcm_start, prompt_wx_snow_pcm_end, "snow"},
+    {prompt_wx_thunder_pcm_start, prompt_wx_thunder_pcm_end, "thunder"},
+    {prompt_wx_unknown_pcm_start, prompt_wx_unknown_pcm_end, "unknown"},
+};
+
+/* Fourth segment - the fixed help offer.  Unlike the three tables above it
+ * offers no choices: it is appended verbatim after the weather copy so the
+ * greeting ends on an invitation to talk instead of a statement about the
+ * weather. */
+static const boot_greeting_asset_t s_boot_closing_pcm = {
+    prompt_greet_closing_pcm_start, prompt_greet_closing_pcm_end, "closing"};
+
+static boot_period_t boot_period_from_hour(int hour)
+{
+    if (hour >= 5 && hour <= 11) return BOOT_PERIOD_FORENOON;
+    if (hour == 12) return BOOT_PERIOD_NOON;
+    if (hour >= 13 && hour <= 17) return BOOT_PERIOD_AFTERNOON;
+    if (hour >= 18 && hour <= 22) return BOOT_PERIOD_EVENING;
+    return BOOT_PERIOD_NIGHT;
 }
 
-static bool build_boot_greeting_text(char *greeting, size_t greeting_size)
+/* Maps weather_service.c's weather_text() onto a spoken weather line.  Note
+ * that weather_text() returns "未知" when a WMO code has no mapping: that must
+ * not fall through to the clear-weather copy. */
+static boot_weather_t boot_weather_from_text(const char *weather)
 {
+    if (weather == NULL || weather[0] == '\0') return BOOT_WEATHER_UNKNOWN;
+    if (strstr(weather, "雪") != NULL || strstr(weather, "冰") != NULL) return BOOT_WEATHER_SNOW;
+    if (strstr(weather, "雷") != NULL) return BOOT_WEATHER_THUNDER;
+    if (strstr(weather, "雨") != NULL) return BOOT_WEATHER_RAIN;
+    if (strstr(weather, "雾") != NULL) return BOOT_WEATHER_FOG;
+    if (strstr(weather, "云") != NULL || strstr(weather, "阴") != NULL) return BOOT_WEATHER_CLOUDY;
+    if (strstr(weather, "晴") != NULL) return BOOT_WEATHER_CLEAR;
+    return BOOT_WEATHER_UNKNOWN;
+}
+
+/* Picks the embedded greeting segments for this boot.
+ *
+ * The official xiaozhi.me server rejects the old [device_call] direct-TTS
+ * prefix, so the greeting is assembled from pre-rendered PCM instead of a
+ * cloud request.  Four segments are concatenated:
+ *
+ *   [period greeting] + [spoken clock] + [weather copy] + [help offer]
+ *
+ * Every segment carries its own time modifier ("现在是上午7点" vs
+ * "现在是晚上7点"), which is what the old shared-clip design could not say.
+ * It costs 6 + 24 + 7 + 1 = 38 short assets instead of hundreds of whole
+ * sentences.  When the clock has not been refreshed yet the spoken clock is
+ * dropped and the generic period greeting is used instead. */
+static size_t select_boot_greeting_segments(local_pcm_segment_t *segments, size_t capacity)
+{
+    if (segments == NULL || capacity < 4U)
+        return 0U;
+
     lumidock_snapshot_t snapshot = {0};
     mid_snapshot_get(&snapshot);
+    const time_weather_snapshot_t *tw = &snapshot.time_weather;
+    const char *weather = tw->valid ? tw->weather_text : "";
+    const boot_weather_t weather_pick = boot_weather_from_text(weather);
 
-    if (!snapshot.time_weather.valid || snapshot.time_weather.weather_text[0] == '\0')
-    {
-        const int written = snprintf(greeting, greeting_size,
-                                     "[device_call]你好呀，很高兴见到你，今天有什么想和我聊的吗？");
-        return written >= 0 && (size_t)written < greeting_size;
-    }
+    /* local_time is only meaningful once time_service_poll() has refreshed it,
+     * which needs a valid RTC or a finished SNTP sync; tm_year stays 0 until
+     * then, and reading tm_hour would invent a bogus hour. */
+    const bool clock_ready = tw->valid && tw->local_time.tm_year > 0 &&
+                             tw->local_time.tm_hour >= 0 && tw->local_time.tm_hour <= 23;
+    const int hour = clock_ready ? tw->local_time.tm_hour : 0;
+    const boot_period_t period =
+        clock_ready ? boot_period_from_hour(hour) : BOOT_PERIOD_GENERIC;
 
-    const struct tm *local_time = &snapshot.time_weather.local_time;
-    const int temperature_c = snapshot.time_weather.temperature_c >= 0.0f ? (int)(snapshot.time_weather.temperature_c + 0.5f) : (int)(snapshot.time_weather.temperature_c - 0.5f);
-    const uint32_t template_index = (uint32_t)snapshot.time_weather.local_time.tm_yday % 3U;
-    const char *weather = snapshot.time_weather.weather_text;
-    int written;
-    if (template_index == 0U)
+    size_t count = 0U;
+    segments[count].start = s_boot_period_pcm[period].start;
+    segments[count].end = s_boot_period_pcm[period].end;
+    ++count;
+    if (clock_ready)
     {
-        written = snprintf(greeting, greeting_size,
-                           "[device_call]%s，现在是%d点%02d分，今天%s，气温%d度。今天有什么安排吗？",
-                           boot_greeting_salutation(local_time->tm_hour), local_time->tm_hour,
-                           local_time->tm_min, weather, temperature_c);
+        segments[count].start = s_boot_hour_pcm[hour].start;
+        segments[count].end = s_boot_hour_pcm[hour].end;
+        ++count;
     }
-    else if (template_index == 1U)
-    {
-        written = snprintf(greeting, greeting_size,
-                           "[device_call]今天是星期%d，当前%d点%02d分，天气%s，温度%d度。出门记得留意天气哦。",
-                           local_time->tm_wday, local_time->tm_hour, local_time->tm_min,
-                           weather, temperature_c);
-    }
-    else
-    {
-        written = snprintf(greeting, greeting_size,
-                           "[device_call]你好呀，现在%d点%02d分，今天%s，%d度。想让我帮你查点什么吗？",
-                           local_time->tm_hour, local_time->tm_min, weather, temperature_c);
-    }
-    return written >= 0 && (size_t)written < greeting_size;
-}
+    segments[count].start = s_boot_weather_pcm[weather_pick].start;
+    segments[count].end = s_boot_weather_pcm[weather_pick].end;
+    ++count;
+    /* The help offer closes every greeting, including the degraded one without
+     * a spoken clock, so the segment count is 4 or 3 and never fewer. */
+    segments[count].start = s_boot_closing_pcm.start;
+    segments[count].end = s_boot_closing_pcm.end;
+    ++count;
 
-static bool send_boot_greeting_detect(void)
-{
-    char greeting[XIAOZHI_BOOT_GREETING_TEXT_MAX_BYTES] = {0};
-    if (!build_boot_greeting_text(greeting, sizeof(greeting)))
-    {
-        ESP_LOGW(TAG, "boot greeting text generation failed");
-        return false;
-    }
-
-    cJSON *root = cJSON_CreateObject();
-    if (root == NULL || cJSON_AddStringToObject(root, "type", "listen") == NULL ||
-        cJSON_AddStringToObject(root, "state", "detect") == NULL ||
-        cJSON_AddStringToObject(root, "text", greeting) == NULL)
-    {
-        cJSON_Delete(root);
-        return false;
-    }
-    char *request = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (request == NULL)
-        return false;
-
-    ESP_LOGI(TAG, "boot greeting text prepared: %s", greeting);
-    const bool sent = send_text(request);
-    cJSON_free(request);
-    return sent;
+    ESP_LOGI(TAG, "boot greeting PCM bucket=%s weather=%s hour=%s closing=%s segments=%u",
+             s_boot_period_pcm[period].name, weather,
+             clock_ready ? s_boot_hour_pcm[hour].name : "none",
+             s_boot_closing_pcm.name, (unsigned)count);
+    return count;
 }
 
 static void begin_boot_greeting(void)
@@ -1537,10 +2047,19 @@ static void begin_boot_greeting(void)
         finish_boot_greeting_failure("WSS not ready");
         return;
     }
-    if (!send_boot_greeting_detect())
+    local_pcm_segment_t greeting_segments[4] = {{0}};
+    const size_t greeting_segment_count =
+        select_boot_greeting_segments(greeting_segments, 4U);
+    if (greeting_segment_count == 0U)
     {
-        finish_boot_greeting_failure("listen/detect send failed");
+        finish_boot_greeting_failure("local greeting PCM unavailable");
         return;
+    }
+    size_t greeting_bytes = 0U;
+    for (size_t index = 0U; index < greeting_segment_count; ++index)
+    {
+        greeting_bytes +=
+            (size_t)(greeting_segments[index].end - greeting_segments[index].start);
     }
     ++s_turn_id;
     if (s_turn_id == 0U)
@@ -1550,9 +2069,19 @@ static void begin_boot_greeting(void)
     s_playing_turn_id = 0U;
     s_session_active = true;
     s_state = XIAOZHI_VOICE_BOOT_GREETING_WAIT_TTS;
-    s_boot_greeting_tts_deadline_us = esp_timer_get_time() + XIAOZHI_BOOT_GREETING_TTS_TIMEOUT_US;
+    /* The greeting is local now, so the cloud TTS deadline stays disarmed; the
+     * shared local-prompt watchdog bounds the playback instead. */
+    s_boot_greeting_tts_deadline_us = 0;
     s_boot_greeting_reply_deadline_us = 0;
-    ESP_LOGI(TAG, "boot greeting detect sent: id=%u; waiting for one cloud TTS", (unsigned)s_boot_greeting_id);
+    if (!play_local_prompt_segments(LOCAL_PROMPT_BOOT_GREETING, greeting_segments,
+                                    greeting_segment_count, NULL))
+    {
+        finish_boot_greeting_failure("local greeting PCM unavailable");
+        return;
+    }
+    ESP_LOGI(TAG, "boot greeting local PCM playing: id=%u segments=%u bytes=%u",
+             (unsigned)s_boot_greeting_id, (unsigned)greeting_segment_count,
+             (unsigned)greeting_bytes);
     publish_ui_state(VOICE_UI_CONNECTING);
 }
 
@@ -1698,12 +2227,17 @@ static bool consume_post_playback_vad_start(uint32_t recent_peak)
                  (unsigned)recent_peak, (unsigned)XIAOZHI_POST_PLAYBACK_SILENCE_RESET_PEAK);
         return true;
     }
-    if (recent_peak < XIAOZHI_DIRECT_REPLY_BYPASS_PEAK)
+    /* A follow-up has to clear a higher bar than the boot greeting: the user
+     * has just been talking to the device, so real speech is close-mic loud,
+     * while a room burst must never consume the bounded follow-up window. */
+    const uint32_t bypass_peak = followup_reply ? XIAOZHI_FOLLOWUP_DIRECT_REPLY_MIN_PEAK
+                                                : XIAOZHI_DIRECT_REPLY_BYPASS_PEAK;
+    if (recent_peak < bypass_peak)
     {
         s_post_playback_silence_deadline_us = esp_timer_get_time() +
                                               XIAOZHI_POST_PLAYBACK_SILENCE_GUARD_US;
-        ESP_LOGI(TAG, "post-playback VAD start retained silence guard: peak=%u deadline_extended_ms=%u",
-                 (unsigned)recent_peak,
+        ESP_LOGI(TAG, "post-playback VAD start retained silence guard: peak=%u threshold=%u deadline_extended_ms=%u",
+                 (unsigned)recent_peak, (unsigned)bypass_peak,
                  (unsigned)(XIAOZHI_POST_PLAYBACK_SILENCE_GUARD_US / 1000LL));
         return true;
     }
@@ -1740,7 +2274,8 @@ static void finish_wake_greeting_after_playback(void)
     s_state = XIAOZHI_VOICE_WAIT_FOLLOWUP;
     arm_post_playback_silence_gate();
     s_followup_deadline_us = esp_timer_get_time() + XIAOZHI_FOLLOWUP_WINDOW_US;
-    ESP_LOGI(TAG, "wake greeting PCM drained; fresh VAD baseline, follow-up window=15s");
+    ESP_LOGI(TAG, "wake greeting PCM drained; fresh VAD baseline, follow-up window=%lldms",
+             (long long)(XIAOZHI_FOLLOWUP_WINDOW_US / 1000LL));
 }
 
 static void enter_followup_after_playback(void)
@@ -1768,22 +2303,51 @@ static void enter_followup_after_playback(void)
     if (exit_prompt_finished)
     {
         ESP_LOGI(TAG, "exit prompt PCM drained; closing voice session");
+        s_session_exit_clean = true;
         close_channel(false);
         return;
     }
     if (timeout_prompt_finished)
     {
-        ESP_LOGI(TAG, "timeout prompt PCM drained; follow-up window=15s");
+        ESP_LOGI(TAG, "timeout prompt PCM drained; follow-up window=%lldms",
+                 (long long)(XIAOZHI_FOLLOWUP_WINDOW_US / 1000LL));
     }
     if (fallback_prompt_finished)
     {
-        ESP_LOGI(TAG, "fallback prompt PCM drained; follow-up window=15s");
+        ESP_LOGI(TAG, "fallback prompt PCM drained; follow-up window=%lldms",
+                 (long long)(XIAOZHI_FOLLOWUP_WINDOW_US / 1000LL));
     }
     s_vad_speech = false;
     arm_post_playback_silence_gate();
     if (boot_greeting_finished)
         s_boot_greeting_direct_window_active = true;
-    if (boot_greeting_window_active)
+    /* 电台必须排在开机问候窗口前面：问候窗口的标记 (s_boot_greeting_direct_window_active)
+       要一直挂到下一次 close_channel 才清，压在后面会把"开电台"那一轮截走。 */
+    if (radio_stream_service_is_requested())
+    {
+        if (s_radio_on_before_turn)
+        {
+            /* 用户是打断正在播的电台进来的：先把听音窗口留满，再归还扬声器。窗口期间
+               电台保持让位——也就是"停拉流、关解码"的哑状态——麦克风收到的是安静的
+               房间，所以不存在旧版那种"对着麦克风放电台"的自激上行。窗口内用户直接
+               开口就能接上下一轮；到期由 tick 直接归还扬声器恢复直播。 */
+            s_state = XIAOZHI_VOICE_WAIT_FOLLOWUP;
+            s_followup_deadline_us = esp_timer_get_time() + XIAOZHI_FOLLOWUP_WINDOW_US;
+            s_ui_idle_deadline_us = 0;
+            ESP_LOGI(TAG, "电台让位保持；先留 follow-up window=%lldms 再归还扬声器",
+                     (long long)(XIAOZHI_FOLLOWUP_WINDOW_US / 1000LL));
+        }
+        else
+        {
+            /* 电台请求是这一轮才下来的（用户说"开电台"）：他要的就是电台出声，
+               不能压着听音窗口，立即归还扬声器并收场。 */
+            s_session_exit_clean = true;
+            ESP_LOGI(TAG, "电台在本轮启动；立即归还扬声器并结束本轮");
+            close_channel(false);
+            return;
+        }
+    }
+    else if (boot_greeting_window_active)
     {
         s_boot_greeting_reply_deadline_us = esp_timer_get_time() +
                                             XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US;
@@ -1791,11 +2355,13 @@ static void enter_followup_after_playback(void)
         s_ui_idle_deadline_us = 0;
         if (boot_greeting_finished)
         {
-            ESP_LOGI(TAG, "boot greeting PCM drained; direct reply window=15s");
+            ESP_LOGI(TAG, "boot greeting PCM drained; direct reply window=%lldms",
+                     (long long)(XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US / 1000LL));
         }
         else
         {
-            ESP_LOGI(TAG, "boot greeting response PCM drained; direct reply window re-armed=15s");
+            ESP_LOGI(TAG, "boot greeting response PCM drained; direct reply window re-armed=%lldms",
+                     (long long)(XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US / 1000LL));
         }
     }
     else
@@ -1803,7 +2369,8 @@ static void enter_followup_after_playback(void)
         s_state = XIAOZHI_VOICE_WAIT_FOLLOWUP;
         s_followup_deadline_us = esp_timer_get_time() + XIAOZHI_FOLLOWUP_WINDOW_US;
         s_ui_idle_deadline_us = 0;
-        ESP_LOGI(TAG, "cloud TTS PCM drained; fresh VAD baseline, follow-up window=15s");
+        ESP_LOGI(TAG, "cloud TTS PCM drained; fresh VAD baseline, follow-up window=%lldms",
+                 (long long)(XIAOZHI_FOLLOWUP_WINDOW_US / 1000LL));
     }
     ESP_LOGI(TAG, "post-playback silence gate armed");
     /* Keep the established WSS/session for the next turn. A follow-up is
@@ -1825,6 +2392,89 @@ static void enter_followup_after_playback(void)
         finish_wake_greeting_after_playback();
     }
     publish_ui_state(VOICE_UI_LISTENING);
+}
+
+/* Dispatches the shared local-prompt playout once it has drained (or once its
+ * watchdog fired).  Intent prompts only release a queued cloud reply, while the
+ * session prompts each resume their own part of the state machine - exactly
+ * what the cloud [device_call] TTS path used to do when its stream stopped. */
+static void finish_local_prompt_playback(void)
+{
+    const local_prompt_kind_t kind = s_local_prompt_kind;
+    s_local_prompt_kind = LOCAL_PROMPT_NONE;
+    switch (kind)
+    {
+    case LOCAL_PROMPT_BOOT_GREETING:
+        s_playing_boot_greeting = true;
+        enter_followup_after_playback();
+        break;
+    case LOCAL_PROMPT_EXIT:
+        s_playing_exit_prompt = true;
+        enter_followup_after_playback();
+        break;
+    case LOCAL_PROMPT_TIMEOUT:
+        s_playing_timeout_prompt = true;
+        enter_followup_after_playback();
+        break;
+    case LOCAL_PROMPT_FALLBACK:
+        s_playing_fallback_prompt = true;
+        enter_followup_after_playback();
+        break;
+    case LOCAL_PROMPT_INTENT:
+    case LOCAL_PROMPT_NONE:
+    default:
+        if (s_pending_cloud_tts_after_prompt)
+        {
+            s_pending_cloud_tts_after_prompt = false;
+            resume_deferred_cloud_tts();
+        }
+        break;
+    }
+}
+
+/* 云端回复的音频真的到了：本地“正在执行”提示音到此为止，立刻让位。
+ *
+ * 这一段原来是把包丢掉、等提示音放完再开 TTS。实测云端回得比提示音快得多：
+ * 日志 67530 提示音开始，67560 第一个音频包就到了，直到 68380 提示音放完为止
+ * 一共丢掉约 40 个包（约 2.4 s）；恢复播放时只剩 10 帧，“电台已经在播放中啦～”
+ * 只剩下尾巴，前两个字整段没出声，紧接着 70780 就 underrun，听起来就是卡卡的。
+ * 让位早一点只是把提示音截断，云端的字一个都不会丢。
+ *
+ * 现在再补一层优雅收尾：云端音频到达时若提示音只剩不到 XIAOZHI_LOCAL_PROMPT_GRACE_US，
+ * 就让它把最后两个字说完再让位。见下面 release_deferred_cloud_tts_on_audio()。
+ *
+ * 只从 VOICE_EVENT_WSS_BINARY 开头一行调用：逻辑放这里是为了不往那个分支里塞
+ * 新的大括号。test_voice_single_turn_tts_contract.ps1 用 IndexOf('    }') 切那段
+ * 分支，插进去的代码只要带大括号就会把切点提到守卫之前，断言直接挂掉。 */
+static void release_deferred_cloud_tts_on_audio(uint32_t connection_seq)
+{
+    if (!s_pending_cloud_tts_after_prompt || connection_seq != s_wss_connection_seq)
+    {
+        return;
+    }
+    /* 云端音频到了。剩不到 GRACE 就让它说完：不 abort、也不清
+       s_pending_cloud_tts_after_prompt——不清是有意的，VOICE_EVENT_LOCAL_PROMPT_FINISHED
+       的自然收尾会看到它还在，替我们 resume 云端 TTS。 */
+    const int64_t remaining_us = s_local_prompt_end_us - esp_timer_get_time();
+    if (s_local_prompt_active && remaining_us > 0 &&
+        remaining_us <= XIAOZHI_LOCAL_PROMPT_GRACE_US)
+    {
+        ESP_LOGI(TAG, "cloud reply audio arrived; local prompt finishes first: turn=%u remaining_ms=%lld",
+                 (unsigned)s_pending_cloud_tts_turn_id, (long long)(remaining_us / 1000LL));
+        return;
+    }
+    ESP_LOGI(TAG, "cloud reply audio arrived; local prompt yields: turn=%u",
+             (unsigned)s_pending_cloud_tts_turn_id);
+    if (s_local_prompt_epoch != 0U)
+    {
+        audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, s_local_prompt_epoch);
+    }
+    s_local_prompt_active = false;
+    s_local_prompt_deadline_us = 0;
+    s_local_prompt_end_us = 0;
+    s_local_prompt_kind = LOCAL_PROMPT_NONE;
+    s_pending_cloud_tts_after_prompt = false;
+    resume_deferred_cloud_tts();
 }
 
 static esp_err_t start_wss(bool foreground_session)
@@ -1894,7 +2544,7 @@ static esp_err_t start_wss(bool foreground_session)
         .reconnect_timeout_ms = 2000,
         .network_timeout_ms = 5000,
         .ping_interval_sec = 10,
-        .pingpong_timeout_sec = 30,
+        .pingpong_timeout_sec = 20,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     ++s_wss_connection_seq;
@@ -1944,6 +2594,9 @@ static esp_err_t start_wss(bool foreground_session)
              (int)register_err, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     s_hello_ready = false;
+    /* Discovery belongs to one session: a fresh connection has to prove again
+     * that the cloud speaks MCP before the local volume shortcut steps aside. */
+    mcp_service_reset();
     s_session_active = foreground_session;
     s_state = XIAOZHI_VOICE_WAIT_HELLO;
     if (foreground_session)
@@ -1990,6 +2643,19 @@ static void prewarm_wss(void)
     }
 }
 
+/* 电台让位是异步的：yield() 只是置位，拉流任务要等它自己那一轮循环退出会话，才会
+   关掉 HTTP/TLS 把内部 RAM 还回来。WSS 的 websocket task 要 4096 字节连续内部
+   RAM，实测电台拉流时只剩 4631 字节 / 最大连续块 1920，所以面对一个已经拉流成功
+   的电台，立刻建连是必败的。这里等它停稳再走，最多 XIAOZHI_RADIO_PARK_WAIT_US。 */
+static void wait_for_radio_park(void)
+{
+    if (!radio_stream_service_is_requested())
+        return;
+    const int64_t deadline_us = esp_timer_get_time() + XIAOZHI_RADIO_PARK_WAIT_US;
+    while (radio_stream_service_is_active() && esp_timer_get_time() < deadline_us)
+        vTaskDelay(pdMS_TO_TICKS(10));
+}
+
 static void begin_channel(void)
 {
     if (!xiaozhi_activation_service_is_activated())
@@ -2018,6 +2684,11 @@ static void begin_channel(void)
         s_pending_wake = false;
         return;
     }
+    /* 走到这里说明没有可复用的热连接，必须现建。唤醒处理已经在前面调过 yield()，
+       但那是异步的；等电台真的退出会话、把内部 RAM 还回来再建，否则 4096 字节
+       连续块要不到，白白吃一个"连接失败"。（只在前台路径等：预连接路径里电台还
+       在正常拉流，不该为了它把 tick 拖住。） */
+    wait_for_radio_park();
     if (start_wss(true) != ESP_OK)
     {
         s_pending_wake = false;
@@ -2049,6 +2720,10 @@ static void process_text(const uint8_t *data, size_t data_len)
         if (s_state == XIAOZHI_VOICE_WAIT_RESPONSE && cJSON_IsString(text) &&
             text->valuestring != NULL)
         {
+            /* 每句新话重新判定：上一句禁掉的云端电台工具不能连坐到这一句。
+               follow-up 里接着说“打开一下电台”时，本地没覆盖这种说法，还得
+               让云端的 self.radio.play 有机会执行。 */
+            mcp_service_set_radio_tools_blocked(false);
             ESP_LOGI(TAG, "local IoT command candidate: text=%s", text->valuestring);
             s_response_deadline_us = esp_timer_get_time() + XIAOZHI_WAIT_RESPONSE_TIMEOUT_US;
             ESP_LOGI(TAG, "cloud STT received; response timeout refreshed turn=%u",
@@ -2068,11 +2743,49 @@ static void process_text(const uint8_t *data, size_t data_len)
                     ESP_LOGI(TAG, "countdown start deferred until cloud TTS completion: turn=%u",
                              (unsigned)s_waiting_turn_id);
                 }
-                /* The cloud's response is the only confirmation spoken.  A
+                /* The cloud's response is the standalone spoken answer.  The
+                 * local prompt below is only a transient acknowledgment; a
                  * radio command still starts after that response drains. */
                 if (result == VOICE_IOT_COMMAND_RADIO_PLAY)
                 {
                     s_pending_radio_play = true;
+                }
+                /* 本地刚动过电台：这一轮云端的电台工具一律让路。日志里"关闭电台"
+                   被云端 ASR 截成"电台。"，同一个模型据此调 self.radio.play，
+                   把刚停掉的电台重新拉起来。 */
+                if (result == VOICE_IOT_COMMAND_RADIO_PLAY ||
+                    result == VOICE_IOT_COMMAND_RADIO_HANDLED)
+                {
+                    mcp_service_set_radio_tools_blocked(true);
+                }
+                /* Immediate "正在执行" confirmation before the cloud ack. */
+                extern const uint8_t prompt_executing_pcm_start[] asm(
+                    "_binary_prompt_executing_16k_mono_s16le_pcm_start");
+                extern const uint8_t prompt_executing_pcm_end[] asm(
+                    "_binary_prompt_executing_16k_mono_s16le_pcm_end");
+                (void)play_local_prompt_pcm(LOCAL_PROMPT_INTENT, prompt_executing_pcm_start,
+                                            prompt_executing_pcm_end, NULL);
+            }
+            else
+            {
+                /* Not a local command: classify query vs chat to pick the prompt. */
+                extern const uint8_t prompt_querying_pcm_start[] asm(
+                    "_binary_prompt_querying_16k_mono_s16le_pcm_start");
+                extern const uint8_t prompt_querying_pcm_end[] asm(
+                    "_binary_prompt_querying_16k_mono_s16le_pcm_end");
+                extern const uint8_t prompt_thinking_pcm_start[] asm(
+                    "_binary_prompt_thinking_16k_mono_s16le_pcm_start");
+                extern const uint8_t prompt_thinking_pcm_end[] asm(
+                    "_binary_prompt_thinking_16k_mono_s16le_pcm_end");
+                if (is_query_intent(text->valuestring))
+                {
+                    (void)play_local_prompt_pcm(LOCAL_PROMPT_INTENT, prompt_querying_pcm_start,
+                                                prompt_querying_pcm_end, NULL);
+                }
+                else
+                {
+                    (void)play_local_prompt_pcm(LOCAL_PROMPT_INTENT, prompt_thinking_pcm_start,
+                                                prompt_thinking_pcm_end, NULL);
                 }
             }
         }
@@ -2125,20 +2838,39 @@ static void process_text(const uint8_t *data, size_t data_len)
                                        s_waiting_turn_id != 0U;
             const bool greeting_turn = s_state == XIAOZHI_VOICE_WAIT_SPEECH &&
                                        s_greeting_turn_id != 0U;
-            const bool boot_greeting_turn = s_state == XIAOZHI_VOICE_BOOT_GREETING_WAIT_TTS &&
-                                            s_boot_greeting_id != 0U;
-            const bool exit_turn = s_state == XIAOZHI_VOICE_EXITING &&
-                                   s_exit_prompt_pending && s_exit_prompt_turn_id != 0U;
-            const bool timeout_turn = s_state == XIAOZHI_VOICE_EXITING &&
-                                      s_timeout_prompt_pending && s_timeout_prompt_turn_id != 0U;
-            const bool fallback_turn = s_state == XIAOZHI_VOICE_EXITING &&
-                                       s_fallback_prompt_pending && s_fallback_prompt_turn_id != 0U;
+            /* The boot greeting, exit, timeout and fallback prompts are all
+             * embedded PCM assets now, so the cloud can never answer them with
+             * TTS.  Their pending markers survive only for bookkeeping and the
+             * one-shot retry budget; accepting a stale cloud TTS here would
+             * reset the shared playout and truncate the local prompt that is
+             * still speaking.  Only a real response turn and the single
+             * registered wake greeting may accept a cloud TTS start. */
+            const bool boot_greeting_turn = false;
+            const bool exit_turn = false;
+            const bool timeout_turn = false;
+            const bool fallback_turn = false;
             if (!response_turn && !greeting_turn && !boot_greeting_turn && !exit_turn &&
                 !timeout_turn && !fallback_turn)
             {
                 s_discard_tts_stream = true;
                 ESP_LOGW(TAG, "duplicate/stale TTS start ignored: state=%d waiting_turn=%u playing_turn=%u",
                          s_state, (unsigned)s_waiting_turn_id, (unsigned)s_playing_turn_id);
+                ESP_LOGI(TAG, "cloud JSON processed: type=%s state=%s",
+                         type->valuestring, state_text);
+                cJSON_Delete(root);
+                return;
+            }
+            if (s_local_prompt_active && response_turn)
+            {
+                /* A valid cloud reply arrived while the local confirmation
+                 * prompt is still playing: hold it so begin_tts_playback (which
+                 * discards the shared playout) cannot truncate the prompt.  The
+                 * prompt FINISHED event releases it via resume_deferred_cloud_tts. */
+                s_pending_cloud_tts_after_prompt = true;
+                s_pending_cloud_tts_turn_id = s_waiting_turn_id;
+                s_discard_tts_stream = true;
+                ESP_LOGI(TAG, "cloud tts start deferred behind local prompt: turn=%u",
+                         (unsigned)s_waiting_turn_id);
                 ESP_LOGI(TAG, "cloud JSON processed: type=%s state=%s",
                          type->valuestring, state_text);
                 cJSON_Delete(root);
@@ -2209,6 +2941,7 @@ static void process_text(const uint8_t *data, size_t data_len)
             s_tts_start_us = esp_timer_get_time();
             s_tts_last_packet_us = 0;
             s_tts_stall_deadline_us = 0;
+            s_tts_first_pcm_deadline_us = s_tts_start_us + XIAOZHI_TTS_FIRST_PCM_TIMEOUT_US;
             s_tts_first_packet_seen = false;
             s_tts_first_pcm_seen = false;
             if (boot_greeting_turn)
@@ -2289,6 +3022,30 @@ static void process_text(const uint8_t *data, size_t data_len)
             s_state = XIAOZHI_VOICE_TTS_DRAINING;
             ESP_LOGI(TAG, "cloud TTS stopped; waiting for PCM drain epoch=%u",
                      (unsigned)s_tts_playback_epoch);
+        }
+    }
+    else if (strcmp(type->valuestring, "mcp") == 0)
+    {
+        /* The cloud can only control the volume once it has discovered the
+         * tools we answer, so this branch is what makes "提高音量" work. */
+        const cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
+        const char *reply = mcp_service_handle(payload);
+        if (reply != NULL)
+        {
+            const int written = snprintf(s_mcp_tx_frame, sizeof(s_mcp_tx_frame),
+                                         "{\"session_id\":\"%s\",\"type\":\"mcp\",\"payload\":%s}",
+                                         s_session_id[0] != '\0' ? s_session_id : "-", reply);
+            if (written > 0 && (size_t)written < sizeof(s_mcp_tx_frame))
+            {
+                if (!send_ws_text_raw(s_mcp_tx_frame))
+                {
+                    ESP_LOGW(TAG, "MCP reply send failed; the cloud will retry its request");
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "MCP reply frame dropped: %d bytes needed", written);
+            }
         }
     }
     else if (strcmp(type->valuestring, "alert") == 0)
@@ -2491,6 +3248,8 @@ static void begin_timer_chime(void)
     ++s_chime_epoch;
     const uint32_t epoch = s_chime_epoch;
     const size_t pcm_bytes = TIMER_CHIME_PCM_SAMPLES * sizeof(timer_chime_pcm[0]);
+    /* 抢扬声器之前先让电台退开：让位和停止不是一回事，电台的整体流程要活着。 */
+    (void)radio_stream_service_yield();
     if (audio_playback_service_begin(AUDIO_PLAYOUT_SOURCE_TIMER_CHIME, epoch, 8U) != ESP_OK)
     {
         ESP_LOGW(TAG, "timer chime begin failed: epoch=%u", (unsigned)epoch);
@@ -2555,12 +3314,13 @@ static void handle_event(voice_event_t *event)
         {
             (void)send_text("{\"type\":\"abort\",\"reason\":\"wake_word_detected\"}");
             ESP_LOGI(TAG, "voice turn abort: id=%u", (unsigned)s_playing_turn_id);
-            if (s_pending_countdown_start)
+            if (s_pending_countdown_start || mcp_service_pending_countdown())
             {
+                s_pending_countdown_start = false;
+                mcp_service_clear_pending_countdown();
                 const timer_service_cmd_result_t result = timer_service_start_pending_countdowns();
                 ESP_LOGI(TAG, "deferred countdown finalized after TTS interruption: result=%d",
                          (int)result);
-                s_pending_countdown_start = false;
             }
             s_playing_turn_id = 0U;
             s_waiting_turn_id = 0U;
@@ -2587,6 +3347,15 @@ static void handle_event(voice_event_t *event)
              * so the follow-up conversation is not stuck deaf. */
             xiaozhi_audio_pipeline_resume_after_playback();
         }
+        /* 电台让位必须在开麦之前：唤醒词是本地识别的（不需要上行），所以这一步之后
+           麦克风环境才是干净的。让位会把电台的拉流和解码整段停掉，把 core 1 和
+           网络缓冲让给这一轮语音，答完由 close_channel 调 regain() 重新接回直播。 */
+        /* 这里取 is_requested() 而不是 is_active()：后者在"电台已 regain、还在重连
+           尚未出声"时为假，偏偏那也是用户眼里的"电台模式"——用 is_active 会让这种
+           时刻唤醒的对话答完立刻把扬声器交回去。is_requested 在电台刚启动(还在
+           CONNECTING)时同样为真，覆盖更完整；用户暂停过电台时它为假，走普通窗口。 */
+        s_radio_on_before_turn = radio_stream_service_is_requested();
+        (void)radio_stream_service_yield();
         if (s_state == XIAOZHI_VOICE_WAIT_HELLO)
             s_pending_wake = true;
         else
@@ -2639,8 +3408,20 @@ static void handle_event(voice_event_t *event)
                 ESP_LOGI(TAG, "follow-up VAD start ignored; waiting for silence");
                 break;
             }
+            /* Room noise must not consume the bounded follow-up window: the
+             * window has to expire so the session closes on its own.  Only a
+             * close-mic peak restarts a cloud turn. */
+            if (recent_peak < XIAOZHI_FOLLOWUP_DIRECT_REPLY_MIN_PEAK)
+            {
+                ESP_LOGI(TAG, "follow-up VAD start gated as ambient noise: peak=%u threshold=%u",
+                         (unsigned)recent_peak,
+                         (unsigned)XIAOZHI_FOLLOWUP_DIRECT_REPLY_MIN_PEAK);
+                break;
+            }
             start_followup_listen();
             s_followup_deadline_us = 0;
+            /* 用户真的接话了：这一段等待结束，下一段沉默重新拥有一次“没听清”。 */
+            s_followup_retry_used = false;
             ESP_LOGI(TAG, "follow-up speech detected; starting next cloud turn");
         }
         else if (s_state == XIAOZHI_VOICE_WAIT_SPEECH && s_wait_for_turn_silence)
@@ -2754,11 +3535,28 @@ static void handle_event(voice_event_t *event)
         xiaozhi_audio_pipeline_reset_after_transport_failure();
         if (s_session_active)
         {
-            /* The user was mid-conversation when the server dropped us:
-             * answer with the local error tone instead of bouncing back to
-             * the main page silently. */
-            ESP_LOGW(TAG, "WSS dropped during an active turn; playing local error tone");
-            play_error_tone_then_close(false);
+            /* The cloud ends a conversation by closing the link right after it
+             * finished answering ("终止对话"): the reply already played, so this
+             * is a normal exit and must not be reported as a fault.  A drop that
+             * still owes the user an answer (speech in flight, response pending,
+             * TTS still arriving) keeps the local error tone. */
+            const bool turn_delivered = s_state == XIAOZHI_VOICE_WAIT_FOLLOWUP ||
+                                        s_state == XIAOZHI_VOICE_BOOT_GREETING_WAIT_REPLY ||
+                                        s_state == XIAOZHI_VOICE_TTS_DRAINING;
+            if (turn_delivered)
+            {
+                ESP_LOGI(TAG, "WSS closed by the server after a delivered turn; ending the session without the fault tone");
+                s_session_exit_clean = true;
+                close_channel(false);
+            }
+            else
+            {
+                /* The user was mid-conversation when the server dropped us:
+                 * answer with the local error tone instead of bouncing back to
+                 * the main page silently. */
+                ESP_LOGW(TAG, "WSS dropped during an active turn; playing local error tone");
+                play_error_tone_then_close(false);
+            }
         }
         else
         {
@@ -2781,6 +3579,7 @@ static void handle_event(voice_event_t *event)
         process_text(event->payload, event->payload_len);
         break;
     case VOICE_EVENT_WSS_BINARY:
+        release_deferred_cloud_tts_on_audio(event->value);
         if (s_discard_tts_stream ||
             (s_state != XIAOZHI_VOICE_TTS_BUFFERING && s_state != XIAOZHI_VOICE_SPEAKING) ||
             event->value != s_wss_connection_seq ||
@@ -2847,6 +3646,7 @@ static void handle_event(voice_event_t *event)
         }
         if (s_state == XIAOZHI_VOICE_TTS_BUFFERING)
             s_state = XIAOZHI_VOICE_SPEAKING;
+        s_tts_first_pcm_deadline_us = 0;
         if (s_playing_exit_prompt || s_playing_timeout_prompt || s_playing_fallback_prompt)
         {
             s_exit_tts_playback_deadline_us = esp_timer_get_time() +
@@ -2875,16 +3675,23 @@ static void handle_event(voice_event_t *event)
             break;
         }
         s_tts_stall_deadline_us = 0;
-        if (s_pending_countdown_start)
+        s_tts_first_pcm_deadline_us = 0;
+        /* Either the local shortcut or the cloud MCP tool can have reserved the
+         * start; both are released here, once the acknowledgement is audible. */
+        if (s_pending_countdown_start || mcp_service_pending_countdown())
         {
+            s_pending_countdown_start = false;
+            mcp_service_clear_pending_countdown();
             const timer_service_cmd_result_t result = timer_service_start_pending_countdowns();
             ESP_LOGI(TAG, "deferred countdown finalized after cloud TTS PCM drain: result=%d",
                      (int)result);
-            s_pending_countdown_start = false;
         }
-        if (s_pending_radio_play)
+        if (s_pending_radio_play || mcp_service_pending_radio())
         {
             s_pending_radio_play = false;
+            mcp_service_clear_pending_radio();
+            /* 电台是这一轮才要求的，收场时不该为它留听音窗口。 */
+            s_radio_on_before_turn = false;
             ESP_LOGI(TAG, "radio acknowledgement finished; starting radio stream");
             if (radio_stream_service_play_default() != ESP_OK)
             {
@@ -2904,7 +3711,8 @@ static void handle_event(voice_event_t *event)
             {
                 s_tts_stall_deadline_us = esp_timer_get_time() +
                                           XIAOZHI_TTS_STALL_TIMEOUT_US;
-                ESP_LOGW(TAG, "TTS stall watchdog armed; local finish if the stream stays silent for 8 s");
+                ESP_LOGW(TAG, "TTS stall watchdog armed; local finish if the stream stays silent for %lld s",
+                         (long long)(XIAOZHI_TTS_STALL_TIMEOUT_US / 1000000LL));
             }
         }
         break;
@@ -2918,6 +3726,19 @@ static void handle_event(voice_event_t *event)
         s_error_tone_deadline_us = 0;
         ESP_LOGI(TAG, "local error tone finished; closing the voice session");
         close_channel(false);
+        break;
+    case VOICE_EVENT_LOCAL_PROMPT_FINISHED:
+        if (event->value != s_local_prompt_epoch || !s_local_prompt_active)
+        {
+            ESP_LOGI(TAG, "stale local prompt finish ignored: epoch=%u active=%d",
+                     (unsigned)event->value, (int)s_local_prompt_active);
+            break;
+        }
+        s_local_prompt_active = false;
+        s_local_prompt_deadline_us = 0;
+        s_local_prompt_end_us = 0;
+        ESP_LOGI(TAG, "local prompt finished: kind=%d", (int)s_local_prompt_kind);
+        finish_local_prompt_playback();
         break;
     case VOICE_EVENT_UPLINK_FAILED:
         /* A failed uplink write can arrive while the turn is in any live
@@ -3023,8 +3844,13 @@ static void voice_session_task(void *arg)
                 publish_ui_state(VOICE_UI_IDLE);
                 if (s_client == NULL && xiaozhi_activation_service_is_activated())
                 {
+                    /* 电台在播时立刻保温；其余场景沿用 5 秒，避免刚关掉会话就立刻
+                       重连去和用户的追问抢 core 1。 */
+                    const bool prewarm_radio_on = radio_stream_service_is_requested();
                     s_prewarm_retry_delay_us = 0; /* fresh schedule: reset the backoff ramp */
-                    s_prewarm_retry_us = esp_timer_get_time() + XIAOZHI_PREWARM_RETRY_US;
+                    s_prewarm_retry_us = esp_timer_get_time() +
+                                         (prewarm_radio_on ? XIAOZHI_PREWARM_RADIO_DELAY_US
+                                                           : XIAOZHI_PREWARM_RETRY_US);
                 }
             }
         }
@@ -3083,6 +3909,17 @@ static void voice_session_task(void *arg)
             s_error_tone_deadline_us = 0;
             ESP_LOGW(TAG, "local error tone watchdog expired; closing the voice session");
             close_channel(false);
+        }
+        if (s_local_prompt_active && s_local_prompt_deadline_us != 0 &&
+            esp_timer_get_time() >= s_local_prompt_deadline_us)
+        {
+            s_local_prompt_active = false;
+            s_local_prompt_deadline_us = 0;
+            s_local_prompt_end_us = 0;
+            ESP_LOGW(TAG, "local prompt watchdog expired: kind=%d; aborting the shared playout",
+                     (int)s_local_prompt_kind);
+            audio_playback_service_abort(AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT, s_local_prompt_epoch);
+            finish_local_prompt_playback();
         }
         if (s_state == XIAOZHI_VOICE_EXITING || s_playing_exit_prompt ||
             s_playing_timeout_prompt || s_playing_fallback_prompt)
@@ -3160,9 +3997,44 @@ static void voice_session_task(void *arg)
             esp_timer_get_time() >= s_followup_deadline_us)
         {
             s_followup_deadline_us = 0;
-            ESP_LOGI(TAG, "follow-up window expired; requesting generated exit prompt");
-            if (!request_cloud_exit_prompt())
-                play_error_tone_then_close(false);
+            /* 电台还等着这次窗口：不请求"拜拜"、不再占用扬声器，直接把直播接回来。
+               用户打断电台只是想问一句，收场时再补一句告别反而多余。 */
+            if (s_radio_on_before_turn && radio_stream_service_is_requested())
+            {
+                ESP_LOGI(TAG, "电台让位窗口到期；直接归还扬声器恢复直播");
+                s_session_exit_clean = true;
+                close_channel(false);
+            }
+            else if (!s_followup_retry_used)
+            {
+                /* 第一段聆听窗口没等到人说话：先播一句“我没听清，可以再说一遍吗？”
+                   （就是 prompt_timeout 那条资产），再开一轮窗口，其余逻辑不变。
+                   提示音排空后 enter_followup_after_playback() 会自动重新装一个
+                   XIAOZHI_FOLLOWUP_WINDOW_US 的窗口，这里不需要手工 arm，也不该
+                   走 exit 分支——exit 分支会在播完后直接 close_channel。 */
+                s_followup_retry_used = true;
+                ESP_LOGI(TAG, "follow-up window silent; playing the retry prompt and re-arming once");
+                if (!request_cloud_timeout_prompt())
+                    play_error_tone_then_close(false);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "follow-up window expired; requesting generated exit prompt");
+                if (!request_cloud_exit_prompt())
+                    play_error_tone_then_close(false);
+            }
+        }
+        /* Never-audible watchdog: the turn was accepted but no PCM ever reached the
+         * speaker, so the underrun watchdog below was never even armed. */
+        if (s_tts_first_pcm_deadline_us != 0 &&
+            (s_state == XIAOZHI_VOICE_TTS_BUFFERING ||
+             s_state == XIAOZHI_VOICE_SPEAKING) &&
+            esp_timer_get_time() >= s_tts_first_pcm_deadline_us)
+        {
+            s_tts_first_pcm_deadline_us = 0;
+            ESP_LOGW(TAG, "TTS accepted but never became audible; finishing playback locally");
+            xiaozhi_audio_pipeline_finish_playback();
+            s_state = XIAOZHI_VOICE_TTS_DRAINING;
         }
         /* TTS stall watchdog: the server stopped sending audio without a tts
          * stop frame (server-side turn loss).  Finish playback locally so the
@@ -3207,6 +4079,8 @@ static void voice_session_task(void *arg)
             s_last_timer_tick_us = esp_timer_get_time();
             timer_service_poll();
             publish_timer_snapshot();
+            /* Backstop for a deferred start whose turn already ended. */
+            consume_deferred_media_starts();
         }
     }
 }
@@ -3228,13 +4102,49 @@ static bool wait_for_prewarmed_wss(void)
     return false;
 }
 
+/* 字符串字面量的地址不保证唯一，比 op 名称必须比内容。 */
+static bool uplink_operation_equal(const char *left, const char *right)
+{
+    if (left == right) return true;
+    if (left == NULL || right == NULL) return false;
+    return strcmp(left, right) == 0;
+}
+
 static void websocket_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     const uint32_t connection_seq = (uint32_t)(uintptr_t)handler_args;
     (void)base;
-    ESP_LOGI(TAG, "WSS callback event_id=%ld connection_seq=%u op=%s terminal_gen=%u terminal=%d",
-             (long)event_id, (unsigned)connection_seq, s_uplink_tx_operation,
-             (unsigned)s_uplink_terminal_generation, s_uplink_terminal_active ? 1 : 0);
+    /* 这条日志原来是每个 WSS 事件打一条，而 WEBSOCKET_EVENT_DATA 在 TTS 期间
+       每 40~90 ms 就来一次——实测 247 行的日志里它独占 52 行（21%），把
+       "TTS packet arrival"、"late TTS packet"、"cloud JSON received" 这些真信号
+       全淹了，每次排查都得先手动 grep。
+       现在只有「不是 DATA」或「五元组变了」才打：状态跃迁一条不漏，稳态的数据流
+       静默。格式串刻意保持原样——test_voice_connection_lifetime_contract.ps1 用
+       不跨行的 .* 匹配 event_id / connection_seq / terminal_gen 三段。 */
+    static int32_t last_event_id = INT32_MIN;
+    static uint32_t last_connection_seq = UINT32_MAX;
+    static const char *last_operation = NULL;
+    static unsigned last_terminal_generation = UINT32_MAX;
+    static int last_terminal_active = -1;
+    /* volatile 量先快照再比较，否则几次读取之间可能变，日志会自相矛盾。 */
+    const int terminal_active = s_uplink_terminal_active ? 1 : 0;
+    const unsigned terminal_generation = s_uplink_terminal_generation;
+    const bool state_changed =
+        event_id != last_event_id || connection_seq != last_connection_seq ||
+        !uplink_operation_equal(last_operation, s_uplink_tx_operation) ||
+        terminal_generation != last_terminal_generation ||
+        terminal_active != last_terminal_active;
+    if (event_id != WEBSOCKET_EVENT_DATA || state_changed)
+    {
+        ESP_LOGI(TAG, "WSS callback event_id=%ld connection_seq=%u op=%s terminal_gen=%u terminal=%d",
+                 (long)event_id, (unsigned)connection_seq, s_uplink_tx_operation,
+                 terminal_generation, terminal_active);
+        last_event_id = event_id;
+        last_connection_seq = connection_seq;
+        last_operation = s_uplink_tx_operation;
+        last_terminal_generation = terminal_generation;
+        last_terminal_active = terminal_active;
+    }
     if (event_id == WEBSOCKET_EVENT_CONNECTED)
     {
         s_wss_last_connected_us = esp_timer_get_time();
@@ -3242,7 +4152,7 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
         s_wss_last_pong_us = 0;
         s_wss_last_rx_us = s_wss_last_connected_us;
         s_wss_health = XIAOZHI_WSS_HEALTH_HEALTHY;
-        ESP_LOGI(TAG, "WSS heartbeat connected: seq=%u ping_interval_sec=10 pong_timeout_sec=30",
+        ESP_LOGI(TAG, "WSS heartbeat connected: seq=%u ping_interval_sec=10 pong_timeout_sec=20",
                  (unsigned)connection_seq);
         log_wss_wifi_state();
         post_event_value(VOICE_EVENT_WSS_CONNECTED, connection_seq);
@@ -3274,7 +4184,7 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
                      data->close_status_code);
             if (data->error_handle.error_type == WEBSOCKET_ERROR_TYPE_PONG_TIMEOUT)
             {
-                ESP_LOGW(TAG, "WSS heartbeat timeout: no PONG within 30 seconds");
+                ESP_LOGW(TAG, "WSS heartbeat timeout: no PONG within 20 seconds");
             }
             log_wss_wifi_state();
         }
@@ -3379,6 +4289,9 @@ static void tts_playback_changed(xiaozhi_tts_playback_event_t event, uint32_t ep
         break;
     case XIAOZHI_ERROR_TONE_PLAYBACK_FINISHED:
         post_playback_event(VOICE_EVENT_ERROR_TONE_FINISHED, epoch);
+        break;
+    case XIAOZHI_LOCAL_PROMPT_PLAYBACK_FINISHED:
+        post_playback_event(VOICE_EVENT_LOCAL_PROMPT_FINISHED, epoch);
         break;
     }
 }

@@ -7,10 +7,12 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "app_log.h"
 #include "http_memory_log.h"
@@ -201,8 +203,12 @@ esp_err_t app_weather_init(void)
     if (weather_snapshot_init() != ESP_OK) return ESP_ERR_NO_MEM;
     s_events = xEventGroupCreate();
     if (s_events == NULL) return ESP_ERR_NO_MEM;
-    return xTaskCreatePinnedToCore(weather_task, "weather_task", 6144, NULL, 3,
-                                   &s_weather_task_handle, 0) == pdPASS
+    /* 天气刷新只做 HTTPS 请求和内存快照，从不写 NVS，所以任务栈可以放在 PSRAM。
+     * 天气/位置/激活任务与语音管道并发启动，把常驻任务占的内部 RAM 降到最低，
+     * ESP-SR 创建 WakeNet 时才能稳定拿到连续块。 */
+    return xTaskCreatePinnedToCoreWithCaps(weather_task, "weather_task", 6144, NULL, 3,
+                                           &s_weather_task_handle, 0,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS
                ? ESP_OK
                : ESP_ERR_NO_MEM;
 }

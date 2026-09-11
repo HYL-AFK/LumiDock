@@ -627,12 +627,14 @@ static void schedule_sta_reconnect(void)
         return;
     }
 
-    BaseType_t ok = xTaskCreate(sta_reconnect_task,
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(sta_reconnect_task,
                                 "sta_reconn",
                                 4096,
                                 (void *)(uintptr_t)s_connect_generation,
                                 5,
-                                &s_reconnect_task);
+                                &s_reconnect_task,
+                                tskNO_AFFINITY,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         s_reconnect_task = NULL;
         APP_LOGE(TAG, "create STA reconnect task failed");
@@ -1030,6 +1032,9 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
         APP_LOGE(TAG, "create Wi-Fi async dispatch queue failed");
         return ESP_ERR_NO_MEM;
     }
+    /* network_coordinator_task 运行路径会写 NVS(process_wifi_event 处理 STA_GOT_IP 时
+     * 调用 app_config_save_last_wifi_ssid -> nvs_set_str/nvs_commit),写入期间禁用 SPI Cache。
+     * 任务栈必须留在内部 RAM,否则 PSRAM 栈访问会触发断言崩溃。 */
     if (xTaskCreatePinnedToCore(network_coordinator_task, "network_coordinator", 4096,
                                 NULL, 5, &s_network_coordinator_task, 1) != pdPASS) {
         s_network_coordinator_task = NULL;
@@ -1067,8 +1072,9 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
     update_ap_ip_cache();
     s_inited = true;
     internet_health_policy_init(&s_internet_health);
-    if (xTaskCreate(internet_probe_task, "internet_probe", 4096, NULL, 3,
-                    &s_internet_probe_task) != pdPASS) {
+    if (xTaskCreatePinnedToCoreWithCaps(internet_probe_task, "internet_probe", 3072, NULL, 3,
+                    &s_internet_probe_task, tskNO_AFFINITY,
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_internet_probe_task = NULL;
         APP_LOGE(TAG, "create internet probe task failed");
         return ESP_ERR_NO_MEM;

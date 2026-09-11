@@ -4,8 +4,10 @@
 #include <string.h>
 
 #include "driver/uart.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #include "board_pins.h"
@@ -299,7 +301,9 @@ esp_err_t bms_service_init(void)
     s_frame_len = 0;
     esp_err_t err = bms_uart_init();
     if (err != ESP_OK) return err;
-    if (xTaskCreate(bms_task, "bms_poll", 4096, NULL, 5, &s_task) != pdPASS) {
+    if (xTaskCreatePinnedToCoreWithCaps(bms_task, "bms_poll", 3072, NULL, 5,
+                                        &s_task, tskNO_AFFINITY,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "BMS UART2 ready TX=%d RX=%d, DE/RE unused",

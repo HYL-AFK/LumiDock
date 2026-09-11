@@ -131,4 +131,22 @@ if ($execBlock -notmatch 'timer_service_start_stopwatch\(\)' -or
     throw 'Stopwatch commands must map onto the timer service API.'
 }
 
+# 只有一块闹钟槽位，设新的会顶掉旧的。回答里必须说明被取消的是几点，否则用户
+# 设第二个闹钟时前一个会无声消失。快照必须先取再 set——反过来读到的就是新值了。
+$alarmStart = $execBlock.IndexOf('timer_service_get_snapshot(&previous)')
+$alarmEnd = $execBlock.IndexOf('return VOICE_IOT_COMMAND_EXECUTED;', $alarmStart)
+if ($alarmStart -lt 0 -or $alarmEnd -lt 0) {
+    throw 'The set-alarm branch must read the pending alarm before replacing it.'
+}
+$alarmBlock = $execBlock.Substring($alarmStart, $alarmEnd - $alarmStart)
+if ($alarmBlock -notmatch 'previous\.alarm_active') {
+    throw 'The set-alarm answer must branch on whether an alarm was actually replaced.'
+}
+if ($alarmBlock -notmatch '已取消上一个%u点的闹钟') {
+    throw 'Replacing an alarm must tell the user which alarm was cancelled.'
+}
+if ($alarmBlock.IndexOf('timer_service_get_snapshot') -gt $alarmBlock.IndexOf('timer_service_set_alarm')) {
+    throw 'The snapshot must be taken before set_alarm, otherwise it already reports the new alarm.'
+}
+
 Write-Output 'Voice timer command contract passed.'

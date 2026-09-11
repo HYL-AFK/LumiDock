@@ -13,5 +13,5 @@ if ($voice -notmatch 'play_error_tone_then_close') { throw 'The play-error-tone-
 if ($voice -match 'XIAOZHI_TIMEOUT_UI_HOLD_US|s_timeout_ui_deadline_us|returning to main after 5s') { throw 'The timeout hold that bounced back to the main page must be removed.' }
 if ($voice -notmatch 'cloud data acquisition timeout; requesting generated timeout prompt') { throw 'Cloud data timeout must request a cloud-spoken timeout prompt.' }
 if ($voice -notmatch 'request_cloud_timeout_prompt') { throw 'Cloud data timeout must request a spoken timeout prompt from the cloud.' }
-if ($voice -notmatch 'timeout prompt PCM drained; follow-up window=15s') { throw 'Timeout prompt must re-arm the 15 second follow-up window after playback.' }
+if ($voice -notmatch 'timeout prompt PCM drained; follow-up window=%lldms') { throw 'Timeout prompt must re-arm the follow-up window after playback.' }
 Write-Output 'Voice expression v2 contract passed.'

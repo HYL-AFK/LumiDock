@@ -14,8 +14,11 @@
 #include "nvs_flash.h"
 
 #define TIMER_NVS_NAMESPACE "lumidock_timer"
+/* 持久化的范围只有闹钟：它必须跨下电存活。倒计时和正计时都是内存态。 */
 #define TIMER_NVS_KEY_ALARMS "alarms"
-#define TIMER_NVS_KEY_COUNTDOWNS "countdowns"
+/* 旧固件把倒计时也写进过 NVS。开机时清一次这个遗留键：没人再读它，留着既占
+   空间又会在排查时误导（"NVS 里明明有个倒计时"）。 */
+#define TIMER_NVS_KEY_LEGACY_COUNTDOWNS "countdowns"
 
 /* 2020-09-13: any clock newer than this is treated as SNTP-converged. */
 #define TIMER_TIME_SYNCED_EPOCH 1600000000LL
@@ -52,8 +55,6 @@ static int64_t s_ring_started_us;
 static int64_t s_last_heartbeat_us;
 
 static timer_service_event_cb_t s_event_cb;
-/* Countdown progress flush counter (NVS wear limiting). */
-static uint32_t s_persist_tick;
 /* Wall-clock stamp of the previous poll; countdown ticks use the real
  * elapsed seconds so a delayed task loop cannot slow the countdown. */
 static time_t s_last_poll_time;
@@ -64,67 +65,54 @@ static time_t s_last_poll_time;
  * calls the timer APIs has a PSRAM stack, so callers only snapshot their
  * state under s_persist_mutex and wake s_persist_task, which performs the
  * real NVS write on an internal-RAM stack. */
-#define TIMER_PERSIST_BIT_ALARMS (1UL << 0)
-#define TIMER_PERSIST_BIT_COUNTDOWNS (1UL << 1)
-
 static TaskHandle_t s_persist_task;
 static SemaphoreHandle_t s_persist_mutex;
 static SemaphoreHandle_t s_timer_load_done;
+/* 只有闹钟需要影子副本：倒计时/正计时没有落盘路径。 */
 static timer_alarm_slot_t s_persist_alarms_shadow[TIMER_SERVICE_MAX_ALARMS];
-static timer_countdown_slot_t s_persist_countdowns_shadow[TIMER_SERVICE_MAX_COUNTDOWNS];
 
-static void request_persist(uint32_t bits)
+static void request_persist(void)
 {
     if (s_persist_task == NULL || s_persist_mutex == NULL) {
         ESP_LOGW(TAG, "persist worker unavailable; timer state stays in memory only");
         return;
     }
     if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return;
-    if (bits & TIMER_PERSIST_BIT_ALARMS) {
-        memcpy(s_persist_alarms_shadow, s_alarms, sizeof(s_persist_alarms_shadow));
-    }
-    if (bits & TIMER_PERSIST_BIT_COUNTDOWNS) {
-        memcpy(s_persist_countdowns_shadow, s_countdowns, sizeof(s_persist_countdowns_shadow));
-    }
+    memcpy(s_persist_alarms_shadow, s_alarms, sizeof(s_persist_alarms_shadow));
     xSemaphoreGive(s_persist_mutex);
-    (void)xTaskNotify(s_persist_task, bits, eSetBits);
+    /* 通知值非 0 就行：worker 只关心"有东西要写"，写的一律是闹钟影子。 */
+    (void)xTaskNotify(s_persist_task, 1UL, eSetBits);
 }
 
 static esp_err_t persist_alarms(void)
 {
-    request_persist(TIMER_PERSIST_BIT_ALARMS);
-    return ESP_OK;
-}
-
-static esp_err_t persist_countdowns(void)
-{
-    request_persist(TIMER_PERSIST_BIT_COUNTDOWNS);
+    request_persist();
     return ESP_OK;
 }
 
 static void load_persisted_state(void)
 {
     nvs_handle_t handle;
-    if (nvs_open(TIMER_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
+    /* 倒计时不回读：init 里已经把它 memset 成空，下电即失就是预期行为。
+       需要 READWRITE 才清得掉上面那个遗留键；万一写不开（分区满/只读），退回只读
+       也绝不能连闹钟一起丢——遗留键留给下次开机再清。 */
+    if (nvs_open(TIMER_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK &&
+        nvs_open(TIMER_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
     size_t blob_len = sizeof(s_alarms);
     if (nvs_get_blob(handle, TIMER_NVS_KEY_ALARMS, s_alarms, &blob_len) != ESP_OK) {
         memset(s_alarms, 0, sizeof(s_alarms));
     }
-    blob_len = sizeof(s_countdowns);
-    if (nvs_get_blob(handle, TIMER_NVS_KEY_COUNTDOWNS, s_countdowns, &blob_len) != ESP_OK) {
-        memset(s_countdowns, 0, sizeof(s_countdowns));
+    if (nvs_erase_key(handle, TIMER_NVS_KEY_LEGACY_COUNTDOWNS) == ESP_OK) {
+        (void)nvs_commit(handle);
+        ESP_LOGI(TAG, "legacy persisted countdown dropped: countdowns no longer survive a power cut");
     }
     nvs_close(handle);
     for (size_t i = 0; i < TIMER_SERVICE_MAX_ALARMS; ++i) {
         if (s_alarms[i].valid && s_alarms[i].target_epoch > 0) {
             ESP_LOGI(TAG, "alarm restored: slot=%u target=%lld", (unsigned)i,
                      (long long)s_alarms[i].target_epoch);
-        }
-    }
-    for (size_t i = 0; i < TIMER_SERVICE_MAX_COUNTDOWNS; ++i) {
-        if (s_countdowns[i].valid && s_countdowns[i].remaining_seconds > 0) {
-            ESP_LOGI(TAG, "countdown restored: slot=%u remaining=%ld",
-                     (unsigned)i, (long)s_countdowns[i].remaining_seconds);
         }
     }
 }
@@ -156,32 +144,15 @@ static void flush_alarms_to_nvs(void)
     }
 }
 
-static void flush_countdowns_to_nvs(void)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(TIMER_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "countdown persist open failed: %s", esp_err_to_name(err));
-        return;
-    }
-    const size_t blob_len = sizeof(s_persist_countdowns_shadow);
-    err = nvs_set_blob(handle, TIMER_NVS_KEY_COUNTDOWNS, s_persist_countdowns_shadow, blob_len);
-    if (err == ESP_OK) err = nvs_commit(handle);
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "countdown persist failed: %s", esp_err_to_name(err));
-    }
-}
-
 static void persist_worker_task(void *arg)
 {
+    (void)arg;
     for (;;) {
-        uint32_t bits = 0;
-        (void)xTaskNotifyWait(0, ULONG_MAX, &bits, portMAX_DELAY);
-        if (bits == 0 || s_persist_mutex == NULL) continue;
+        uint32_t notified = 0;
+        (void)xTaskNotifyWait(0, ULONG_MAX, &notified, portMAX_DELAY);
+        if (notified == 0U || s_persist_mutex == NULL) continue;
         if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) continue;
-        if (bits & TIMER_PERSIST_BIT_ALARMS) flush_alarms_to_nvs();
-        if (bits & TIMER_PERSIST_BIT_COUNTDOWNS) flush_countdowns_to_nvs();
+        flush_alarms_to_nvs();
         xSemaphoreGive(s_persist_mutex);
     }
 }
@@ -193,7 +164,7 @@ static void notify_event(timer_service_event_t event, timer_service_slot_t slot)
 
 static bool slot_is_countdown(timer_service_slot_t slot)
 {
-    return slot == TIMER_SERVICE_SLOT_COUNTDOWN0 || slot == TIMER_SERVICE_SLOT_COUNTDOWN1;
+    return slot == TIMER_SERVICE_SLOT_COUNTDOWN0;
 }
 
 esp_err_t timer_service_init(timer_service_event_cb_t event_cb)
@@ -225,7 +196,7 @@ esp_err_t timer_service_init(timer_service_event_cb_t event_cb)
         vSemaphoreDelete(s_timer_load_done);
         s_timer_load_done = NULL;
     }
-    if (xTaskCreatePinnedToCoreWithCaps(persist_worker_task, "timer_persist", 4096, NULL, 2,
+    if (xTaskCreatePinnedToCoreWithCaps(persist_worker_task, "timer_persist", 2560, NULL, 2,
                                         &s_persist_task, 1,
                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         s_persist_task = NULL;
@@ -257,16 +228,19 @@ timer_service_cmd_result_t timer_service_set_alarm(uint8_t hour, uint8_t minute)
     time_t target = mktime(&local);
     /* One-shot alarm: if the moment already passed, ring tomorrow. */
     if (target <= now + 60) target += 24 * 3600;
+    /* Single alarm slot: a new alarm replaces the pending one instead of
+     * being rejected, so the main page never holds two alarms at once. */
     for (size_t i = 0; i < TIMER_SERVICE_MAX_ALARMS; ++i) {
-        if (!s_alarms[i].valid) {
-            s_alarms[i].valid = true;
-            s_alarms[i].target_epoch = (int64_t)target;
-            persist_alarms();
-            ESP_LOGI(TAG, "alarm set: slot=%u target=%lld", (unsigned)i, (long long)target);
-            return TIMER_SERVICE_CMD_EXECUTED;
+        if (s_alarms[i].valid) {
+            ESP_LOGI(TAG, "alarm replaced: slot=%u previous_target=%lld", (unsigned)i,
+                     (long long)s_alarms[i].target_epoch);
         }
+        s_alarms[i].valid = true;
+        s_alarms[i].target_epoch = (int64_t)target;
+        persist_alarms();
+        ESP_LOGI(TAG, "alarm set: slot=%u target=%lld", (unsigned)i, (long long)target);
+        return TIMER_SERVICE_CMD_EXECUTED;
     }
-    ESP_LOGW(TAG, "alarm rejected: all %u slots in use", TIMER_SERVICE_MAX_ALARMS);
     return TIMER_SERVICE_CMD_FAILED;
 }
 
@@ -305,17 +279,24 @@ timer_service_cmd_result_t timer_service_set_countdown(uint32_t duration_seconds
         ESP_LOGW(TAG, "countdown rejected while stopwatch is running");
         return TIMER_SERVICE_CMD_FAILED;
     }
+    /* Single countdown slot: a new countdown replaces the running one and any
+     * voice countdown still waiting for its acknowledgement TTS, so at most
+     * one countdown ever exists. */
     for (size_t i = 0; i < TIMER_SERVICE_MAX_COUNTDOWNS; ++i) {
-        if (!s_countdowns[i].valid && !s_pending_countdowns[i].valid) {
-            s_countdowns[i].valid = true;
-            s_countdowns[i].remaining_seconds = (int32_t)duration_seconds;
-            persist_countdowns();
-            ESP_LOGI(TAG, "countdown set: slot=%u duration=%lu",
-                     (unsigned)i, (unsigned long)duration_seconds);
-            return TIMER_SERVICE_CMD_EXECUTED;
+        if (s_countdowns[i].valid || s_pending_countdowns[i].valid) {
+            const long previous = s_countdowns[i].valid
+                                      ? (long)s_countdowns[i].remaining_seconds
+                                      : (long)s_pending_countdowns[i].remaining_seconds;
+            ESP_LOGI(TAG, "countdown replaced: slot=%u previous=%ld", (unsigned)i, previous);
         }
+        s_pending_countdowns[i].valid = false;
+        s_pending_countdowns[i].remaining_seconds = 0;
+        s_countdowns[i].valid = true;
+        s_countdowns[i].remaining_seconds = (int32_t)duration_seconds;
+        ESP_LOGI(TAG, "countdown set: slot=%u duration=%lu",
+                 (unsigned)i, (unsigned long)duration_seconds);
+        return TIMER_SERVICE_CMD_EXECUTED;
     }
-    ESP_LOGW(TAG, "countdown rejected: all %u slots in use", TIMER_SERVICE_MAX_COUNTDOWNS);
     return TIMER_SERVICE_CMD_FAILED;
 }
 
@@ -328,17 +309,24 @@ timer_service_cmd_result_t timer_service_prepare_countdown(uint32_t duration_sec
         ESP_LOGW(TAG, "countdown rejected while stopwatch is running");
         return TIMER_SERVICE_CMD_FAILED;
     }
+    /* Single countdown slot: a voice countdown replaces any previous one, and
+     * the running slot is cleared so the replacement starts cleanly once the
+     * acknowledgement TTS has drained. */
     for (size_t i = 0; i < TIMER_SERVICE_MAX_COUNTDOWNS; ++i) {
-        if (!s_countdowns[i].valid && !s_pending_countdowns[i].valid) {
-            s_pending_countdowns[i].valid = true;
-            s_pending_countdowns[i].remaining_seconds = (int32_t)duration_seconds;
-            ESP_LOGI(TAG, "countdown prepared: slot=%u duration=%lu; waiting for TTS completion",
-                     (unsigned)i, (unsigned long)duration_seconds);
-            return TIMER_SERVICE_CMD_EXECUTED;
+        if (s_countdowns[i].valid || s_pending_countdowns[i].valid) {
+            const long previous = s_countdowns[i].valid
+                                      ? (long)s_countdowns[i].remaining_seconds
+                                      : (long)s_pending_countdowns[i].remaining_seconds;
+            ESP_LOGI(TAG, "countdown replaced: slot=%u previous=%ld", (unsigned)i, previous);
         }
+        s_countdowns[i].valid = false;
+        s_countdowns[i].remaining_seconds = 0;
+        s_pending_countdowns[i].valid = true;
+        s_pending_countdowns[i].remaining_seconds = (int32_t)duration_seconds;
+        ESP_LOGI(TAG, "countdown prepared: slot=%u duration=%lu; waiting for TTS completion",
+                 (unsigned)i, (unsigned long)duration_seconds);
+        return TIMER_SERVICE_CMD_EXECUTED;
     }
-    ESP_LOGW(TAG, "countdown rejected: all %u slots in use or pending",
-             TIMER_SERVICE_MAX_COUNTDOWNS);
     return TIMER_SERVICE_CMD_FAILED;
 }
 
@@ -356,7 +344,6 @@ timer_service_cmd_result_t timer_service_start_pending_countdowns(void)
         s_countdowns[i] = s_pending_countdowns[i];
         s_pending_countdowns[i].valid = false;
         s_pending_countdowns[i].remaining_seconds = 0;
-        persist_countdowns();
         ESP_LOGI(TAG, "countdown started after voice TTS/chain completion: slot=%u remaining=%ld",
                  (unsigned)i, (long)s_countdowns[i].remaining_seconds);
         started = true;
@@ -461,6 +448,19 @@ void timer_service_get_snapshot(timer_service_snapshot_t *out)
         out->alarm_minute = (uint8_t)local.tm_min;
     }
     out->countdown_active = timer_service_query_countdown_remaining(&out->countdown_remaining_seconds);
+    if (!out->countdown_active) {
+        /* A voice countdown waiting for its acknowledgement TTS is already a
+         * committed timer: report it so the main page swaps away from the
+         * alarm the moment it is set instead of after the prompt drains. */
+        for (size_t i = 0; i < TIMER_SERVICE_MAX_COUNTDOWNS; ++i) {
+            if (s_pending_countdowns[i].valid && s_pending_countdowns[i].remaining_seconds > 0) {
+                out->countdown_active = true;
+                out->countdown_remaining_seconds =
+                    (uint32_t)s_pending_countdowns[i].remaining_seconds;
+                break;
+            }
+        }
+    }
     (void)timer_service_query_stopwatch(&out->stopwatch_seconds);
     out->stopwatch_running = s_stopwatch_running &&
                              out->stopwatch_seconds < TIMER_SERVICE_MAX_DISPLAY_SECONDS;
@@ -500,11 +500,11 @@ static void start_ringing(timer_service_slot_t slot)
     s_ringing_slot = slot;
     s_ring_started_us = esp_timer_get_time();
     s_last_heartbeat_us = 0;
-    /* Delete one-shot sources immediately: the alarm/countdown is consumed. */
+    /* Delete one-shot sources immediately: the alarm/countdown is consumed.
+       只有闹钟需要落盘——倒计时是内存态，响完清内存就够。 */
     if (slot_is_countdown(slot)) {
         s_countdowns[slot - TIMER_SERVICE_SLOT_COUNTDOWN0].valid = false;
         s_countdowns[slot - TIMER_SERVICE_SLOT_COUNTDOWN0].remaining_seconds = 0;
-        persist_countdowns();
     } else {
         s_alarms[slot - TIMER_SERVICE_SLOT_ALARM0].valid = false;
         s_alarms[slot - TIMER_SERVICE_SLOT_ALARM0].target_epoch = 0;
@@ -548,23 +548,14 @@ void timer_service_poll(void)
         }
     }
 
-    /* Countdown tick and expiry. */
-    bool countdown_changed = false;
+    /* Countdown tick and expiry. 进度只活在内存里：下电即失是预期行为，
+       所以这里不再按 N 秒节流落盘（原来是 30 tick 一次）。 */
     for (size_t i = 0; i < TIMER_SERVICE_MAX_COUNTDOWNS; ++i) {
         if (!s_countdowns[i].valid || s_countdowns[i].remaining_seconds <= 0) continue;
         if ((time_t)s_countdowns[i].remaining_seconds <= elapsed) {
             start_ringing((timer_service_slot_t)(TIMER_SERVICE_SLOT_COUNTDOWN0 + i));
-            countdown_changed = true;
         } else {
             s_countdowns[i].remaining_seconds -= (int32_t)elapsed;
-            countdown_changed = true;
-        }
-    }
-    if (countdown_changed) {
-        ++s_persist_tick;
-        if (s_persist_tick >= TIMER_SERVICE_COUNTDOWN_PERSIST_TICKS) {
-            s_persist_tick = 0U;
-            persist_countdowns();
         }
     }
 

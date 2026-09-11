@@ -10,11 +10,13 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_netif_sntp.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #include "app_weather.h"
@@ -514,10 +516,14 @@ esp_err_t app_time_init(void)
     s_sntp_events = xEventGroupCreate();
     s_location_events = xEventGroupCreate();
     if (s_sntp_events == NULL || s_location_events == NULL) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(sntp_task, "sntp_task", 4096, NULL, 4,
-                    &s_sntp_task_handle) != pdPASS) {
+    if (xTaskCreatePinnedToCoreWithCaps(sntp_task, "sntp_task", 3072, NULL, 4,
+                    &s_sntp_task_handle, tskNO_AFFINITY,
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+    /* location_task 运行路径会写 NVS(location_snapshot_set -> nvs_set_blob),
+     * 写入期间会禁用 SPI Cache。任务栈必须留在内部 RAM,否则 PSRAM 栈访问会触发
+     * esp_task_stack_is_sane_cache_disabled() 断言崩溃。 */
     if (xTaskCreatePinnedToCore(location_task, "location_task", 4096, NULL, 3,
                                 &s_location_task_handle, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;

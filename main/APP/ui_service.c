@@ -12,6 +12,7 @@
 #include "lvgl.h"
 
 #include "mid_snapshot.h"
+#include "radio_stream_service.h"
 #include "st7789_driver.h"
 #include "ui_assets.h"
 #include "ui_cjk_font.h"
@@ -342,13 +343,17 @@ static void create_status_bar(lv_obj_t *parent, ui_status_bar_t *bar, bool compa
     lv_obj_set_pos(bar->mic_error, 46, 6);
     lv_obj_set_pos(bar->bluetooth, 46, 6);
     lv_obj_set_pos(bar->battery, 74, 6);
-    bar->protocol = make_label(parent, "PD", &lv_font_montserrat_14, color(UI_ACCENT));
+    /* 没有 STC 数据时不再冒充 "PD"：否则“协议未知”和“真的协商到 PD”在屏
+       幕上是同一个样子，反而看不出充电状态到底有没有上报。 */
+    bar->protocol = make_label(parent, "--", &lv_font_montserrat_14, color(UI_ACCENT));
     lv_obj_align(bar->protocol, LV_ALIGN_TOP_RIGHT, -14, 8);
     bar->clock = NULL;
     if (compact_clock)
     {
         bar->clock = make_label(parent, "00:00", &lv_font_montserrat_14, color(UI_INK));
-        lv_obj_align(bar->clock, LV_ALIGN_TOP_RIGHT, -52, 8);
+        /* 初始位置只是占位，update_status_bar() 每次刷新会按协议名的实际
+           宽度把时钟重排到协议标签左侧。 */
+        lv_obj_align_to(bar->clock, bar->protocol, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     }
 }
 
@@ -357,9 +362,13 @@ static void update_status_bar(const ui_status_bar_t *bar, const lumidock_snapsho
     set_status_icon(bar->wifi, &ui_icon_wifi, snapshot->wifi.connected);
     set_status_icon(bar->bluetooth, &ui_icon_bluetooth, snapshot->bluetooth.connected);
     set_status_icon(bar->battery, &ui_icon_battery, snapshot->bms.online);
-    lv_label_set_text(bar->protocol, snapshot->charging.valid ? snapshot->charging.name : "PD");
+    lv_label_set_text(bar->protocol, snapshot->charging.valid ? snapshot->charging.name : "--");
     if (compact_clock && bar->clock != NULL)
     {
+        /* 协议名最长是 "PD PPS"（六个字符），比原来的 "PD" 宽出一倍多，而时钟
+           原先钉在 -52 的固定偏移上，会被协议名压字。改成贴着协议标签左侧
+           重排，每次刷新都按当前文本重新对齐。 */
+        lv_obj_align_to(bar->clock, bar->protocol, LV_ALIGN_OUT_LEFT_MID, -8, 0);
         char clock[8];
         if (snapshot->time_weather.valid)
         {
@@ -379,7 +388,7 @@ static void update_main_status_bar(const lumidock_snapshot_t *snapshot)
     lv_obj_add_flag(s_scene.main_status.bluetooth, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_scene.main_status.battery, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_scene.main_status.protocol,
-                      snapshot->charging.valid ? snapshot->charging.name : "PD");
+                      snapshot->charging.valid ? snapshot->charging.name : "--");
 }
 
 static const lv_image_dsc_t *weather_scene_for_code(int weather_code)
@@ -745,7 +754,7 @@ static void create_charging_page(lv_obj_t *root)
     lv_obj_set_style_line_rounded(s_scene.charge_bolt, true, 0);
     s_scene.charge_power = make_label(s_scene.charging_page, "--.- W", &lv_font_montserrat_48, color(UI_INK));
     lv_obj_align(s_scene.charge_power, LV_ALIGN_TOP_MID, 18, 50);
-    s_scene.charge_protocol = make_label(s_scene.charging_page, "PD", &lv_font_montserrat_20, color(UI_ACCENT));
+    s_scene.charge_protocol = make_label(s_scene.charging_page, "--", &lv_font_montserrat_20, color(UI_ACCENT));
     lv_obj_align(s_scene.charge_protocol, LV_ALIGN_TOP_MID, 0, 111);
     s_scene.charge_soc = make_label(s_scene.charging_page, "--%", &lv_font_montserrat_16, color(UI_MUTED));
     lv_obj_align(s_scene.charge_soc, LV_ALIGN_TOP_MID, 0, 140);
@@ -1058,6 +1067,10 @@ static void update_main_timer(const timer_snapshot_t *timer)
     update_main_timer_preview();
     return;
 #else
+    /* One main-page slot serves three timers, with an explicit precedence: a
+     * running countdown or stopwatch always covers a pending alarm, and only
+     * one of the two labels is visible at a time.  Setting a countdown therefore
+     * takes the slot away from the alarm instead of sharing it. */
     char text[16];
     const bool timer_display_active = timer->countdown_active || timer->stopwatch_running;
     if (timer_display_active)
@@ -1246,7 +1259,7 @@ static void update_charging_page(const lumidock_snapshot_t *snapshot)
         (void)snprintf(text, sizeof(text), "%.1f W", (double)power);
         lv_label_set_text(s_scene.charge_power, text);
     }
-    lv_label_set_text(s_scene.charge_protocol, snapshot->charging.valid ? snapshot->charging.name : "PD");
+    lv_label_set_text(s_scene.charge_protocol, snapshot->charging.valid ? snapshot->charging.name : "--");
     if (snapshot->bms.online)
     {
         (void)snprintf(text, sizeof(text), "%u%%", snapshot->bms.soc_percent);
@@ -1396,7 +1409,13 @@ static void update_voice_eyes(voice_ui_state_t state)
 static void update_voice_page(const lumidock_snapshot_t *snapshot)
 {
     update_status_bar(&s_scene.voice_status, snapshot, true);
-    const voice_ui_state_t state = snapshot->voice_session.state;
+    voice_ui_state_t state = snapshot->voice_session.state;
+    /* 电台在播就是“小智在说话”，只是音源不是云端 TTS：这一轮对话已经收尾，
+       voice_session.state 回落成 IDLE，照搬就会显示安静闭眼的脸，和正在出声的
+       听感正好相反。这里把“电台出声中”当成说话状态，让眼睛和嘴一起动起来。
+       真的在处理语音回合时（连接/聆听/思考）仍以会话状态为准。 */
+    if (state == VOICE_UI_IDLE && radio_stream_service_is_requested())
+        state = VOICE_UI_SPEAKING;
     update_voice_eyes(state);
     if ((s_scene.voice_pulse_frame++ % 6U) == 0U && state == VOICE_UI_SPEAKING)
     {
@@ -1562,7 +1581,12 @@ static void update_page_state(const lumidock_snapshot_t *snapshot, int64_t now_u
             }
             return;
         }
-        set_page(charging_active(snapshot) ? UI_PAGE_CHARGING : UI_PAGE_MAIN);
+        /* 电台在播时停在语音页：电台是同一轮对话拉起来的“小智在说话”，只是音源
+           不同，会话结束就把屏幕翻回时钟会让人以为播放被打断了。只有用户说
+           “退出电台”终止电台后，这里才恢复回主页面。充电页优先级更高，交给下面
+           的充电分支处理。 */
+        if (!radio_stream_service_is_requested())
+            set_page(charging_active(snapshot) ? UI_PAGE_CHARGING : UI_PAGE_MAIN);
     }
     if (charging_active(snapshot))
     {

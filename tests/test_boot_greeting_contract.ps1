@@ -9,7 +9,7 @@ $header = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi
     @{ Content = $voice; Pattern = 'XIAOZHI_VOICE_BOOT_GREETING_WAIT_TTS'; Message = 'Boot greeting must have an isolated TTS-wait state.' },
     @{ Content = $voice; Pattern = 'XIAOZHI_VOICE_BOOT_GREETING_WAIT_REPLY'; Message = 'Boot greeting must have an isolated direct-reply state.' },
     @{ Content = $voice; Pattern = 'XIAOZHI_BOOT_GREETING_TTS_TIMEOUT_US \(8LL \* 1000LL \* 1000LL\)'; Message = 'Boot greeting must time out if TTS does not begin within eight seconds.' },
-    @{ Content = $voice; Pattern = 'XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US \(15LL \* 1000LL \* 1000LL\)'; Message = 'Boot greeting direct-reply window must last 15 seconds.' },
+    @{ Content = $voice; Pattern = 'XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US \(6400LL \* 1000LL\)'; Message = 'Boot greeting direct-reply window must last 6.4 seconds.' },
     @{ Content = $voice; Pattern = 's_boot_greeting_attempted'; Message = 'Boot greeting must be limited to once per power cycle.' },
     @{ Content = $voice; Pattern = 's_boot_greeting_request_pending'; Message = 'Repeated coordinator polls must not enqueue duplicate boot greeting events.' },
     @{ Content = $voice; Pattern = 's_pipeline_ready'; Message = 'Boot greeting must wait until Opus and AFE/WakeNet/VAD initialization is complete.' },

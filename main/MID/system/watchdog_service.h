@@ -13,6 +13,11 @@ esp_err_t watchdog_service_subscribe_current_task(void);
 /* Records a heartbeat for the calling application task. */
 void watchdog_service_feed(void);
 
+/* Opts the calling task into reboot-on-stale-heartbeat.  Every task is
+ * report-only by default, because a late heartbeat on a saturated core is a
+ * scheduling symptom rather than a hang and must not restart the device. */
+void watchdog_service_set_current_task_fatal(bool fatal);
+
 /* Marks a bounded blocking network operation for the calling task. */
 void watchdog_service_set_current_task_blocking(bool blocking);
 

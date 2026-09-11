@@ -43,8 +43,8 @@ if ($finishBlock -notmatch 'xiaozhi_audio_pipeline_set_streaming\(false\)' -or
     $finishBlock -notmatch 'send_terminal_uplink_sequence\(\)') {
     throw 'listen/stop must stop capture, isolate terminal tails after main TX, and use the terminal owner.'
 }
-if ($playout -notmatch '#define AUDIO_PLAYOUT_QUEUE_DEPTH 128U') {
-    throw 'PCM playout queue must be expanded to 128 30-ms chunks.'
+if ($playout -notmatch '#define AUDIO_PLAYOUT_QUEUE_DEPTH 256U') {
+    throw 'PCM playout queue must be expanded to 256 30-ms chunks.'
 }
 if ($driver -notmatch 's_ctrl_lock' -or $driver -notmatch 's_rx_lock' -or $driver -notmatch 's_tx_lock') {
     throw 'ES8311 driver must split control, RX, and TX locks.'

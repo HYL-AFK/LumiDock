@@ -2,29 +2,30 @@ $ErrorActionPreference = 'Stop'
 
 $voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_voice_service.c"
 
-# The fallback prompt must exist with editable wording and the same
-# [device_call] mechanism as the timeout prompt.
+# The fallback prompt used to be a cloud [device_call] TTS request.  The
+# official xiaozhi.me server rejects that prefix, so it is an embedded PCM
+# asset now and the wording lives in the tone generator that renders it.
 if ($voice -notmatch 'request_cloud_fallback_prompt') {
     throw 'Fallback prompt request must exist.'
-}
-if ($voice -notmatch 's_fallback_phrases') {
-    throw 'Fallback prompt wording must live in an editable phrase list.'
 }
 $fbStart = $voice.IndexOf('static bool request_cloud_fallback_prompt')
 $logStart = $voice.IndexOf('static void log_uplink_traffic', $fbStart)
 if ($fbStart -lt 0 -or $logStart -lt 0) { throw 'Fallback prompt function boundaries are missing.' }
 $fbBlock = $voice.Substring($fbStart, $logStart - $fbStart)
-if ($fbBlock -notmatch '\[device_call\]') {
-    throw 'The fallback prompt must be wrapped in [device_call] so the server answers with TTS.'
+if ($fbBlock -notmatch 'play_local_prompt_pcm\(LOCAL_PROMPT_FALLBACK, prompt_fallback_pcm_start,') {
+    throw 'The fallback prompt must play the embedded PCM asset.'
+}
+if ($fbBlock -match '"\[device_call\]') {
+    throw 'The fallback prompt must not build a [device_call] direct-TTS request.'
 }
 if ($fbBlock -notmatch 's_fallback_prompt_turn_id = s_turn_id' -or
-    $fbBlock -notmatch 's_state = XIAOZHI_VOICE_EXITING' -or
-    $fbBlock -notmatch 's_exit_tts_start_deadline_us = now_us \+ XIAOZHI_EXIT_TTS_START_TIMEOUT_US') {
-    throw 'The fallback prompt must open a generated EXITING turn with the three-layer TTS deadline protection.'
+    $fbBlock -notmatch 's_state = XIAOZHI_VOICE_EXITING') {
+    throw 'The fallback prompt must open a dedicated EXITING turn.'
 }
-if ($fbBlock -notmatch 'send_text\(request\)' -or
-    $fbBlock -notmatch 's_fallback_prompt_pending = false') {
-    throw 'A failed fallback request must return false and roll back its pending markers.'
+if ($fbBlock -notmatch 's_fallback_prompt_pending = false;' -or
+    $fbBlock -notmatch 's_fallback_prompt_turn_id = 0U;' -or
+    $fbBlock -notmatch 'return false;') {
+    throw 'A failed fallback request must roll back its pending markers and return false.'
 }
 
 # Every local silent-ending path must ask for a spoken fallback before giving up.
@@ -34,14 +35,18 @@ $failureMarkers = @(
     'unable to start Opus uplink; requesting generated fallback prompt',
     'terminal uplink tail failed[\s\S]{0,120}requesting generated fallback prompt',
     'terminal listen/stop failed[\s\S]{0,120}requesting generated fallback prompt',
-    'terminal main write failed[\s\S]{0,120}requesting generated fallback prompt',
-    'terminal Opus transport failure[\s\S]{0,120}requesting generated fallback prompt',
-    'voice turn ended after Opus transport failure; requesting generated fallback prompt'
+    'terminal main write failed[\s\S]{0,120}requesting generated fallback prompt'
 )
 foreach ($marker in $failureMarkers) {
     if ($voice -notmatch $marker) {
         throw "Silent-ending path must request a fallback prompt: $marker"
     }
+}
+
+# A dead transport cannot deliver a spoken fallback, so that path closes with
+# the local error tone instead of spending another cloud round trip.
+if ($voice -notmatch 'voice turn transport failure; no cloud fallback, entering bounded cleanup') {
+    throw 'A dead transport must close with the local error tone instead of a cloud fallback.'
 }
 
 # The main-write timeout path must also request the fallback prompt.
@@ -61,7 +66,7 @@ if ($ttsStartBlock -notmatch 'rejected_generated_prompt' -or
 }
 
 # A drained fallback prompt must re-arm the 15 second follow-up window.
-if ($voice -notmatch 'fallback prompt PCM drained; follow-up window=15s') {
+if ($voice -notmatch 'fallback prompt PCM drained; follow-up window=%lldms') {
     throw 'Fallback prompt must re-arm the 15 second follow-up window after playback.'
 }
 

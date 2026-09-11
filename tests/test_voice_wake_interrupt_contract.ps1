@@ -40,11 +40,11 @@ if ($handleEvent -notmatch 's_playing_timeout_prompt = false;[\s\S]*?s_exit_tts_
 if ($voice -notmatch 'request_cloud_timeout_prompt') {
     throw 'Timeout prompt request must exist.'
 }
-if ($voice -notmatch 'timeout prompt PCM drained; follow-up window=15s') {
+if ($voice -notmatch 'timeout prompt PCM drained; follow-up window=%lldms') {
     throw 'Timeout prompt must re-arm the 15 second follow-up window after playback.'
 }
-if ($voice -notmatch 's_timeout_phrases') {
-    throw 'Timeout prompt wording must live in an editable phrase list.'
+if ($voice -notmatch 'play_local_prompt_pcm\(LOCAL_PROMPT_TIMEOUT, prompt_timeout_pcm_start') {
+    throw 'Timeout prompt must play the embedded PCM asset instead of a cloud phrase list.'
 }
 
 Write-Output 'Voice wake interrupt contract passed.'

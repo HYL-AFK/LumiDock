@@ -11,9 +11,14 @@
 #include "esp_blufi_api.h"
 #include "esp_bt.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/timers.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -33,6 +38,13 @@ void ble_store_config_init(void);
 #define BLE_FIXED_ADV_NAME "ESPARK"
 #define BLUFI_SCAN_LIST_MAX_AP 20
 #define BLE_PROVISION_WINDOW_MS (5 * 60 * 1000)
+#define BLE_BOOT_WINDOW_MS (60 * 1000)
+/* The window-expiry stop calls NimBLE (ble_hs_lock) and MUST NOT run on the
+ * FreeRTOS software-timer task (Tmr Svc), which both blocks and, on SMP,
+ * corrupts the scheduler. The expiry is handed to a dedicated task with its
+ * own stack so the (potentially blocking) NimBLE stop runs off the timer task. */
+#define BLE_WINDOW_EXPIRE_TASK_STACK 5120U
+#define BLE_WINDOW_EXPIRE_TASK_PRIO  (tskIDLE_PRIORITY + 3)
 
 static app_config_t s_cfg;
 static bool s_ready;
@@ -41,8 +53,13 @@ static bool s_connected;
 static bool s_window_active;
 static bool s_window_requested;
 static bool s_stack_started;
+static uint32_t s_window_ms;
+static bool s_deep_sleep_on_expire = true;
+static ble_window_kind_t s_window_kind;
 static int64_t s_window_deadline_us;
 static TimerHandle_t s_window_timer;
+static SemaphoreHandle_t s_window_expire_sem;
+static TaskHandle_t s_window_expire_task;
 static bool s_notify_enabled;
 static bool s_sta_connecting;
 static bool s_scan_in_progress;
@@ -74,15 +91,35 @@ static void ble_window_expire(void)
         (void)esp_blufi_adv_stop();
         s_advertising = false;
     }
-    APP_LOGW(TAG, "BLE provisioning window expired; entering deep sleep");
+    APP_LOGW(TAG, "BLE provisioning window expired; deep_sleep_on_expire=%d",
+             (int)s_deep_sleep_on_expire);
     (void)runtime_event_log_append(RUNTIME_EVENT_BLE_TIMEOUT, 0, 0, 0);
-    startup_gate_enter_deep_sleep();
+    if (s_deep_sleep_on_expire) {
+        startup_gate_enter_deep_sleep();
+    }
+}
+
+static void ble_window_expire_task(void *param)
+{
+    (void)param;
+    for (;;) {
+        if (xSemaphoreTake(s_window_expire_sem, portMAX_DELAY) == pdTRUE) {
+            ble_window_expire();
+        }
+    }
 }
 
 static void ble_window_timer_callback(TimerHandle_t timer)
 {
     (void)timer;
-    ble_window_expire();
+    /* FreeRTOS software-timer callbacks run on the low-priority "Tmr Svc" task
+       and MUST NOT block. Calling esp_blufi_adv_stop() -> NimBLE ble_hs_lock()
+       from there both blocks and, on SMP, corrupts the scheduler (panic).
+       Hand the expiry off to the dedicated task instead so the NimBLE stop
+       (and any deep sleep) runs off the software-timer task. */
+    if (s_window_active && s_window_expire_sem != NULL) {
+        (void)xSemaphoreGive(s_window_expire_sem);
+    }
 }
 
 static const char *blufi_error_to_str(esp_blufi_error_state_t state)
@@ -687,7 +724,7 @@ static esp_err_t blufi_stack_init(void)
     return blufi_host_init();
 }
 
-void ble_provision_init(const app_config_t *cfg, bool open_window)
+void ble_provision_init(const app_config_t *cfg, bool open_window, ble_window_kind_t kind)
 {
     if (cfg != NULL) {
         s_cfg = *cfg;
@@ -695,12 +732,57 @@ void ble_provision_init(const app_config_t *cfg, bool open_window)
         app_config_set_default(&s_cfg);
     }
     s_window_requested = open_window;
+    s_window_kind = kind;
+    switch (kind) {
+    case BLE_WINDOW_BOOT:
+        s_window_ms = BLE_BOOT_WINDOW_MS;
+        s_deep_sleep_on_expire = false;
+        break;
+    default:
+        s_window_ms = BLE_PROVISION_WINDOW_MS;
+        s_deep_sleep_on_expire = true;
+        break;
+    }
+    /* The one-shot timer period must always match the current mode. A timer
+     * created for a short BOOT window (e.g. 60s) in a prior init would otherwise
+     * keep its stale period and expire a first-time PROVISION window after
+     * seconds instead of minutes. Re-create it whenever the period differs. */
+    if (s_window_timer != NULL &&
+        (uint32_t)xTimerGetPeriod(s_window_timer) != (uint32_t)pdMS_TO_TICKS(s_window_ms)) {
+        (void)xTimerDelete(s_window_timer, 0);
+        s_window_timer = NULL;
+    }
     if (s_window_timer == NULL) {
-        s_window_timer = xTimerCreate("ble_window", pdMS_TO_TICKS(BLE_PROVISION_WINDOW_MS),
+        s_window_timer = xTimerCreate("ble_window", pdMS_TO_TICKS(s_window_ms),
                                       pdFALSE, NULL, ble_window_timer_callback);
         if (s_window_timer == NULL) {
             APP_LOGE(TAG, "BLE provisioning timer creation failed");
             return;
+        }
+    }
+    if (s_window_expire_sem == NULL) {
+        s_window_expire_sem = xSemaphoreCreateBinary();
+        if (s_window_expire_sem == NULL) {
+            APP_LOGE(TAG, "BLE window expire semaphore creation failed");
+        }
+    }
+    if (s_window_expire_task == NULL && s_window_expire_sem != NULL) {
+        /* This task is permanently resident (waits forever on the expiry
+         * semaphore) and runs the NimBLE adv_stop / deep-sleep path at window
+         * expiry. Allocate its stack from PSRAM so it never eats into the small
+         * internal-RAM contiguous block that the WSS protocol task (needs 4096
+         * bytes of contiguous internal RAM) depends on. */
+        BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(ble_window_expire_task,
+                                                        "ble_win_expire",
+                                                        BLE_WINDOW_EXPIRE_TASK_STACK,
+                                                        NULL,
+                                                        BLE_WINDOW_EXPIRE_TASK_PRIO,
+                                                        &s_window_expire_task,
+                                                        tskNO_AFFINITY,
+                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ok != pdPASS) {
+            s_window_expire_task = NULL;
+            APP_LOGE(TAG, "BLE window expire task creation failed");
         }
     }
 
@@ -729,7 +811,7 @@ esp_err_t ble_provision_open_window(void)
     s_window_requested = true;
     s_window_active = true;
     s_window_deadline_us = esp_timer_get_time() +
-                           (int64_t)BLE_PROVISION_WINDOW_MS * 1000;
+                           (int64_t)s_window_ms * 1000;
     (void)xTimerStop(s_window_timer, 0);
     if (xTimerStart(s_window_timer, 0) != pdPASS) return ESP_FAIL;
     (void)runtime_event_log_append(RUNTIME_EVENT_BLE_WINDOW_OPEN, 0, 0, 0);
@@ -743,6 +825,12 @@ esp_err_t ble_provision_open_window(void)
 
 void ble_provision_close_window(void)
 {
+    /* A boot re-provision window must stay open for its full 60s duration so the
+     * user can switch Wi-Fi even after the saved network happens to connect.
+     * Only the first-time provisioning window closes immediately on a good link. */
+    if (s_window_kind == BLE_WINDOW_BOOT) {
+        return;
+    }
     s_window_active = false;
     s_window_requested = false;
     s_window_deadline_us = 0;

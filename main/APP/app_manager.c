@@ -16,6 +16,7 @@
 #include "bms_service.h"
 #include "ble_provision_service.h"
 #include "button_driver.h"
+#include "device_settings_service.h"
 #include "i2s_audio_driver.h"
 #include "mid_snapshot.h"
 #include "runtime_event_log.h"
@@ -52,8 +53,15 @@ static esp_err_t init_audio_owner(bool mute_after_init)
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t err = i2s_audio_driver_init();
-    if (err == ESP_OK && mute_after_init) {
-        err = i2s_audio_driver_set_output_muted(true);
+    if (err == ESP_OK)
+    {
+        /* The codec comes back at its power-on level; the user's stored
+         * volume has to be re-applied before anything can play. */
+        (void)device_settings_service_apply_saved_volume();
+        if (mute_after_init)
+        {
+            err = i2s_audio_driver_set_output_muted(true);
+        }
     }
     xSemaphoreGive(i2s_audio_driver_init_lock);
     return err;
@@ -259,6 +267,9 @@ esp_err_t app_manager_start(void)
     /* The boot animation must be running before optional peripherals or
      * networking can perform a slow probe. */
     if ((err = ui_service_init()) != ESP_OK) return err;
+    /* Reads the stored speaker volume while this task still owns an internal
+     * RAM stack (NVS reads disable the SPI cache). */
+    device_settings_service_init();
 
 #if !LUMIDOCK_NETWORK_UI_TEST_MODE
     if ((err = button_driver_init()) != ESP_OK) return err;

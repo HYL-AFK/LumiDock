@@ -29,13 +29,13 @@ if ($voice -notmatch 'VOICE_IOT_COMMAND_COUNTDOWN_PENDING' -or
 
 $finish = $voice.IndexOf('case VOICE_EVENT_TTS_PLAYBACK_FINISHED:')
 $finishEnd = $voice.IndexOf('case VOICE_EVENT_TTS_PLAYBACK_UNDERRUN:', $finish)
-$error = $voice.IndexOf('static void close_channel(bool')
-if ($finish -lt 0 -or $finishEnd -lt 0 -or $error -lt 0) { throw 'Voice playback and close paths are missing.' }
+$closeAt = $voice.IndexOf('static void close_channel(bool')
+if ($finish -lt 0 -or $finishEnd -lt 0 -or $closeAt -lt 0) { throw 'Voice playback and close paths are missing.' }
 $finishBlock = $voice.Substring($finish, $finishEnd - $finish)
 if ($finishBlock -notmatch 'timer_service_start_pending_countdowns\(\)') {
     throw 'A successfully drained cloud TTS must start the pending countdown.'
 }
-$closeBlock = $voice.Substring($error)
+$closeBlock = $voice.Substring($closeAt)
 if ($closeBlock -notmatch 'timer_service_start_pending_countdowns\(\)') {
     throw 'Voice-chain failure cleanup must start the pending countdown before returning idle.'
 }

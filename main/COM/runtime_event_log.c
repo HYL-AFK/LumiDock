@@ -7,6 +7,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "app_log.h"
 
@@ -44,10 +45,18 @@ _Static_assert(sizeof(runtime_event_record_t) == RUNTIME_EVENT_RECORD_SIZE,
 _Static_assert(sizeof(runtime_event_store_t) == 544,
                "runtime event NVS blob size changed");
 
+/* NVS 写入会禁用 SPI cache。事件先写入内存并标记脏，由周期定时任务批量落盘，
+ * 避免在调用现场（如 BLE 窗口过期）瞬时冻结所有 PSRAM 任务造成卡顿。 */
+#define RUNTIME_EVENT_FLUSH_PERIOD_US (1000 * 1000) /* 1 s */
+
 static const char *TAG = "runtime_event_log";
 static runtime_event_store_t s_store;
 static SemaphoreHandle_t s_lock;
 static bool s_initialized;
+static bool s_dirty;
+static esp_timer_handle_t s_flush_timer;
+
+static void runtime_event_log_flush_timer_cb(void *arg);
 
 static const char *event_type_name(runtime_event_type_t type)
 {
@@ -173,6 +182,15 @@ esp_err_t runtime_event_log_init(void)
              RUNTIME_EVENT_LOG_CAPACITY,
              RUNTIME_EVENT_RECORD_SIZE,
              (unsigned)sizeof(s_store));
+
+    /* 周期批量落盘，避免每次 append 同步写 NVS 禁用 cache 造成瞬时卡顿。 */
+    esp_timer_create_args_t targs = {
+        .callback = runtime_event_log_flush_timer_cb,
+        .name = "rtlog_flush",
+    };
+    if (esp_timer_create(&targs, &s_flush_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_flush_timer, RUNTIME_EVENT_FLUSH_PERIOD_US);
+    }
     return ESP_OK;
 }
 
@@ -184,7 +202,6 @@ esp_err_t runtime_event_log_append(runtime_event_type_t type,
     if (!s_initialized || type == 0) return ESP_ERR_INVALID_STATE;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    runtime_event_store_t previous = s_store;
     const uint16_t index = s_store.header.write_index;
     runtime_event_record_t *record = &s_store.records[index];
     memset(record, 0, sizeof(*record));
@@ -212,13 +229,28 @@ esp_err_t runtime_event_log_append(runtime_event_type_t type,
     }
     s_store.header.header_crc32 = header_crc(&s_store.header);
 
-    esp_err_t err = store_commit(&s_store);
-    if (err != ESP_OK) {
-        s_store = previous;
-        APP_LOG_ERR(TAG, err, "append event failed: type=%u", (unsigned)type);
+    /* 仅在内存更新并标记脏，真正落盘交给周期定时任务批量提交。 */
+    s_dirty = true;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+static void runtime_event_log_flush_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_initialized || !s_dirty) return;
+
+    /* 快速路径不持锁判断脏标志，确认后再短暂持锁批量落盘。 */
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (s_dirty) {
+        esp_err_t err = store_commit(&s_store);
+        if (err == ESP_OK) {
+            s_dirty = false;
+        } else {
+            APP_LOG_ERR(TAG, err, "event flush failed");
+        }
     }
     xSemaphoreGive(s_lock);
-    return err;
 }
 
 esp_err_t runtime_event_log_get(uint16_t offset_from_oldest,

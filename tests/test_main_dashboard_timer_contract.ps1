@@ -33,7 +33,7 @@ $alarmSvg = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\assets\ui\alarm
     @{ Content = $ui; Pattern = 'main_weekday'; Message = 'Date and weekday must have dedicated labels.' },
     @{ Content = $ui; Pattern = 'main_calendar_group'; Message = 'Date and weekday must share a vertical calendar group.' },
     @{ Content = $ui; Pattern = '&ui_cjk_font_34_black'; Message = 'Date and weekday must use the 34px bold (Hei) CJK font.' },
-    @{ Content = $cjkHeader; Pattern = 'ui_cjk_font_34'; Message = 'The 34px CJK font must be declared to the UI.' },
+    @{ Content = $cjkHeader; Pattern = 'ui_cjk_font_34_black'; Message = 'The 34px bold CJK font must be declared to the UI.' },
     @{ Content = $ui; Pattern = 'main_timer_group'; Message = 'Timer icon and time must share a fixed-size container.' },
     @{ Content = $ui; Pattern = 'UI_MAIN_TIMER_GROUP_WIDTH 136'; Message = 'Timer group must have fixed width.' },
     @{ Content = $ui; Pattern = 'UI_MAIN_TIMER_GROUP_Y 114'; Message = 'Timer group must move down by 11px.' },
@@ -65,6 +65,16 @@ foreach ($scene in @('weather_clear_scene.svg', 'weather_cloudy_scene.svg', 'wea
     $sceneContent = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\assets\ui\$scene"
     if ($sceneContent -match 'data-weather-icon') {
         throw "$scene must not retain a background weather icon."
+    }
+}
+
+# 上面的字体断言原来写的是 'ui_cjk_font_34'，它会被 'ui_cjk_font_34_black' 匹配上，
+# 所以 34px 那个文件被删掉之后它仍然“通过”。现在改成精确名字，并补一条更硬的不变式：
+# CMakeLists 里列出的字体源文件必须真实存在。清掉 24 / 34 / 48px CJK 和 54px 时间字体
+# 时，删了文件忘删条目就是靠这一条拦下来——否则要等到 cmake 阶段才报错。
+foreach ($entry in [regex]::Matches($cmake, '"(APP/[\w]*font[\w]*\.c)"') | ForEach-Object { $_.Groups[1].Value }) {
+    if (-not (Test-Path -LiteralPath "$PSScriptRoot\..\main\$entry")) {
+        throw "CMakeLists compiles $entry, but the file no longer exists."
     }
 }
 

@@ -12,11 +12,15 @@ $cmake = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\CMakeLists.txt"
 
 @(
     @{ Content = $boardPins; Pattern = 'LUMIDOCK_WS2812_LED_COUNT 24U'; Message = 'The status strip must be configured for 24 WS2812 LEDs.' },
-    @{ Content = $driver; Pattern = 'rmt_new_tx_channel'; Message = 'WS2812 output must use the RMT TX peripheral, not a GPIO level.' },
-    @{ Content = $driver; Pattern = 'rmt_new_simple_encoder'; Message = 'WS2812 output must provide an encoder for GRB bit timing.' },
-    @{ Content = $driver; Pattern = 'rmt_transmit'; Message = 'WS2812 colors must be transmitted through RMT.' },
-    @{ Content = $driver; Pattern = 'rmt_tx_wait_all_done\(s_channel, portMAX_DELAY\)'; Message = 'The initial WS2812 frame must wait for RMT completion instead of failing after a short timeout.' },
-    @{ Content = $driver; Pattern = 'const size_t byte_index = symbols_written / 8U;'; Message = 'The RMT encoder must convert already written symbols into a WS2812 data-byte offset.' },
+    @{ Content = $boardPins; Pattern = 'LUMIDOCK_WS2812_2_GPIO GPIO_NUM_14'; Message = 'The synchronized second WS2812 output must use GPIO14.' },
+    @{ Content = $driver; Pattern = '#include "driver/spi_master.h"'; Message = 'WS2812 output must use the SPI master peripheral instead of RMT.' },
+    @{ Content = $driver; Pattern = 'SPI3_HOST'; Message = 'WS2812 output must use the free SPI3 peripheral.' },
+    @{ Content = $driver; Pattern = 'spi_bus_initialize'; Message = 'The WS2812 SPI bus must be initialized.' },
+    @{ Content = $driver; Pattern = 'spi_bus_add_device'; Message = 'The WS2812 SPI device must be registered.' },
+    @{ Content = $driver; Pattern = 'esp_rom_gpio_connect_out_signal'; Message = 'SPI MOSI must be mirrored through the GPIO matrix.' },
+    @{ Content = $driver; Pattern = 'spi_periph_signal\[WS2812_SPI_HOST\]\.spid_out'; Message = 'GPIO14 must receive the SPI3 data output signal.' },
+    @{ Content = $driver; Pattern = 'WS2812_ENCODED_BYTES'; Message = 'The driver must use a dedicated SPI waveform buffer.' },
+    @{ Content = $driver; Pattern = 'WS2812_RESET_US'; Message = 'The SPI driver must provide a WS2812 reset interval.' },
     @{ Content = $driver; Pattern = 'ws2812_driver_set_rgb'; Message = 'The driver must expose direct RGB output.' },
     @{ Content = $driver; Pattern = 'ws2812_driver_set_pixel'; Message = 'The driver must support individual pixels for strip animations.' },
     @{ Content = $driver; Pattern = 'ws2812_driver_show'; Message = 'The driver must transmit a complete strip frame.' },
@@ -42,7 +46,7 @@ $cmake = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\CMakeLists.txt"
     @{ Content = $wifi; Pattern = 'provisioning_active = ble_provision_is_window_active'; Message = 'Wi-Fi service must publish the BluFi window state.' },
     @{ Content = $manager; Pattern = 'status_led_service_init\(\)'; Message = 'Status LED service must start in the current network/UI test profile.' },
     @{ Content = $cmake; Pattern = 'MID/system/status_led_service\.c'; Message = 'Status LED service must be compiled.' },
-    @{ Content = $cmake; Pattern = '(?m)^\s*esp_driver_rmt\s*$'; Message = 'The RMT driver component must be linked.' },
+    @{ Content = $cmake; Pattern = '(?m)^\s*esp_driver_spi\s*$'; Message = 'The SPI driver component must be linked.' },
     @{ Content = $service; Pattern = 'snapshot->voice_session\.state'; Message = 'Voice indication must branch on the snapshot voice sub-state.' },
     @{ Content = $service; Pattern = 'case VOICE_UI_THINKING:[\s\S]*?case VOICE_UI_SPEAKING:[\s\S]*?case VOICE_UI_LISTENING:'; Message = 'The voice indication must distinguish thinking / speaking / listening.' }
 ) | ForEach-Object {
@@ -53,12 +57,16 @@ if ($driver -match 'gpio_set_level\(LUMIDOCK_WS2812_1_GPIO') {
     throw 'A raw GPIO level cannot encode WS2812 color frames.'
 }
 
+if ($driver -match '\brmt_') {
+    throw 'The WS2812 implementation must not use the RMT driver.'
+}
+
 if ($driver -match 'return ws2812_driver_show\(\);') {
     throw 'WS2812 driver initialization must not transmit a frame before the status service task starts.'
 }
 
-if ($driver -match 'byte_index = symbols_written;') {
-    throw 'The RMT callback must convert the symbol offset to a WS2812 data-byte offset.'
+if ($driver -notmatch 'LUMIDOCK_WS2812_2_GPIO') {
+    throw 'The SPI waveform must be routed to the second GPIO14 output.'
 }
 
 $faultPriority = $service.IndexOf('if (s_critical_fault) return STATUS_LED_FAULT;')

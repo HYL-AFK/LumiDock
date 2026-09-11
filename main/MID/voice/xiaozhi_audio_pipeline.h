@@ -20,6 +20,7 @@ typedef enum {
     XIAOZHI_TTS_PLAYBACK_FINISHED,
     XIAOZHI_TTS_PLAYBACK_UNDERRUN,
     XIAOZHI_ERROR_TONE_PLAYBACK_FINISHED,
+    XIAOZHI_LOCAL_PROMPT_PLAYBACK_FINISHED,
 } xiaozhi_tts_playback_event_t;
 typedef void (*xiaozhi_tts_playback_cb_t)(xiaozhi_tts_playback_event_t event,
                                           uint32_t epoch, void *context);

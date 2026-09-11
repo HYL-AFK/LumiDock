@@ -13,6 +13,7 @@
 #include "board_pins.h"
 #include "watchdog_service.h"
 #include "ws2812_driver.h"
+#include "onboard_led_driver.h"
 
 #define STATUS_LED_UPDATE_MS 50U
 #define STATUS_LED_SUCCESS_BLINKS 2U
@@ -188,10 +189,38 @@ static void render_state(status_led_state_t state, const lumidock_snapshot_t *sn
     }
 }
 
+/* Map the shared status selector onto the single on-board RGB LED:
+ * boot -> blue breathe, fault -> red double-blink, everything else (working /
+ * provisioning / voice / charging...) -> solid green. */
+static void render_onboard_led(status_led_state_t state, int64_t now_us)
+{
+    switch (state) {
+    case STATUS_LED_BOOT_ANIMATION: {
+        const uint8_t k = breathe(110U, now_us);
+        (void)onboard_led_driver_set_rgb(color_scale(30U, k), color_scale(90U, k),
+                                         color_scale(255U, k));
+        break;
+    }
+    case STATUS_LED_FAULT:
+        if (double_blink(now_us)) {
+            (void)onboard_led_driver_set_rgb(255U, 30U, 30U);
+        } else {
+            onboard_led_driver_clear();
+        }
+        break;
+    default:
+        (void)onboard_led_driver_set_rgb(30U, 200U, 90U);
+        break;
+    }
+}
+
 static void status_led_task(void *arg)
 {
     (void)arg;
     (void)watchdog_service_subscribe_current_task();
+    /* The indicator strip is decorative: it is monitored on the serial log but
+       must never be the reason the device reboots. */
+    watchdog_service_set_current_task_fatal(false);
     for (;;) {
         watchdog_service_feed();
         const int64_t now_us = esp_timer_get_time();
@@ -202,8 +231,10 @@ static void status_led_task(void *arg)
                 s_success_until_us = now_us + STATUS_LED_SUCCESS_US;
             }
             s_internet_was_online = snapshot->wifi.internet_online;
-            render_state(choose_state(snapshot, now_us), snapshot, now_us);
+            const status_led_state_t state = choose_state(snapshot, now_us);
+            render_state(state, snapshot, now_us);
             (void)ws2812_driver_show();
+            render_onboard_led(state, now_us);
             mid_snapshot_read_release();
         }
         vTaskDelay(pdMS_TO_TICKS(STATUS_LED_UPDATE_MS));
@@ -215,12 +246,18 @@ esp_err_t status_led_service_init(void)
     if (s_initialized) return ESP_OK;
     esp_err_t err = ws2812_driver_init();
     if (err != ESP_OK) return err;
-    if (xTaskCreatePinnedToCoreWithCaps(status_led_task, "status_led", 3072, NULL, 1, NULL, 1,
+    err = onboard_led_driver_init();
+    if (err != ESP_OK) return err;
+    /* Runs above the core-1 cluster it shares with ui_service, radio_stream and
+       snapshot_bridge (all priority 2).  At priority 1 it was starved for
+       seconds whenever the radio was playing and the AFE was running hot,
+       which froze the animation and tripped the stale-heartbeat report. */
+    if (xTaskCreatePinnedToCoreWithCaps(status_led_task, "status_led", 3072, NULL, 3, NULL, 1,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     s_initialized = true;
-    ESP_LOGI("status_led", "WS2812 status service started on GPIO13");
+    ESP_LOGI("status_led", "WS2812 status service started on GPIO13 and GPIO14 (synchronized)");
     return ESP_OK;
 }
 

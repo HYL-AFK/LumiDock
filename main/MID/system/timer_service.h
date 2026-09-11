@@ -5,23 +5,23 @@
 
 #include "esp_err.h"
 
-/* Timer slots owned by this service: one one-shot alarm and two countdowns.
+/* Timer slots owned by this service: exactly one one-shot alarm and one
+ * countdown, so two timers of the same kind can never compete for the single
+ * main-page slot.  Setting a new one replaces whatever was pending or running.
  * The stopwatch is a single in-memory stopwatch and never persists. */
 #define TIMER_SERVICE_MAX_ALARMS 1U
-#define TIMER_SERVICE_MAX_COUNTDOWNS 2U
+#define TIMER_SERVICE_MAX_COUNTDOWNS 1U
 #define TIMER_SERVICE_MAX_DISPLAY_SECONDS (59U * 60U + 59U)
 /* While a timer rings, the event callback receives one RING heartbeat every
  * 2 s so the caller can replay the chime; after 30 s it auto-stops. */
 #define TIMER_SERVICE_RING_HEARTBEAT_MS 2000U
 #define TIMER_SERVICE_RING_TIMEOUT_MS 30000U
-/* Countdown progress is flushed to NVS every N ticks to limit flash wear;
- * a power cut can lose at most this many seconds of progress. */
-#define TIMER_SERVICE_COUNTDOWN_PERSIST_TICKS 30U
+/* 持久化边界：只有闹钟跨下电存活（NVS）。倒计时和正计时都是内存态，下电即失，
+   所以没有“倒计时进度落盘”这个概念，也没有对应的节流常量。 */
 
 typedef enum {
     TIMER_SERVICE_SLOT_ALARM0 = 0,
     TIMER_SERVICE_SLOT_COUNTDOWN0,
-    TIMER_SERVICE_SLOT_COUNTDOWN1,
     TIMER_SERVICE_SLOT_COUNT,
 } timer_service_slot_t;
 

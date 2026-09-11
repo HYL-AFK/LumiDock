@@ -25,6 +25,10 @@ typedef struct {
     bool active;
     bool blocking;
     bool stale_reported;
+    /* Only a task that explicitly asks for it may turn a late heartbeat into a
+       full device reboot.  Default is report-only: see the comment inside
+       supervisor_task(). */
+    bool fatal;
     char name[WATCHDOG_TASK_NAME_LENGTH];
 } watchdog_slot_t;
 
@@ -65,12 +69,22 @@ static void supervisor_task(void *arg)
                 }
                 if (!slot->stale_reported) {
                     slot->stale_reported = true;
-                    stale = true;
                     ESP_LOGE(TAG, "application task heartbeat stale: %s", slot->name);
                     (void)runtime_event_log_append(RUNTIME_EVENT_WATCHDOG_FAILURE,
                                                    (int32_t)i,
                                                    WATCHDOG_STALE_THRESHOLD_MS,
                                                    0);
+                    /* A late heartbeat is normally a scheduling symptom, not a
+                       hang: on a busy core a low-priority service can be
+                       starved for seconds while the radio, the AFE and the
+                       cloud link all run at once.  Latched that used to kill
+                       the hardware watchdog and reboot the whole device in the
+                       middle of playback.  Reboot is now opt-in per task via
+                       watchdog_service_set_current_task_fatal(true); everyone
+                       else is logged and skipped, and the heartbeat recovers
+                       by itself once the load drops. */
+                    if (!slot->fatal) continue;
+                    stale = true;
                     s_failure_latched = true;
                     status_led_service_set_critical_fault(true);
                     break;
@@ -151,6 +165,15 @@ void watchdog_service_feed(void)
         slot->last_feed_us = esp_timer_get_time();
         slot->stale_reported = false;
     }
+    xSemaphoreGive(s_lock);
+}
+
+void watchdog_service_set_current_task_fatal(bool fatal)
+{
+    if (!s_initialized || s_lock == NULL) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    watchdog_slot_t *slot = find_slot(xTaskGetCurrentTaskHandle());
+    if (slot != NULL) slot->fatal = fatal;
     xSemaphoreGive(s_lock);
 }
 

@@ -3,8 +3,8 @@ $voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_
 $voiceBytes = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot '..\main\MID\voice\xiaozhi_voice_service.c'))
 
 @(
-    @{ Pattern = 'XIAOZHI_FOLLOWUP_WINDOW_US\s*\(15LL\s*\*\s*1000LL\s*\*\s*1000LL\)'; Message = 'Normal follow-up window must be fifteen seconds.' },
-    @{ Pattern = 'XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US\s*\(15LL\s*\*\s*1000LL\s*\*\s*1000LL\)'; Message = 'Boot greeting follow-up window must be fifteen seconds.' },
+    @{ Pattern = 'XIAOZHI_FOLLOWUP_WINDOW_US\s*\(6400LL\s*\*\s*1000LL\)'; Message = 'Normal follow-up window must be 6.4 seconds.' },
+    @{ Pattern = 'XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US\s*\(6400LL\s*\*\s*1000LL\)'; Message = 'Boot greeting follow-up window must be 6.4 seconds.' },
     @{ Pattern = 'XIAOZHI_VOICE_EXITING'; Message = 'Voice service needs a dedicated exit state.' },
     @{ Pattern = 'request_cloud_exit_prompt'; Message = 'Timeout exit must request a fixed farewell.' },
     @{ Pattern = 'exit prompt selected'; Message = 'Exit prompt selection must be logged.' },

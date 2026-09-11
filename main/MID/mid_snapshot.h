@@ -38,11 +38,22 @@ typedef struct {
 } bms_snapshot_t;
 
 typedef struct {
+    uint16_t vout_mv;
+    uint16_t iout_c_ma;
+    uint16_t iout_a_ma;
+    int16_t temperature_tenths;
+    uint8_t status;
+    /* V2.2 新增：该路协商到的快充协议码（SW3518S REG 0x06 原值），
+       按 stc_protocol.h 的 STC_PROTOCOL_TYPE_* 解释。 */
+    uint8_t protocol_code;
+    bool valid;
+} stc_channel_snapshot_t;
+
+typedef struct {
     bool online;
     bool parsed_valid;
     uint32_t timestamp_ms;
-    uint8_t sw_protocol[3];
-    uint8_t fault_code;
+    stc_channel_snapshot_t channels[3];
     uint32_t rx_frames;
     uint32_t parsed_frames;
     uint32_t crc_error_count;

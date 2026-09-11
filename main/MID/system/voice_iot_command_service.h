@@ -9,10 +9,21 @@ typedef enum {
     /* The countdown is reserved now and started by the voice service only
      * after the cloud acknowledgement TTS drains or the chain exits. */
     VOICE_IOT_COMMAND_COUNTDOWN_PENDING,
-    /* Radio play is acknowledged through a cloud [device_call] reply; the
-     * radio stream is started only after that reply finishes playing, so the
-     * acknowledgement TTS cannot interrupt the stream right after it begins. */
+    /* Radio play is acknowledged by the cloud reply; the radio stream is
+     * started only after that reply drains, so the acknowledgement TTS cannot
+     * interrupt the stream right after it begins. */
     VOICE_IOT_COMMAND_RADIO_PLAY,
+    /* The utterance is a device command this service knows, but the cloud MCP
+     * tool owns it, so the shortcut stands down.  The caller must treat it as
+     * a command ("正在执行" confirmation) instead of falling through to the
+     * chat/query prompts. */
+    VOICE_IOT_COMMAND_DEFERRED,
+    /* The radio was paused/stopped right here, so the station already changed
+     * state before the cloud answered.  The caller must silence the cloud's own
+     * radio tools for the rest of the turn: the speech model only ever saw the
+     * (mangled) transcript, and given "电台。" it picks "play" - which used to
+     * restart the station the local shortcut had just stopped. */
+    VOICE_IOT_COMMAND_RADIO_HANDLED,
 } voice_iot_command_result_t;
 
 /* Executes only the small local-command allowlist (device control + timers).

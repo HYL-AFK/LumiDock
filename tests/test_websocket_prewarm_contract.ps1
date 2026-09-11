@@ -9,7 +9,10 @@ $voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_
     @{ Pattern = 'if \(s_pending_wake\) \{[\s\S]*?send_detect\(false\);[\s\S]*?s_pending_wake = false;'; Message = 'Cloud hello must only start detection for a real pending wake word without streaming the wake-word tail.' },
     @{ Pattern = 'start_wss\(true\)'; Message = 'A wake event must promote or create a foreground voice session.' },
     @{ Pattern = 'start_wss\(false\)'; Message = 'Prewarm must not activate the voice UI or listening state.' },
-    @{ Pattern = 'if \(s_initialized && xiaozhi_activation_service_is_activated\(\)\) \{\s*s_prewarm_retry_us = esp_timer_get_time\(\) \+ XIAOZHI_PREWARM_RETRY_US;'; Message = 'A disconnected voice socket must retry in the background without refreshing credentials.' }
+    @{ Pattern = 'if \(s_initialized && xiaozhi_activation_service_is_activated\(\)\)[\s\S]{0,600}?s_prewarm_retry_us = esp_timer_get_time\(\) \+ prewarm_delay_us;'; Message = 'A disconnected voice socket must retry in the background without refreshing credentials.' },
+    @{ Pattern = 'XIAOZHI_PREWARM_RADIO_DELAY_US'; Message = 'Radio playback must keep a hot WebSocket instead of paying a cold TLS handshake on every wake.' },
+    @{ Pattern = 'release_radio_after_close \|\| radio_stream_service_is_requested\(\)'; Message = 'A radio start deferred until after the voice chain closes must prewarm immediately too.' },
+    @{ Pattern = 'const bool prewarm_radio_on = radio_stream_service_is_requested\(\);'; Message = 'The idle-wake prewarm schedule must also be radio aware.' }
 ) | ForEach-Object {
     if ($voice -notmatch $_.Pattern) { throw $_.Message }
 }

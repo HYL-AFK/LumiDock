@@ -7,11 +7,13 @@
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -19,15 +21,22 @@
 #include "http_memory_log.h"
 #include "wifi_manager.h"
 
-#define XIAOZHI_OTA_URL "https://2662r3426b.vicp.fun/xiaozhi/ota/"
+/* Official xiaozhi.me OTA/registration endpoint.  The device POSTs its
+ * application/board descriptors here and receives the websocket URL + token
+ * (or an activation code on first binding). */
+#define XIAOZHI_OTA_URL "https://api.tenclass.net/xiaozhi/ota/"
 #define XIAOZHI_NVS_NAMESPACE "xiaozhi"
 #define XIAOZHI_NVS_CLIENT_ID "client_id"
 #define XIAOZHI_CLIENT_ID_LEN 37U
 #define XIAOZHI_HTTP_BODY_MAX 2048U
 #define XIAOZHI_RETRY_MS 5000U
 
-/* These values match the supplied XiaoZhi reference. They are kept in one
- * place so a registered LumiDock board profile can replace them later. */
+/* Board identity reported to the official service.  LumiDock hardware is an
+ * ESP32-S3 + ES8311 board, which is exactly the upstream bread-compact-wifi
+ * profile, so the official endpoint always answers with a usable websocket
+ * URL/token pair.  The name keeps the upstream "-128x64" variant convention
+ * (a distinct name under a shared type).  LumiDock never consumes the
+ * "firmware" section of the response, so the advertised type is inert. */
 #define XIAOZHI_REFERENCE_BOARD_NAME "bread-compact-wifi-128x64"
 #define XIAOZHI_REFERENCE_BOARD_TYPE "bread-compact-wifi"
 #define XIAOZHI_REFERENCE_USER_AGENT "bread-compact-wifi-128x64/1.0.1"
@@ -218,13 +227,18 @@ esp_err_t xiaozhi_activation_service_init(void)
 {
     if (s_state.initialized) return ESP_OK;
     memset(&s_state, 0, sizeof(s_state));
-    ESP_LOGI(TAG, "backend: xinnan-tech public test platform");
+    ESP_LOGI(TAG, "backend: official xiaozhi.me, OTA endpoint %s", XIAOZHI_OTA_URL);
     const esp_err_t err = load_or_create_client_id();
     if (err != ESP_OK) return err;
     s_state.initialized = true;
     publish_snapshot();
-    return xTaskCreatePinnedToCore(activation_task, "xiaozhi_activation", 6144, NULL, 2,
-                                   &s_task, 0) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+    /* 激活任务只发 HTTPS 注册请求，并调用只读的 esp_wifi_get_mac，从不写 NVS，
+     * 所以任务栈可以放在 PSRAM，把内部 RAM 留给 ESP-SR。 */
+    return xTaskCreatePinnedToCoreWithCaps(activation_task, "xiaozhi_activation", 6144,
+                                           NULL, 2, &s_task, 0,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS
+               ? ESP_OK
+               : ESP_ERR_NO_MEM;
 }
 
 void xiaozhi_activation_service_notify_network(void)

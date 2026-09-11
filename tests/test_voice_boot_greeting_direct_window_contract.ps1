@@ -21,7 +21,7 @@ if ($enterFollowup -notmatch 'boot_greeting_window_active[\s\S]*?s_state\s*=\s*X
 if ($enterFollowup -notmatch 's_boot_greeting_direct_window_active\s*=\s*true;') {
     throw 'Initial boot greeting PCM drain must activate the 3-minute direct-reply window.'
 }
-if ($enterFollowup -notmatch 'boot greeting response PCM drained; direct reply window re-armed=15s') {
+if ($enterFollowup -notmatch 'boot greeting response PCM drained; direct reply window re-armed=%lldms') {
     throw 'Response TTS drain inside the boot-greeting window must re-arm a fresh 15-second idle window.'
 }
 if ($enterFollowup -notmatch 's_boot_greeting_reply_deadline_us\s*=\s*esp_timer_get_time\(\)\s*\+\s*XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US') {

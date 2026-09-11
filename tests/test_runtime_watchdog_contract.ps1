@@ -31,4 +31,23 @@ if ($manager -notmatch 'runtime_event_log_dump_recent\(16U\)') {
     throw 'Boot must emit the recent persistent event history to COM6.'
 }
 
+$watchdogHeader = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\system\watchdog_service.h"
+$statusLed = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\system\status_led_service.c"
+
+# A late heartbeat on a saturated core is a scheduling symptom, not a hang.
+# Latching it used to kill the hardware watchdog and reboot the whole device in
+# the middle of radio playback, so reboot is now opt-in per task.
+if ($watchdog -notmatch 'if \(!slot->fatal\) continue;') {
+    throw 'A late heartbeat must not latch a reboot unless the task opted in.'
+}
+if ($watchdogHeader -notmatch 'watchdog_service_set_current_task_fatal') {
+    throw 'Tasks must be able to opt into reboot-on-stale-heartbeat.'
+}
+if ($statusLed -notmatch 'watchdog_service_set_current_task_fatal\(false\)') {
+    throw 'The decorative LED strip must stay out of the reboot path.'
+}
+if ($statusLed -notmatch '"status_led", 3072, NULL, 3, NULL, 1,') {
+    throw 'The status LED task must outrank the priority-2 core-1 cluster it shares.'
+}
+
 Write-Output 'Runtime log and watchdog contract passed.'

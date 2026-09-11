@@ -6,7 +6,12 @@
 
 /* LumiDock ESP32-S3-Zero board contract. Keep all GPIO decisions here. */
 #define LUMIDOCK_WS2812_1_GPIO GPIO_NUM_13
+#define LUMIDOCK_WS2812_2_GPIO GPIO_NUM_14
 #define LUMIDOCK_WS2812_LED_COUNT 24U
+
+/* On-board single WS2812B status LED (U1 XL-5050RGBC-WS2812B), driven via RMT.
+ * This is independent of the GPIO13/14 strip above (separate DI data line). */
+#define LUMIDOCK_ONBOARD_LED_GPIO GPIO_NUM_48
 
 #define LUMIDOCK_I2S_BCLK_GPIO GPIO_NUM_10
 #define LUMIDOCK_I2S_LRCLK_GPIO GPIO_NUM_9

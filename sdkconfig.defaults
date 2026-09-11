@@ -57,9 +57,14 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_UART is not set
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+# The BluFi provisioning window expires on an xTimer callback (Tmr Svc task),
+# which calls esp_blufi_adv_stop() -> NimBLE. The default 2048-byte software
+# timer stack is too shallow for that call chain and stack-overflows into a
+# panic reboot. Keep it at 4096 so the timer callback can stop advertising.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=4096
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_RX_BA_WIN=3
+CONFIG_ESP_WIFI_RX_BA_WIN=4
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
 CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y

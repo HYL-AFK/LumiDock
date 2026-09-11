@@ -10,8 +10,8 @@ $cmake = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\CMakeLists.txt"
 $manifest = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\idf_component.yml"
 
 @(
-    @{ Content = $service; Pattern = 'https://2662r3426b\.vicp\.fun/xiaozhi/ota/'; Message = 'Activation must use the xinnan-tech public test OTA endpoint.' },
-    @{ Content = $service; Pattern = 'backend: xinnan-tech public test platform'; Message = 'COM6 must identify the active open-source test backend.' },
+    @{ Content = $service; Pattern = 'https://api\.tenclass\.net/xiaozhi/ota/'; Message = 'Activation must use the official xiaozhi.me OTA endpoint.' },
+    @{ Content = $service; Pattern = 'backend: official xiaozhi\.me'; Message = 'COM6 must identify the official xiaozhi.me backend.' },
     @{ Content = $service; Pattern = 'copy_json_string\(websocket, "url"'; Message = 'OTA must keep requiring a websocket URL.' },
     @{ Content = $service; Pattern = 'copy_json_string\(websocket, "token"'; Message = 'OTA must keep requiring a websocket token.' },
     @{ Content = $service; Pattern = 'activation'; Message = 'The service must parse the server activation object.' },

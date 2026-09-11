@@ -16,7 +16,12 @@
 #include "app_config.h"
 #include "wifi_manager.h"
 
-void ble_provision_init(const app_config_t *cfg, bool open_window);
+typedef enum {
+    BLE_WINDOW_PROVISION = 0, /* First-time no-WiFi provisioning; deep-sleep on timeout. */
+    BLE_WINDOW_BOOT      = 1, /* Boot-time re-provision window; resume networking on timeout. */
+} ble_window_kind_t;
+
+void ble_provision_init(const app_config_t *cfg, bool open_window, ble_window_kind_t kind);
 esp_err_t ble_provision_open_window(void);
 void ble_provision_close_window(void);
 void ble_provision_handle_network_event(network_event_type_t event);
