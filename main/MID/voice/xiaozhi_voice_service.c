@@ -1842,38 +1842,12 @@ static void finish_boot_greeting_failure(const char *reason)
     extern const uint8_t symbol##_pcm_end[] asm(                                 \
         "_binary_" #symbol "_16k_mono_s16le_pcm_end")
 
-DECLARE_EMBEDDED_PCM(prompt_greet_forenoon);
-DECLARE_EMBEDDED_PCM(prompt_greet_noon);
-DECLARE_EMBEDDED_PCM(prompt_greet_afternoon);
-DECLARE_EMBEDDED_PCM(prompt_greet_evening);
-DECLARE_EMBEDDED_PCM(prompt_greet_night);
-DECLARE_EMBEDDED_PCM(prompt_greet_generic);
-DECLARE_EMBEDDED_PCM(prompt_greet_closing);
-
-DECLARE_EMBEDDED_PCM(prompt_hour_00);
-DECLARE_EMBEDDED_PCM(prompt_hour_01);
-DECLARE_EMBEDDED_PCM(prompt_hour_02);
-DECLARE_EMBEDDED_PCM(prompt_hour_03);
-DECLARE_EMBEDDED_PCM(prompt_hour_04);
-DECLARE_EMBEDDED_PCM(prompt_hour_05);
-DECLARE_EMBEDDED_PCM(prompt_hour_06);
-DECLARE_EMBEDDED_PCM(prompt_hour_07);
-DECLARE_EMBEDDED_PCM(prompt_hour_08);
-DECLARE_EMBEDDED_PCM(prompt_hour_09);
-DECLARE_EMBEDDED_PCM(prompt_hour_10);
-DECLARE_EMBEDDED_PCM(prompt_hour_11);
-DECLARE_EMBEDDED_PCM(prompt_hour_12);
-DECLARE_EMBEDDED_PCM(prompt_hour_13);
-DECLARE_EMBEDDED_PCM(prompt_hour_14);
-DECLARE_EMBEDDED_PCM(prompt_hour_15);
-DECLARE_EMBEDDED_PCM(prompt_hour_16);
-DECLARE_EMBEDDED_PCM(prompt_hour_17);
-DECLARE_EMBEDDED_PCM(prompt_hour_18);
-DECLARE_EMBEDDED_PCM(prompt_hour_19);
-DECLARE_EMBEDDED_PCM(prompt_hour_20);
-DECLARE_EMBEDDED_PCM(prompt_hour_21);
-DECLARE_EMBEDDED_PCM(prompt_hour_22);
-DECLARE_EMBEDDED_PCM(prompt_hour_23);
+/* 本地问候片段已下线：开机问候改由云端 LLM 现场生成（发一条带问题的
+ * listen/detect，见 begin_boot_greeting），所以 prompt_greet_*、prompt_hour_00~23
+ * 和 prompt_wx_* 都不再编译进固件。
+ *
+ * 这一刀省下的不只是 1.25 MB flash：它同时拆掉了“问候语必须提前录好”这个前提——
+ * 现在改问候措辞只要改 xiaozhi.me 上的角色介绍，不用重新烧固件。 */
 
 DECLARE_EMBEDDED_PCM(prompt_wx_clear);
 DECLARE_EMBEDDED_PCM(prompt_wx_cloudy);
@@ -1916,60 +1890,6 @@ typedef enum
     BOOT_WEATHER_COUNT,
 } boot_weather_t;
 
-static const boot_greeting_asset_t s_boot_period_pcm[BOOT_PERIOD_COUNT] = {
-    {prompt_greet_forenoon_pcm_start, prompt_greet_forenoon_pcm_end, "forenoon"},
-    {prompt_greet_noon_pcm_start, prompt_greet_noon_pcm_end, "noon"},
-    {prompt_greet_afternoon_pcm_start, prompt_greet_afternoon_pcm_end, "afternoon"},
-    {prompt_greet_evening_pcm_start, prompt_greet_evening_pcm_end, "evening"},
-    {prompt_greet_night_pcm_start, prompt_greet_night_pcm_end, "night"},
-    {prompt_greet_generic_pcm_start, prompt_greet_generic_pcm_end, "generic"},
-};
-
-/* Indexed by struct tm::tm_hour, so the live hour is a direct table index. */
-static const boot_greeting_asset_t s_boot_hour_pcm[24] = {
-    {prompt_hour_00_pcm_start, prompt_hour_00_pcm_end, "hour_00"},
-    {prompt_hour_01_pcm_start, prompt_hour_01_pcm_end, "hour_01"},
-    {prompt_hour_02_pcm_start, prompt_hour_02_pcm_end, "hour_02"},
-    {prompt_hour_03_pcm_start, prompt_hour_03_pcm_end, "hour_03"},
-    {prompt_hour_04_pcm_start, prompt_hour_04_pcm_end, "hour_04"},
-    {prompt_hour_05_pcm_start, prompt_hour_05_pcm_end, "hour_05"},
-    {prompt_hour_06_pcm_start, prompt_hour_06_pcm_end, "hour_06"},
-    {prompt_hour_07_pcm_start, prompt_hour_07_pcm_end, "hour_07"},
-    {prompt_hour_08_pcm_start, prompt_hour_08_pcm_end, "hour_08"},
-    {prompt_hour_09_pcm_start, prompt_hour_09_pcm_end, "hour_09"},
-    {prompt_hour_10_pcm_start, prompt_hour_10_pcm_end, "hour_10"},
-    {prompt_hour_11_pcm_start, prompt_hour_11_pcm_end, "hour_11"},
-    {prompt_hour_12_pcm_start, prompt_hour_12_pcm_end, "hour_12"},
-    {prompt_hour_13_pcm_start, prompt_hour_13_pcm_end, "hour_13"},
-    {prompt_hour_14_pcm_start, prompt_hour_14_pcm_end, "hour_14"},
-    {prompt_hour_15_pcm_start, prompt_hour_15_pcm_end, "hour_15"},
-    {prompt_hour_16_pcm_start, prompt_hour_16_pcm_end, "hour_16"},
-    {prompt_hour_17_pcm_start, prompt_hour_17_pcm_end, "hour_17"},
-    {prompt_hour_18_pcm_start, prompt_hour_18_pcm_end, "hour_18"},
-    {prompt_hour_19_pcm_start, prompt_hour_19_pcm_end, "hour_19"},
-    {prompt_hour_20_pcm_start, prompt_hour_20_pcm_end, "hour_20"},
-    {prompt_hour_21_pcm_start, prompt_hour_21_pcm_end, "hour_21"},
-    {prompt_hour_22_pcm_start, prompt_hour_22_pcm_end, "hour_22"},
-    {prompt_hour_23_pcm_start, prompt_hour_23_pcm_end, "hour_23"},
-};
-
-static const boot_greeting_asset_t s_boot_weather_pcm[BOOT_WEATHER_COUNT] = {
-    {prompt_wx_clear_pcm_start, prompt_wx_clear_pcm_end, "clear"},
-    {prompt_wx_cloudy_pcm_start, prompt_wx_cloudy_pcm_end, "cloudy"},
-    {prompt_wx_fog_pcm_start, prompt_wx_fog_pcm_end, "fog"},
-    {prompt_wx_rain_pcm_start, prompt_wx_rain_pcm_end, "rain"},
-    {prompt_wx_snow_pcm_start, prompt_wx_snow_pcm_end, "snow"},
-    {prompt_wx_thunder_pcm_start, prompt_wx_thunder_pcm_end, "thunder"},
-    {prompt_wx_unknown_pcm_start, prompt_wx_unknown_pcm_end, "unknown"},
-};
-
-/* Fourth segment - the fixed help offer.  Unlike the three tables above it
- * offers no choices: it is appended verbatim after the weather copy so the
- * greeting ends on an invitation to talk instead of a statement about the
- * weather. */
-static const boot_greeting_asset_t s_boot_closing_pcm = {
-    prompt_greet_closing_pcm_start, prompt_greet_closing_pcm_end, "closing"};
-
 static boot_period_t boot_period_from_hour(int hour)
 {
     if (hour >= 5 && hour <= 11) return BOOT_PERIOD_FORENOON;
@@ -1992,65 +1912,6 @@ static boot_weather_t boot_weather_from_text(const char *weather)
     if (strstr(weather, "云") != NULL || strstr(weather, "阴") != NULL) return BOOT_WEATHER_CLOUDY;
     if (strstr(weather, "晴") != NULL) return BOOT_WEATHER_CLEAR;
     return BOOT_WEATHER_UNKNOWN;
-}
-
-/* Picks the embedded greeting segments for this boot.
- *
- * The official xiaozhi.me server rejects the old [device_call] direct-TTS
- * prefix, so the greeting is assembled from pre-rendered PCM instead of a
- * cloud request.  Four segments are concatenated:
- *
- *   [period greeting] + [spoken clock] + [weather copy] + [help offer]
- *
- * Every segment carries its own time modifier ("现在是上午7点" vs
- * "现在是晚上7点"), which is what the old shared-clip design could not say.
- * It costs 6 + 24 + 7 + 1 = 38 short assets instead of hundreds of whole
- * sentences.  When the clock has not been refreshed yet the spoken clock is
- * dropped and the generic period greeting is used instead. */
-static size_t select_boot_greeting_segments(local_pcm_segment_t *segments, size_t capacity)
-{
-    if (segments == NULL || capacity < 4U)
-        return 0U;
-
-    lumidock_snapshot_t snapshot = {0};
-    mid_snapshot_get(&snapshot);
-    const time_weather_snapshot_t *tw = &snapshot.time_weather;
-    const char *weather = tw->valid ? tw->weather_text : "";
-    const boot_weather_t weather_pick = boot_weather_from_text(weather);
-
-    /* local_time is only meaningful once time_service_poll() has refreshed it,
-     * which needs a valid RTC or a finished SNTP sync; tm_year stays 0 until
-     * then, and reading tm_hour would invent a bogus hour. */
-    const bool clock_ready = tw->valid && tw->local_time.tm_year > 0 &&
-                             tw->local_time.tm_hour >= 0 && tw->local_time.tm_hour <= 23;
-    const int hour = clock_ready ? tw->local_time.tm_hour : 0;
-    const boot_period_t period =
-        clock_ready ? boot_period_from_hour(hour) : BOOT_PERIOD_GENERIC;
-
-    size_t count = 0U;
-    segments[count].start = s_boot_period_pcm[period].start;
-    segments[count].end = s_boot_period_pcm[period].end;
-    ++count;
-    if (clock_ready)
-    {
-        segments[count].start = s_boot_hour_pcm[hour].start;
-        segments[count].end = s_boot_hour_pcm[hour].end;
-        ++count;
-    }
-    segments[count].start = s_boot_weather_pcm[weather_pick].start;
-    segments[count].end = s_boot_weather_pcm[weather_pick].end;
-    ++count;
-    /* The help offer closes every greeting, including the degraded one without
-     * a spoken clock, so the segment count is 4 or 3 and never fewer. */
-    segments[count].start = s_boot_closing_pcm.start;
-    segments[count].end = s_boot_closing_pcm.end;
-    ++count;
-
-    ESP_LOGI(TAG, "boot greeting PCM bucket=%s weather=%s hour=%s closing=%s segments=%u",
-             s_boot_period_pcm[period].name, weather,
-             clock_ready ? s_boot_hour_pcm[hour].name : "none",
-             s_boot_closing_pcm.name, (unsigned)count);
-    return count;
 }
 
 static void begin_boot_greeting(void)
