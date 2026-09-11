@@ -2061,42 +2061,47 @@ static void begin_boot_greeting(void)
         finish_boot_greeting_failure("WSS not ready");
         return;
     }
-    local_pcm_segment_t greeting_segments[4] = {{0}};
-    const size_t greeting_segment_count =
-        select_boot_greeting_segments(greeting_segments, 4U);
-    if (greeting_segment_count == 0U)
+    /* 方案 A 试验：让云端现场生成问候，不再播本地预置 PCM。
+     *
+     * 原实现是选几个本地片段（时段问候 + 报时 + 天气 + 收尾句）拼着播。
+     * 片段是预先录好的，时间和城市只能分档到“凌晨/上午/下雨/晴”，说不出
+     * “8 点 15 分”“北京今天小雨转阴”这种具体内容，所以改成在开机连上云
+     * 端之后主动发一条 detect，把 text 写成一句问题，赌官方服务器会把这段
+     * 文本当成用户说的话交给 LLM。
+     *
+     * 成败就看云端回什么：
+     *   回“早上好，现在是 8 点 15 分，北京今天晴……” → 方案 A 成立，
+     *     本地问候片段（含 select_boot_greeting_segments、prompt_greet_*、
+     *     prompt_hour_00~23）整条链路都可以删，能省下约 1.16 MB 资源
+     *   回“我在”之类的固定唤醒应答 → 不成立，text 只是唤醒词的标注，
+     *     得走方案 B（用上行音频冒充用户提问）
+     *
+     * 这段文本会被服务器当作“用户说的话”，所以必须是用户口吻的问题，
+     * 不能写成“你好小智”那种唤醒词。 */
+    if (!send_text("{\"type\":\"listen\",\"state\":\"detect\","
+                   "\"text\":\"现在几点了，今天天气怎么样\"}"))
     {
-        finish_boot_greeting_failure("local greeting PCM unavailable");
+        finish_boot_greeting_failure("greeting detect send failed");
         return;
-    }
-    size_t greeting_bytes = 0U;
-    for (size_t index = 0U; index < greeting_segment_count; ++index)
-    {
-        greeting_bytes +=
-            (size_t)(greeting_segments[index].end - greeting_segments[index].start);
     }
     ++s_turn_id;
     if (s_turn_id == 0U)
         ++s_turn_id;
     s_boot_greeting_id = s_turn_id;
+    /* 必须同时置 greeting_turn_id：tts start 处理器只接受 response_turn
+     * 和 greeting_turn，boot_greeting/exit/timeout/fallback 四个 turn 一律
+     * 丢弃。漏了这行，云端的问候会被当成陈旧流丢掉，设备一声不响。 */
+    s_greeting_turn_id = s_turn_id;
     s_waiting_turn_id = 0U;
     s_playing_turn_id = 0U;
     s_session_active = true;
-    s_state = XIAOZHI_VOICE_BOOT_GREETING_WAIT_TTS;
-    /* The greeting is local now, so the cloud TTS deadline stays disarmed; the
-     * shared local-prompt watchdog bounds the playback instead. */
+    s_state = XIAOZHI_VOICE_WAIT_SPEECH;
     s_boot_greeting_tts_deadline_us = 0;
     s_boot_greeting_reply_deadline_us = 0;
-    if (!play_local_prompt_segments(LOCAL_PROMPT_BOOT_GREETING, greeting_segments,
-                                    greeting_segment_count, NULL))
-    {
-        finish_boot_greeting_failure("local greeting PCM unavailable");
-        return;
-    }
-    ESP_LOGI(TAG, "boot greeting local PCM playing: id=%u segments=%u bytes=%u",
-             (unsigned)s_boot_greeting_id, (unsigned)greeting_segment_count,
-             (unsigned)greeting_bytes);
-    publish_ui_state(VOICE_UI_CONNECTING);
+    ESP_LOGI(TAG, "boot greeting sent to the cloud as a question: id=%u",
+             (unsigned)s_boot_greeting_id);
+    publish_ui_state(VOICE_UI_LISTENING);
+    start_listen(true);
 }
 
 static bool send_terminal_uplink_sequence(void)
