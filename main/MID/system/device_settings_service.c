@@ -167,14 +167,31 @@ void device_settings_service_init(void)
     }
 }
 
+/* 上次退出时是静音（0%）的话，这次开机给这个音量而不是 0。
+ *
+ * 静音是个“当场按下”的动作，跨一次断电不该继续生效：开机后一点声音都没有，
+ * 用户只会以为设备坏了（或者忘了自己静音过），而不是想起“哦我静音了”。给一个
+ * 能听见但不刺耳的下限，他听到第一声就知道设备活着；真想再静音，按一下就行。 */
+#define DEVICE_SETTINGS_BOOT_VOLUME_FLOOR 10
+
 bool device_settings_service_apply_saved_volume(void)
 {
     if (!s_target_valid) return false;
-    if (i2s_audio_driver_set_output_volume((float)s_target_volume) != ESP_OK)
+    const int volume =
+        s_target_volume <= 0 ? DEVICE_SETTINGS_BOOT_VOLUME_FLOOR : s_target_volume;
+    if (i2s_audio_driver_set_output_volume((float)volume) != ESP_OK)
     {
         ESP_LOGW(TAG, "applying the stored speaker volume failed");
         return false;
     }
+    /* 同步内存里的目标值：硬件已经是 volume 了，如果还留着 0，后面的状态上报和
+       保存会把两者说成不一样的东西。 */
+    if (volume != s_target_volume)
+    {
+        ESP_LOGI(TAG, "stored speaker volume %d%% raised to the boot floor %d%%",
+                 s_target_volume, volume);
+    }
+    s_target_volume = volume;
     ESP_LOGI(TAG, "stored speaker volume applied: %d%%", s_target_volume);
     return true;
 }
