@@ -2088,9 +2088,11 @@ static void begin_boot_greeting(void)
      *   alert/ERROR "Detect is only for wake words, do not send long texts."
      *   - "现在几点了，今天天气怎么样"（13 字）通过
      *   - "你好小智，现在几点了，今天天气怎么样"（18 字）被拒
-     * 上限就在 13~18 之间，所以这里刻意压在 12 字。**加字之前先数一下。** */
+     * 上限就在 13~18 之间，所以这里刻意压在 11 字。
+     * "现在"和"今天"都省了：这两句本来就隐含在当前语境里，LLM 自己知道。
+     * **加字之前先数一下，超过 13 就有被拒的风险。** */
     if (!send_text("{\"type\":\"listen\",\"state\":\"detect\","
-                   "\"text\":\"你好，现在几点，天气如何\"}"))
+                   "\"text\":\"你好，几点了，天气如何\"}"))
     {
         finish_boot_greeting_failure("greeting detect send failed");
         return;
