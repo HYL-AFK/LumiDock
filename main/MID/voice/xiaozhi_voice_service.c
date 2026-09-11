@@ -1379,14 +1379,28 @@ static void consume_deferred_media_starts(void)
     }
     if (s_pending_radio_play || mcp_service_pending_radio())
     {
+        /* 必须在 clear 之前取：它指向的正是 clear 要清的那块缓冲。 */
+        char wanted_station[24];
+        strncpy(wanted_station, mcp_service_pending_radio_station(), sizeof(wanted_station) - 1U);
+        wanted_station[sizeof(wanted_station) - 1U] = '\0';
         s_pending_radio_play = false;
         mcp_service_clear_pending_radio();
         /* 电台是这一轮才要求的，收场时不该为它留听音窗口。 */
         s_radio_on_before_turn = false;
         ESP_LOGI(TAG, "deferred radio start released by the idle tick");
-        if (radio_stream_service_play_default() != ESP_OK)
+        esp_err_t radio_err = radio_stream_service_play_default();
+        if (wanted_station[0] != '\0')
         {
-            ESP_LOGW(TAG, "radio start failed from the idle tick");
+            radio_err = radio_stream_service_play_station_by_name(wanted_station);
+            if (radio_err == ESP_ERR_NOT_FOUND)
+            {
+                ESP_LOGW(TAG, "cloud named an unknown station; falling back to the default");
+                radio_err = radio_stream_service_play_default();
+            }
+        }
+        if (radio_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "radio start failed from the idle tick: %s", esp_err_to_name(radio_err));
         }
     }
 }
@@ -3688,14 +3702,31 @@ static void handle_event(voice_event_t *event)
         }
         if (s_pending_radio_play || mcp_service_pending_radio())
         {
+            /* 必须在 clear 之前取：它指向的正是 clear 要清的那块缓冲。 */
+            char wanted_station[24];
+            strncpy(wanted_station, mcp_service_pending_radio_station(), sizeof(wanted_station) - 1U);
+            wanted_station[sizeof(wanted_station) - 1U] = '\0';
             s_pending_radio_play = false;
             mcp_service_clear_pending_radio();
             /* 电台是这一轮才要求的，收场时不该为它留听音窗口。 */
             s_radio_on_before_turn = false;
             ESP_LOGI(TAG, "radio acknowledgement finished; starting radio stream");
-            if (radio_stream_service_play_default() != ESP_OK)
+            /* 云端点名的频道走包含匹配（ASR 变体的容错在 radio 侧做）。名字对不上就
+               退回默认台：宁可放中国之声，也不能让这一轮变得没声音。 */
+            esp_err_t radio_err = radio_stream_service_play_default();
+            if (wanted_station[0] != '\0')
             {
-                ESP_LOGW(TAG, "radio start failed after acknowledgement");
+                radio_err = radio_stream_service_play_station_by_name(wanted_station);
+                if (radio_err == ESP_ERR_NOT_FOUND)
+                {
+                    ESP_LOGW(TAG, "cloud named an unknown station; falling back to the default");
+                    radio_err = radio_stream_service_play_default();
+                }
+            }
+            if (radio_err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "radio start failed after acknowledgement: %s",
+                         esp_err_to_name(radio_err));
             }
         }
         enter_followup_after_playback();

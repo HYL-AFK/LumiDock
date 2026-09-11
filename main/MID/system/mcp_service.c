@@ -59,12 +59,11 @@ static const char k_tools_list_result_json[] =
     "about the current condition and as the first step before controlling the device."
     "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
     "{\"name\":\"" MCP_TOOL_SET_VOLUME "\",\"description\":\""
-    "Set the speaker volume to an absolute level between 0 and 100. Always call "
-    "self.get_device_status first: the value you pass is applied verbatim, so a "
-    "guessed level is heard immediately and a guess that is too low sounds like "
-    "being muted. Use this tool only when the user names a level or an extreme. "
-    "Relative requests such as turning it up or asking for less volume are handled "
-    "by the device itself and must not be forwarded here."
+    "Set the speaker volume to an absolute level 0-100. Call self.get_device_status "
+    "first: the value is applied verbatim, so a guess is heard at once. Use this "
+    "only when the user names a level. Relative requests such as turning it up or "
+    "asking for less volume are handled by the device itself and must not be "
+    "forwarded here."
     "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"volume\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100}},"
     "\"required\":[\"volume\"]}},"
@@ -105,11 +104,13 @@ static const char k_tools_list_result_json[] =
     "Silence the alarm or countdown that is ringing right now."
     "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
     "{\"name\":\"" MCP_TOOL_RADIO_PLAY "\",\"description\":\""
-    "Start playing the built-in live radio station on the speaker. This is a fixed "
-    "broadcast station: there are no genres, songs or channels to choose from, so "
-    "call this tool right away whenever the user asks to open, play or start the "
-    "radio. Never ask the user which genre, song or station they want."
-    "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+    "Start the built-in live radio. Omit station for the default channel. "
+    "Channels: 中国之声 news (default), 经济之声 business, 音乐之声 music, "
+    "文艺之声 culture. To switch without naming one, take the current channel "
+    "from self.get_device_status and pass the next name in that list, wrapping "
+    "around. Never ask which genre the user wants."
+    "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"station\":"
+    "{\"type\":\"string\",\"description\":\"Channel name; omit for the default.\"}}}}",
     "{\"name\":\"" MCP_TOOL_RADIO_PAUSE "\",\"description\":\""
     "Pause the radio stream. Use self.radio.resume to continue it."
     "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
@@ -136,6 +137,10 @@ static bool s_discovery_done;
  * touched from the voice session task, so no lock is needed. */
 static volatile bool s_pending_countdown;
 static volatile bool s_pending_radio;
+/* 云端在 self.radio.play 里点名要哪个频道。空串＝没点名（放默认台）。
+ * 只存名字不存下标：真正解析在 radio_stream_service 里做，那里才拿得到频道表；
+ * 而且名字比下标更能承受编译期的频道增删。 */
+static char s_pending_radio_station[24];
 /* Set once a local radio command has been applied (see mcp_service.h): the
  * cloud keeps talking about the same utterance, and its radio tools must not
  * be allowed to undo what already happened. */
@@ -431,13 +436,25 @@ static const char *handle_stop_ringing(long id)
     return reply_tool_text(id, "true");
 }
 
-static const char *handle_radio_play(long id)
+static const char *handle_radio_play(const cJSON *arguments, long id)
 {
+    const cJSON *station =
+        cJSON_IsObject(arguments) ? cJSON_GetObjectItemCaseSensitive(arguments, "station") : NULL;
+    /* 台名是可选参数：只部署“打开电台”的说法完全合法，那就放默认台。
+       给了但不是字符串才当参数错。 */
+    if (station != NULL && !cJSON_IsString(station))
+    {
+        ESP_LOGW(TAG, "tool call rejected: %s with a non-string station", MCP_TOOL_RADIO_PLAY);
+        return reply_error(id, MCP_ERROR_INVALID_PARAMS, "Invalid argument: station");
+    }
+    const char *wanted = (station != NULL && station->valuestring != NULL) ? station->valuestring : "";
+    strncpy(s_pending_radio_station, wanted, sizeof(s_pending_radio_station) - 1U);
+    s_pending_radio_station[sizeof(s_pending_radio_station) - 1U] = '\0';
     /* The cloud answers this call with speech, and that TTS owns the shared
      * playout; starting the stream here would be silenced by it. */
     s_pending_radio = true;
-    ESP_LOGI(TAG, "tool call: %s deferred until the acknowledgement TTS drains",
-             MCP_TOOL_RADIO_PLAY);
+    ESP_LOGI(TAG, "tool call: %s station=\"%s\" deferred until the acknowledgement TTS drains",
+             MCP_TOOL_RADIO_PLAY, s_pending_radio_station);
     return reply_tool_text(id, "true");
 }
 
@@ -527,7 +544,7 @@ static const char *handle_tools_call(const cJSON *params, long id)
     }
     if (strcmp(tool, MCP_TOOL_RADIO_PLAY) == 0)
     {
-        return handle_radio_play(id);
+        return handle_radio_play(arguments, id);
     }
     if (strcmp(tool, MCP_TOOL_RADIO_PAUSE) == 0)
     {
@@ -654,6 +671,13 @@ bool mcp_service_pending_radio(void)
 void mcp_service_clear_pending_radio(void)
 {
     s_pending_radio = false;
+    s_pending_radio_station[0] = '\0';
+}
+
+/* 空串＝云端没点名，调用方放默认台。 */
+const char *mcp_service_pending_radio_station(void)
+{
+    return s_pending_radio_station;
 }
 
 void mcp_service_set_radio_tools_blocked(bool blocked)

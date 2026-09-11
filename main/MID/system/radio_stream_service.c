@@ -37,20 +37,29 @@
  * 不是这里的值。 */
 #define RADIO_PREBUFFER_FRAMES 40U
 
-/* 电台源。两种取流方式共用下面同一套解码/转换/入队/背压循环，差别只在“字节从哪来”：
- *   MP3 —— 一条长连接，读到的字节就是 MP3 帧。蜻蜓FM 的静态直播流是这种。
- *   HLS —— 先读 .m3u8 播放列表，再一片片顺序拉 .ts 分片。央广网等官方源都是这种。
- * 蜻蜓FM 已经下架了中国之声的静态 MP3 源（live/386 实测 404，而同域名的 20500038
- * 仍正常吐流，所以是单个 ID 下架而不是域名失效）。要听“正规”电台就只剩 HLS 一条路。
- * 切回旧的只要改 RADIO_SOURCE 这一个宏。 */
-#define RADIO_URL_MP3 "http://lhttp.qtfm.cn/live/20500038/64k.mp3"
-#define RADIO_URL_HLS "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8"
+/* 电台频道表。全部走 HLS。
+ *
+ * 蜻蜓FM 的 MP3 长连接路径已经删掉：它的取流方式、错误处理和这套 HLS 完全不同，
+ * 两条并存要维护两套；蜻蜓那版留在 git 标签 qtfm-radio-checkpoint 上，真要用再切回。
+ *
+ * 央广的源规则很整齐：http://ngcdn001.cnr.cn/live/{代号}/index.m3u8。代号是拼音首
+ * 字母，但**不能凭猜**——华夏之声的 hzzs 实测就是 404。加台前先拿浏览器或 curl 打
+ * 一下这个地址，能看到 #EXTM3U 才算数；拿不到的分片会让整个台一哑到底。 */
+typedef struct {
+    const char *name; /* 云端和本地短语都按这个名字匹配 */
+    const char *key;  /* 包含匹配用的 2 字关键词，见 station_by_query() */
+    const char *url;
+} radio_station_t;
 
-typedef enum {
-    RADIO_SOURCE_MP3 = 0,
-    RADIO_SOURCE_HLS,
-} radio_source_kind_t;
-#define RADIO_SOURCE RADIO_SOURCE_HLS
+#define RADIO_STATION_COUNT 4U
+static const radio_station_t k_stations[RADIO_STATION_COUNT] = {
+    {"中国之声", "中国", "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8"},
+    {"经济之声", "经济", "http://ngcdn001.cnr.cn/live/jjzs/index.m3u8"},
+    {"音乐之声", "音乐", "http://ngcdn001.cnr.cn/live/yyzs/index.m3u8"},
+    {"文艺之声", "文艺", "http://ngcdn001.cnr.cn/live/wyzs/index.m3u8"},
+};
+/* 只说“打开电台”没点名字时放这个。 */
+#define RADIO_STATION_DEFAULT 0U
 
 /* HLS 参数。CNR 实测：播放列表里保留 6 个分片、每个 10 s（TARGETDURATION=10），
    窗口整体滑动；片名是连续整数 + ".ts"；无鉴权；纯 HTTP（不用碰 TLS）。 */
@@ -93,6 +102,9 @@ static char s_failure_stage[24];
 static int s_failure_code;
 static uint8_t s_failure_reconnects;
 static uint8_t s_reconnects;
+/* 当前频道在 k_stations 里的下标。切台只改它、再让电台重连：重新解析播放列表是必须
+   的（新台的分片目录和序号都不同），但回放通道不关，所以用户听到的是无缝切换。 */
+static uint32_t s_station_index;
 
 static void record_failure(const char *stage, int code, uint8_t reconnects)
 {
@@ -171,7 +183,8 @@ static size_t radio_to_16k_mono(const uint8_t *src, size_t src_bytes, uint32_t s
 
 /* ------------------------------------------------------------------ HLS 取流 */
 typedef struct {
-    esp_http_client_handle_t http; /* 整段会话复用同一个 handle */
+    esp_http_client_handle_t http; /* 整段会话复用的 handle */
+    const char *playlist_url;      /* 本会话的播放列表地址（由切台时选定） */
     char base[RADIO_HLS_URL_MAX];  /* 分片目录，含结尾的 '/' */
     uint64_t next_index;           /* 下一个要拉的分片序号 */
     bool segment_open;             /* 当前分片的响应还没读完 */
@@ -190,7 +203,7 @@ typedef struct {
 static bool hls_read_playlist(radio_hls_t *hls, bool reopen)
 {
     if (reopen) {
-        esp_http_client_set_url(hls->http, RADIO_URL_HLS);
+        esp_http_client_set_url(hls->http, hls->playlist_url);
         esp_http_client_close(hls->http);
         if (esp_http_client_open(hls->http, 0) != ESP_OK) return false;
         (void)esp_http_client_fetch_headers(hls->http);
@@ -206,7 +219,7 @@ static bool hls_read_playlist(radio_hls_t *hls, bool reopen)
     body[used] = '\0';
 
     /* 分片目录 = 播放列表 URL 去掉最后一个路径段。 */
-    strncpy(hls->base, RADIO_URL_HLS, sizeof(hls->base) - 1U);
+    strncpy(hls->base, hls->playlist_url, sizeof(hls->base) - 1U);
     hls->base[sizeof(hls->base) - 1U] = '\0';
     char *slash = strrchr(hls->base, '/');
     if (slash == NULL) return false;
@@ -306,7 +319,8 @@ static void radio_task(void *arg)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         const bool requested = s_play_requested;
         const bool yield_parked = s_yielded;
-        uint32_t epoch = s_epoch;
+        const uint32_t epoch = s_epoch;
+        const radio_station_t *station = &k_stations[s_station_index];
         xSemaphoreGive(s_lock);
         /* 让位期间不建立也不保持任何流：这正是要让出去的那部分资源。等 regain()
            清掉 s_yielded 再重新接回直播（直播可以丢音，直接接当前时刻）。 */
@@ -318,7 +332,7 @@ static void radio_task(void *arg)
         ESP_LOGI(TAG, "radio state=CONNECTING epoch=%u", (unsigned)epoch);
         radio_hls_t hls = {0};
         esp_http_client_config_t cfg = {
-            .url = RADIO_SOURCE == RADIO_SOURCE_HLS ? RADIO_URL_HLS : RADIO_URL_MP3,
+            .url = station->url,
             /* 超时从一个坏 socket 里拔出来要等多久。实测连 CNR 建连只要约 240 ms，
                所以 4 s 已经有十几倍余量；而设成 12 s 的代价是电台一次哑 11.7 秒。 */
             .timeout_ms = 4000,
@@ -335,7 +349,8 @@ static void radio_task(void *arg)
         }
         (void)esp_http_client_fetch_headers(http);
         /* HLS：刚打开的就是播放列表本身，直接在这个响应上解析，不用再连一次。 */
-        if (RADIO_SOURCE == RADIO_SOURCE_HLS) {
+        {
+            hls.playlist_url = station->url;
             hls.http = http;
             if (!hls_read_playlist(&hls, false)) {
                 record_failure("hls_playlist", ESP_ERR_INVALID_RESPONSE, 0);
@@ -366,10 +381,9 @@ static void radio_task(void *arg)
            打开：分片里是 HE-AAC 时不开会解不出声。 */
         esp_ts_dec_cfg_t ts_cfg = {.aac_plus_enable = true};
         esp_audio_simple_dec_cfg_t dec_cfg = {
-            .dec_type = RADIO_SOURCE == RADIO_SOURCE_HLS ? ESP_AUDIO_SIMPLE_DEC_TYPE_TS
-                                                         : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
-            .dec_cfg = RADIO_SOURCE == RADIO_SOURCE_HLS ? &ts_cfg : NULL,
-            .cfg_size = RADIO_SOURCE == RADIO_SOURCE_HLS ? sizeof(ts_cfg) : 0U,
+            .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_TS,
+            .dec_cfg = &ts_cfg,
+            .cfg_size = sizeof(ts_cfg),
             .use_frame_dec = false,
         };
         esp_audio_simple_dec_handle_t decoder = NULL;
@@ -444,12 +458,9 @@ static void radio_task(void *arg)
              * 之后再也没有声音，而且这个循环会持续烧 core 1 和 PSRAM 带宽。旧的 MP3 长
              * 连接没暴露它，只因为服务端按实时供流，一次 read 通常只有一两 KB。 */
             if (input_len == 0U || last_consumed == 0U) {
-                /* 唯一的“字节从哪来”分歧点：MP3 是长连接直读，HLS 是分片响应体、读完
-                   一片自动换下一片。往下的解码/重采样/入队/背压处理完全共用。 */
-                int n = RADIO_SOURCE == RADIO_SOURCE_HLS
-                            ? hls_read(&hls, input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len)
-                            : esp_http_client_read(http, (char *)input + input_len,
-                                                   (int)(RADIO_INPUT_BUFFER_BYTES - input_len));
+                /* HLS 的分片响应体：读完一片自动换下一片。往下的解码/重采样/入队/
+                   背压处理完全共用。 */
+                int n = hls_read(&hls, input + input_len, RADIO_INPUT_BUFFER_BYTES - input_len);
                 if (n == 0) {
                     if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
                     else record_failure("http_read_eof", 0, s_reconnects);
@@ -607,13 +618,61 @@ esp_err_t radio_stream_service_init(void)
     return ESP_OK;
 }
 
+/* 切台：改下标 + 换 epoch，让会话循环按新频道重新接流。
+ * 故意不碰回放通道（不 abort、不重新 begin），所以“换台”听上去是直接换内容而不是
+ * 先断再连；代价是要等新台的播放列表回来才出声（实测约 240 ms）。 */
+static esp_err_t radio_select_station(uint32_t index)
+{
+    if (index >= RADIO_STATION_COUNT) return ESP_ERR_INVALID_ARG;
+    if (radio_stream_service_init() != ESP_OK) return ESP_FAIL;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const bool changed = s_station_index != index;
+    s_station_index = index;
+    ++s_epoch;
+    if (s_epoch == 0U) s_epoch = 1U;
+    s_play_requested = true;
+    s_user_paused = false;
+    s_reconnects = 0U;
+    xSemaphoreGive(s_lock);
+    xTaskNotifyGive(s_task);
+    if (changed) ESP_LOGI(TAG, "切台：%s（%u/%u）", k_stations[index].name,
+                          (unsigned)(index + 1U), (unsigned)RADIO_STATION_COUNT);
+    return ESP_OK;
+}
+
 esp_err_t radio_stream_service_play_default(void)
 {
-    if (radio_stream_service_init() != ESP_OK) return ESP_FAIL;
-    xSemaphoreTake(s_lock, portMAX_DELAY); ++s_epoch; if (s_epoch == 0U) s_epoch = 1U; s_play_requested = true; s_user_paused = false; s_reconnects = 0U; xSemaphoreGive(s_lock);
-    xTaskNotifyGive(s_task);
-    ESP_LOGI(TAG, "开始播放固定 MP3 电台");
-    return ESP_OK;
+    return radio_select_station(RADIO_STATION_DEFAULT);
+}
+
+esp_err_t radio_stream_service_play_station_by_name(const char *query)
+{
+    if (query == NULL) return ESP_ERR_INVALID_ARG;
+    /* 包含匹配而不是相等匹配：云端 ASR 会把台名切成“音乐之声儿”“音乐之声。”这类
+       变体（“打开电台”被切成“开电台”是同一个毛病）。容错归设备，云端只需把用户
+       的话转成一个名字。 */
+    for (uint32_t i = 0U; i < RADIO_STATION_COUNT; ++i) {
+        if (strstr(query, k_stations[i].key) != NULL) return radio_select_station(i);
+    }
+    ESP_LOGW(TAG, "没听出台名：\"%s\"", query);
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t radio_stream_service_play_next(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const uint32_t next = (s_station_index + 1U) % RADIO_STATION_COUNT;
+    xSemaphoreGive(s_lock);
+    return radio_select_station(next);
+}
+
+const char *radio_stream_service_station_name(void)
+{
+    if (s_lock == NULL) return k_stations[RADIO_STATION_DEFAULT].name;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const char *name = k_stations[s_station_index].name;
+    xSemaphoreGive(s_lock);
+    return name;
 }
 
 /* 暂停是静音保活而不是断流：会话循环继续把 HTTP 流读下去，只是不出声，于是
