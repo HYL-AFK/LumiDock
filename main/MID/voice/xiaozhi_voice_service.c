@@ -342,6 +342,9 @@ static uint32_t s_tts_playback_epoch;
 static uint32_t s_greeting_turn_id;
 static uint32_t s_boot_greeting_id;
 static bool s_boot_greeting_attempted;
+/* 开机那轮问候是「设备主动问、云端回答」，不是用户在提问。这一位从发 detect 起
+   置上，一直到云端的问候 PCM 播完才落。它的唯一作用是在收场时绕开接话窗口。 */
+static bool s_boot_greeting_question;
 static volatile bool s_boot_greeting_request_pending;
 static bool s_playing_boot_greeting;
 static bool s_playing_wake_greeting;
@@ -2109,6 +2112,7 @@ static void begin_boot_greeting(void)
     s_playing_turn_id = 0U;
     s_session_active = true;
     s_state = XIAOZHI_VOICE_WAIT_RESPONSE;
+    s_boot_greeting_question = true;
     s_boot_greeting_tts_deadline_us = 0;
     s_boot_greeting_reply_deadline_us = 0;
     ESP_LOGI(TAG, "boot greeting sent to the cloud as a question: id=%u",
@@ -2395,6 +2399,23 @@ static void enter_followup_after_playback(void)
             ESP_LOGI(TAG, "boot greeting response PCM drained; direct reply window re-armed=%lldms",
                      (long long)(XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US / 1000LL));
         }
+    }
+    else if (s_boot_greeting_question)
+    {
+        /* 开机那轮主动问候：云端答完就结束，不开接话窗口。
+         *
+         * 问候不是用户提的问题，他没有任何话要接着说；开一个 6.4 秒的听音窗口
+         * 反而害事——实测日志：27147 开窗，33567 窗口沉默又播了一次超时提示音，
+         * 35507 再开一次。这期间喊“你好小智”会被当成接话内容吞掉，听起来就是
+         * “第一次喊没反应、第二次才有”。所以直接收场回到等唤醒。 */
+        s_boot_greeting_question = false;
+        s_state = XIAOZHI_VOICE_WAIT_WAKE;
+        s_followup_deadline_us = 0;
+        s_ui_idle_deadline_us = 0;
+        s_session_exit_clean = true;
+        ESP_LOGI(TAG, "boot greeting finished; ending the turn without a follow-up window");
+        close_channel(false);
+        return;
     }
     else
     {
