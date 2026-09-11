@@ -2088,20 +2088,33 @@ static void begin_boot_greeting(void)
     if (s_turn_id == 0U)
         ++s_turn_id;
     s_boot_greeting_id = s_turn_id;
-    /* 必须同时置 greeting_turn_id：tts start 处理器只接受 response_turn
-     * 和 greeting_turn，boot_greeting/exit/timeout/fallback 四个 turn 一律
-     * 丢弃。漏了这行，云端的问候会被当成陈旧流丢掉，设备一声不响。 */
-    s_greeting_turn_id = s_turn_id;
-    s_waiting_turn_id = 0U;
+    /* 走「等云端回答」这条状态，而不是「等用户说话」。
+     *
+     * 实测日志 14776→14976：服务器收到带 text 的 detect 之后，会先回一条 stt（把
+     * 我们写的文本原样当成用户说的话），紧接着就 push tts start。也就是说这一轮在
+     * 服务器眼里已经「说完话了」，正等着我们把回答播出来。
+     *
+     * tts start 只接受两种：response_turn（state==WAIT_RESPONSE 且 waiting_turn 非
+     * 零）和 greeting_turn（state==WAIT_SPEECH 且 greeting_turn 非零）。上一版这里
+     * 是 WAIT_SPEECH + start_listen(true)，两个都不成立：
+     *   - start_listen 会把状态推走，greeting_turn 的前提当场失效；
+     *   - 同时它开了一条永远等不到人说话的上行——麦克风前没有人，VAD 一直被能量
+     *     门限挡着（日志里刷的 "VAD start gated by energy: recent_peak=414
+     *     threshold=644"），上行永远收不了尾，状态永远进不了 WAIT_RESPONSE。
+     * 结果云端的问候在 14976 被当成陈旧流丢掉，设备一声不响地停在聆听页。
+     *
+     * 所以：不 start_listen。这不是一轮真实对话，没有音频要上行，服务器也不需要
+     * 它。置好 waiting_turn_id + WAIT_RESPONSE，云端的 TTS 就会被当成正常回答接收。 */
+    s_waiting_turn_id = s_turn_id;
     s_playing_turn_id = 0U;
     s_session_active = true;
-    s_state = XIAOZHI_VOICE_WAIT_SPEECH;
+    s_state = XIAOZHI_VOICE_WAIT_RESPONSE;
     s_boot_greeting_tts_deadline_us = 0;
     s_boot_greeting_reply_deadline_us = 0;
     ESP_LOGI(TAG, "boot greeting sent to the cloud as a question: id=%u",
              (unsigned)s_boot_greeting_id);
-    publish_ui_state(VOICE_UI_LISTENING);
-    start_listen(true);
+    /* 已经说完话了，正在等云端回答——对应 UI 的「思考」状态。 */
+    publish_ui_state(VOICE_UI_THINKING);
 }
 
 static bool send_terminal_uplink_sequence(void)
