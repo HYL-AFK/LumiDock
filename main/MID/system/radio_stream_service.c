@@ -47,7 +47,7 @@
  * 一下这个地址，能看到 #EXTM3U 才算数；拿不到的分片会让整个台一哑到底。 */
 typedef struct {
     const char *name; /* 云端和本地短语都按这个名字匹配 */
-    const char *key;  /* 包含匹配用的 2 字关键词，见 station_by_query() */
+    const char *key;  /* 包含匹配用的 2 字关键词，见 play_station_by_name() */
     const char *url;
 } radio_station_t;
 

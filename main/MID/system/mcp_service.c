@@ -110,7 +110,7 @@ static const char k_tools_list_result_json[] =
     "from self.get_device_status and pass the next name in that list, wrapping "
     "around. Never ask which genre the user wants."
     "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"station\":"
-    "{\"type\":\"string\",\"description\":\"Channel name; omit for the default.\"}}}}",
+    "{\"type\":\"string\",\"description\":\"Channel name; omit for the default.\"}}}},",
     "{\"name\":\"" MCP_TOOL_RADIO_PAUSE "\",\"description\":\""
     "Pause the radio stream. Use self.radio.resume to continue it."
     "\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
