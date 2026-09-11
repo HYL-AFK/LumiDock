@@ -237,6 +237,9 @@ static const char *handle_get_device_status(long id)
        is_active() 会短暂变假，但用户的意图仍是“电台在播”，上报不能因此翻成
        没在播，否则云端会重新起一个。 */
     const bool radio_playing = radio_stream_service_is_requested();
+    /* 当前频道名。云端靠它把“换个台”算成具体的下一个名字 —— 没有这个字段，
+       “换个台”就无从下手（它只能看到一个布尔值）。 */
+    const char *radio_station = radio_stream_service_station_name();
     char plain[512];
     const int written = snprintf(
         plain, sizeof(plain),
@@ -244,13 +247,13 @@ static const char *handle_get_device_status(long id)
         "\"timer\":{\"alarm_active\":%s,\"alarm_time\":\"%02u:%02u\","
         "\"countdown_active\":%s,\"countdown_remaining_seconds\":%lu,"
         "\"stopwatch_running\":%s,\"stopwatch_seconds\":%lu,\"ringing\":%s},"
-        "\"radio\":{\"playing\":%s}}",
+        "\"radio\":{\"playing\":%s,\"station\":\"%s\"}}",
         volume, timers.alarm_active ? "true" : "false", (unsigned)timers.alarm_hour,
         (unsigned)timers.alarm_minute, timers.countdown_active ? "true" : "false",
         (unsigned long)timers.countdown_remaining_seconds,
         timers.stopwatch_running ? "true" : "false",
         (unsigned long)timers.stopwatch_seconds, timers.ringing ? "true" : "false",
-        radio_playing ? "true" : "false");
+        radio_playing ? "true" : "false", radio_station);
     if (written <= 0 || (size_t)written >= sizeof(plain))
     {
         return reply_error(id, MCP_ERROR_INTERNAL, "Failed to build the device status");

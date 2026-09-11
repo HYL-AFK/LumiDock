@@ -190,19 +190,23 @@ if ($ui -notmatch 'state == VOICE_UI_IDLE && radio_stream_service_is_requested\(
     throw 'The voice page must show the speaking face while the radio is playing.'
 }
 # ---------------------------------------------------------------- HLS 电台
-# 蜻蜓FM 已经下架中国之声的静态 MP3 源（live/386 实测 404，而同域名的 20500038 仍正常
-# 吐流，所以是单个 ID 下架、不是域名失效）。官方源是 HLS，想听“正规”电台就只剩这一条
-# 路。两条取流路径都留在文件里，切回去只改 RADIO_SOURCE 一个宏。
-if ($radio -notmatch '#define RADIO_SOURCE RADIO_SOURCE_HLS') {
-    throw 'The radio must prefer the HLS source unless the Qtfm static stream is restored.'
+# 蜻蜓FM 的 MP3 长连接路径是故意删掉的（它的取流方式、错误处理和 HLS 完全不同，
+# 两条并存要维护两套）。蜻蜓那版留在 git 标签 qtfm-radio-checkpoint 上，真要用就切
+# 回那个版本，不要在这里重新长出第二条路径。
+if ($radio -match 'RADIO_SOURCE_MP3|RADIO_URL_MP3|ESP_AUDIO_SIMPLE_DEC_TYPE_MP3|esp_http_client_read\(http') {
+    throw 'The Qtfm MP3 path was removed on purpose; every channel now goes through HLS.'
 }
-if ($radio -notmatch '#define RADIO_URL_HLS "http://ngcdn001\.cnr\.cn/live/zgzs/index\.m3u8"') {
-    throw 'The HLS playlist URL must point at the CNR stream that was verified on the bench.'
+# 频道表是“设备能放什么”的唯一真相。加台只能改这张表，不能在别处硬编码地址——
+# 那样 MCP 描述、本地短语表和实际能播的台会三方对不上。
+if ($radio -notmatch '#define RADIO_STATION_COUNT 4U') {
+    throw 'The channel table is the single source of truth for what the radio can play.'
 }
-if ($radio -notmatch '#define RADIO_URL_MP3 "http://lhttp\.qtfm\.cn/live/20500038/64k\.mp3"') {
-    throw 'Keep the verified Qtfm URL in the file so switching back stays a one-line change.'
+foreach ($channel in @('zgzs', 'jjzs', 'yyzs', 'wyzs')) {
+    if ($radio -notmatch "live/$channel/index\.m3u8") {
+        throw "Missing channel $channel; probe the URL before adding it, hzzs is a known 404."
+    }
 }
-if ($radio -notmatch 'RADIO_SOURCE == RADIO_SOURCE_HLS \? ESP_AUDIO_SIMPLE_DEC_TYPE_TS') {
+if ($radio -notmatch 'ESP_AUDIO_SIMPLE_DEC_TYPE_TS') {
     throw 'HLS carries AAC inside a TS container; the MP3 decoder cannot read it.'
 }
 if ($radio -notmatch 'esp_ts_dec_cfg_t ts_cfg = \{\.aac_plus_enable = true\}') {
@@ -239,8 +243,18 @@ if ($radio -notmatch 'hls->next_index = prev_index != 0U \? prev_index : last_in
     throw 'Start from the second-newest segment: the newest one leaves no jitter margin.'
 }
 # 解码/重采样/入队/背压必须完全共用，分歧只允许出现在“字节从哪来”这一处。
-if ($radio -notmatch '(?s)RADIO_SOURCE == RADIO_SOURCE_HLS\s*\?\s*hls_read\(&hls,') {
-    throw 'Both sources must share one decode path; only the byte source may differ.'
+# 云端只管把用户的话转成一个台名，容错归设备：ASR 会把台名切成“音乐之声儿”这类变体，
+# 所以这里必须是包含匹配，相等匹配会直接失效。
+if ($radio -notmatch 'strstr\(query, k_stations\[i\]\.key\)') {
+    throw 'Station lookup must be a substring match; ASR mangles the names.'
+}
+if ($radio -notmatch '\(s_station_index \+ 1U\) % RADIO_STATION_COUNT') {
+    throw 'Next-channel must wrap around instead of running off the end of the table.'
+}
+# 设备状态必须带上当前台名：没有它，云端无从把“换个台”算成具体的下一个。
+$mcp = Get-Content -Raw "$PSScriptRoot\..\main\MID\system\mcp_service.c"
+if ($mcp -notmatch '\"radio\":\{\"playing\":%s,\"station\":\"%s\"\}\}') {
+    throw 'The device status must report the current channel so the cloud can pick the next one.'
 }
 # 读和消化必须解耦。esp_audio_simple_dec_process 一次只消化能填满输出缓冲的那几帧：
 # 输出缓冲 8 KB，而 48 kHz 立体声 AAC 一帧就是 4 KB，所以一次只吃得下约两帧（几百
