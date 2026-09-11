@@ -247,17 +247,18 @@ static bool hls_open_segment(radio_hls_t *hls, uint64_t index)
                                  (unsigned long long)index);
     if (written <= 0 || (size_t)written >= sizeof(url)) return false;
 
-    /* 不调 esp_http_client_close()：IDF 的 esp_http_client_connect() 只在
-       state < HTTP_STATE_CONNECTED 时才真的重连（esp_http_client.c:1469），所以
-       换 URL 再 open() 就是在原 socket 上发下一个 GET。每 10 s 一次的分片请求因此
-       不用重做 TCP 握手——上次实测首次建连要 7.3 s，那个代价每片付一次就完了。 */
+    /* 每个分片都开一条新连接，不复用上一片的 socket。
+     *
+     * 原实现想省掉这次握手（IDF 的 esp_http_client_connect 只在
+     * state < HTTP_STATE_CONNECTED 时才真重连），但实机上换来的是更糟的结果：分片
+     * 服务器常在响应完就关连接，而 state 已到 CONNECTED 的 open() 会跳过重连、把
+     * 请求写进一条死 socket，随后整段卡在 timeout_ms 上——实测电台一次哑掉 11.7 秒
+     * （日志 49990 → 61710 没有任何 PCM 入队，队列从 46 帧耗干后 underrun）。
+     * 代价那边：实测建连只要约 240 ms，而分片是 10 秒一个，握手开销被 1 秒的播放
+     * 预缓冲完全吸收。别再改回复用。 */
     esp_http_client_set_url(hls->http, url);
-    if (esp_http_client_open(hls->http, 0) != ESP_OK) {
-        /* 服务端可能在上一个响应里关了连接（Connection: close）：重开一条。 */
-        esp_http_client_close(hls->http);
-        esp_http_client_set_url(hls->http, url);
-        if (esp_http_client_open(hls->http, 0) != ESP_OK) return false;
-    }
+    esp_http_client_close(hls->http);
+    if (esp_http_client_open(hls->http, 0) != ESP_OK) return false;
     (void)esp_http_client_fetch_headers(hls->http);
     hls->segment_open = true;
     return true;
@@ -318,7 +319,9 @@ static void radio_task(void *arg)
         radio_hls_t hls = {0};
         esp_http_client_config_t cfg = {
             .url = RADIO_SOURCE == RADIO_SOURCE_HLS ? RADIO_URL_HLS : RADIO_URL_MP3,
-            .timeout_ms = 12000,
+            /* 超时从一个坏 socket 里拔出来要等多久。实测连 CNR 建连只要约 240 ms，
+               所以 4 s 已经有十几倍余量；而设成 12 s 的代价是电台一次哑 11.7 秒。 */
+            .timeout_ms = 4000,
             .buffer_size = RADIO_HTTP_BUFFER_BYTES,
         };
         esp_http_client_handle_t http = esp_http_client_init(&cfg);

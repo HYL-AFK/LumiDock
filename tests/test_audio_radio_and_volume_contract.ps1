@@ -211,11 +211,16 @@ if ($radio -notmatch 'esp_ts_dec_cfg_t ts_cfg = \{\.aac_plus_enable = true\}') {
 if ($radio -notmatch 'RADIO_HLS_PLAYLIST_MAX 1024U') {
     throw 'The playlist is tiny but must stay bounded; never allocate it per fetch.'
 }
-# 每 10 s 一个分片。IDF 的 esp_http_client_connect() 只在 state < HTTP_STATE_CONNECTED
-# 时才真的重连（esp_http_client.c:1469），所以只要不提前 close()，换 URL 再 open() 就是
-# 在原 socket 上发下一个 GET。实测首次建连要 7.3 s，每片付一次根本来不及。
-if ($radio -notmatch '(?s)hls_open_segment[\s\S]{0,900}?esp_http_client_set_url\(hls->http, url\);[\s\S]{0,120}?esp_http_client_open\(hls->http, 0\)') {
-    throw 'Segment requests must reuse the open socket instead of reconnecting every 10 seconds.'
+# 每片分片必须开新连接，不能复用上一片的 socket。分片服务器常在响应完就关连接，而
+# state 已到 HTTP_STATE_CONNECTED 的 esp_http_client_open() 会跳过重连、把请求写进一条
+# 死 socket，之后整段卡在 timeout_ms 上——实测电台一次哑掉 11.7 秒（日志 49990 → 61710
+# 没有任何 PCM 入队，队列从 46 帧耗干后 underrun）。建连实测只要约 240 ms，而分片是
+# 10 秒一个，这点握手开销被 1 秒的播放预缓冲完全吸收。
+if ($radio -notmatch '(?s)hls_open_segment[\s\S]{0,1200}?esp_http_client_set_url\(hls->http, url\);\s*\n\s*esp_http_client_close\(hls->http\);') {
+    throw 'Each segment must get a fresh connection; a reused dead socket costs a whole timeout.'
+}
+if ($radio -notmatch '\.timeout_ms = 4000,') {
+    throw 'The socket timeout is what bounds how long one bad segment can silence the radio.'
 }
 # 分片会随滑动窗口过期。拉不到就重拉列表拿新序号，否则电台会卡在窗口外面再也不出声。
 if ($radio -notmatch '(?s)hls_open_segment\(hls, hls->next_index\)[\s\S]{0,400}?hls_read_playlist\(hls, true\)') {
