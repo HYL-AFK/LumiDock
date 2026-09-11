@@ -2795,8 +2795,15 @@ static void process_text(const uint8_t *data, size_t data_len)
                     "_binary_prompt_executing_16k_mono_s16le_pcm_start");
                 extern const uint8_t prompt_executing_pcm_end[] asm(
                     "_binary_prompt_executing_16k_mono_s16le_pcm_end");
-                (void)play_local_prompt_pcm(LOCAL_PROMPT_INTENT, prompt_executing_pcm_start,
-                                            prompt_executing_pcm_end, NULL);
+                /* 开机那一轮主动问候不播本地意图提示音：它不是用户在提问，
+                   播“正在执行/正在查询”只会和云端正在生成的问候撞在一起。
+                   s_boot_greeting_id 在发 detect 时置上、云端 TTS 被接受时清掉
+                   （见 tts start 处理器），正好完整覆盖 stt 到达的那个窗口。 */
+                if (s_boot_greeting_id == 0U)
+                {
+                    (void)play_local_prompt_pcm(LOCAL_PROMPT_INTENT, prompt_executing_pcm_start,
+                                                prompt_executing_pcm_end, NULL);
+                }
             }
             else
             {
@@ -2809,7 +2816,11 @@ static void process_text(const uint8_t *data, size_t data_len)
                     "_binary_prompt_thinking_16k_mono_s16le_pcm_start");
                 extern const uint8_t prompt_thinking_pcm_end[] asm(
                     "_binary_prompt_thinking_16k_mono_s16le_pcm_end");
-                if (is_query_intent(text->valuestring))
+                if (s_boot_greeting_id != 0U)
+                {
+                    /* 同上：开机主动问候不播本地意图提示音。 */
+                }
+                else if (is_query_intent(text->valuestring))
                 {
                     (void)play_local_prompt_pcm(LOCAL_PROMPT_INTENT, prompt_querying_pcm_start,
                                                 prompt_querying_pcm_end, NULL);
