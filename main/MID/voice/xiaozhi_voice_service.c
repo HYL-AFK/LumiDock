@@ -2636,9 +2636,33 @@ static void process_text(const uint8_t *data, size_t data_len)
     if (strcmp(type->valuestring, "stt") == 0)
     {
         const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
-        if (s_state == XIAOZHI_VOICE_WAIT_RESPONSE && cJSON_IsString(text) &&
+        /* 本地提示音（超时/退出/兜底）还在播的时候用户就能开口——那一刻
+           s_state 停在提示音自己的状态上，原来这句 `s_state == WAIT_RESPONSE`
+           会把云端的 stt 直接挡掉。
+
+           后果不只是“这一轮没反应”：s_waiting_turn_id 会停在 0，紧接着到的
+           云端 TTS 又被判成陈旧流整段丢掉（实测日志 532：
+           "duplicate/stale TTS start ignored: state=10 waiting_turn=0"），
+           用户听到的是“本地命令自己执行了，但小智一个字没说”。
+
+           用户开口就是新的一轮，提示音该不该继续播由让位逻辑管，不归这里。 */
+        if ((s_state == XIAOZHI_VOICE_WAIT_RESPONSE || s_local_prompt_active) &&
+            cJSON_IsString(text) &&
             text->valuestring != NULL)
         {
+            /* 提示音还压着状态时，先把这一轮立起来：下面那条 TTS 的受理判定
+               靠的就是 waiting_turn_id 非零。 */
+            if (s_state != XIAOZHI_VOICE_WAIT_RESPONSE)
+            {
+                s_state = XIAOZHI_VOICE_WAIT_RESPONSE;
+                if (s_waiting_turn_id == 0U)
+                {
+                    ++s_turn_id;
+                    if (s_turn_id == 0U)
+                        ++s_turn_id;
+                    s_waiting_turn_id = s_turn_id;
+                }
+            }
             /* 每句新话重新判定：上一句禁掉的云端电台工具不能连坐到这一句。
                follow-up 里接着说“打开一下电台”时，本地没覆盖这种说法，还得
                让云端的 self.radio.play 有机会执行。 */
