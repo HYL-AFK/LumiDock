@@ -468,47 +468,21 @@ static void radio_task(void *arg)
              * 读入是消化的三十几倍，输入缓冲必然一直满、一直整块丢掉——实机就是响一两秒
              * 之后再也没有声音，而且这个循环会持续烧 core 1 和 PSRAM 带宽。旧的 MP3 长
              * 连接没暴露它，只因为服务端按实时供流，一次 read 通常只有一两 KB。 */
-            /* input_len < 输入缓冲是必须的：缓冲已经满了就没有位置可读，下面的填满
-               循环一次都不会跑，filled 会停在 0 而被当成“网络没进展”误报重连。
-               那种情况（缓冲满 + 解析器不吃）是上面 stall_rounds 那条路管的。 */
-            if ((input_len == 0U || last_consumed == 0U) &&
-                input_len < RADIO_INPUT_BUFFER_BYTES) {
+            if (input_len == 0U || last_consumed == 0U) {
                 /* HLS 的分片响应体：读完一片自动换下一片。往下的解码/重采样/入队/
                    背压处理完全共用。 */
-                /* 小批量读，但读到把缓冲填满为止。
-                 *
-                 * 上面那段注释解释了为什么不能“只喂一次就回头再读”：读入速度是消化
-                 * 的三十几倍，缓冲会一直满、一直整块丢掉。旧 MP3 长连接没暴露它，
-                 * 只因为服务端按实时供流、一次 read 只有一两 KB。
-                 *
-                 * 但反过来把单次读限成 2 KB 然后就走也不行：缓冲永远只装 2 KB，
-                 * 解码完就空，每次续杯都得等一次网络往返，实机就是电台一卡一卡。
-                 * 预读量是撑过网络抖动的垫子，不能拿去换粒度。
-                 *
-                 * 所以这里两样都要：每次 read 还是 2 KB（给 WiFi 栈留出调度点），
-                 * 但循环到填满 16 KB 才交回主循环。粒度是 2 KB，预读量还是 16 KB。 */
-                size_t filled = 0U;
-                int n = 0;
-                while (input_len + filled < RADIO_INPUT_BUFFER_BYTES) {
-                    size_t want = RADIO_INPUT_BUFFER_BYTES - input_len - filled;
-                    if (want > RADIO_HLS_READ_CHUNK_MAX)
-                        want = RADIO_HLS_READ_CHUNK_MAX;
-                    n = hls_read(&hls, input + input_len + filled, want);
-                    if (n <= 0) break;
-                    filled += (size_t)n;
-                }
-                /* 只拿第一拍的结果判成败：填满过程中遇到的 0 多半是这一片读完了
-                   （hls_read 内部已经换到下一片），刚拿到的字节不能丢，下一轮接着拉。 */
-                if (filled == 0U) {
-                    if (n == 0) {
-                        if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
-                        else record_failure("http_read_eof", 0, s_reconnects);
-                        break;
-                    }
-                    record_failure("http_read", n, s_reconnects);
+                /* 单次不超过 2 KB：见 RADIO_HLS_READ_CHUNK_MAX 的说明。 */
+                size_t want = RADIO_INPUT_BUFFER_BYTES - input_len;
+                if (want > RADIO_HLS_READ_CHUNK_MAX)
+                    want = RADIO_HLS_READ_CHUNK_MAX;
+                int n = hls_read(&hls, input + input_len, want);
+                if (n == 0) {
+                    if (s_reconnects < RADIO_MAX_RECONNECTS) { ++s_reconnects; retry = true; ESP_LOGW(TAG, "radio network stall; reconnect=%u/%u", (unsigned)s_reconnects, (unsigned)RADIO_MAX_RECONNECTS); }
+                    else record_failure("http_read_eof", 0, s_reconnects);
                     break;
                 }
-                input_len += filled;
+                if (n < 0) { record_failure("http_read", n, s_reconnects); break; }
+                input_len += (size_t)n;
             }
             esp_audio_simple_dec_raw_t raw = {.buffer = input, .len = input_len};
             esp_audio_simple_dec_out_t out = {.buffer = pcm, .len = RADIO_PCM_BUFFER_BYTES};
