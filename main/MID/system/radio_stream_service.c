@@ -344,9 +344,19 @@ static void radio_task(void *arg)
         radio_hls_t hls = {0};
         esp_http_client_config_t cfg = {
             .url = station->url,
-            /* 超时从一个坏 socket 里拔出来要等多久。实测连 CNR 建连只要约 240 ms，
-               所以 4 s 已经有十几倍余量；而设成 12 s 的代价是电台一次哑 11.7 秒。 */
-            .timeout_ms = 4000,
+            /* 超时从一个坏 socket 里拔出来要等多久。
+             *
+             * 原来是 4 s，理由是“实测建连只要 240 ms，十几倍余量”。但那 240 ms 是
+             * 网络好的时候测的：日志里网络一差（同时段 PONG 从 10 s 拖到 20 s），建连
+             * 要好几秒，4 s 必然超时。
+             *
+             * 而超时的代价不对称：判早了 → 分片拉不到 → 吃掉一次 reconnect（只有 3 次）
+             * → 几次抖动后电台直接关掉；判晚了 → 就是多等几秒，播放队列那几百帧在垫着，
+             * 大多数时候连听感都没有影响。宁可多等，别把本来能连上的时候判死。
+             *
+             * 上面那段注释里“12 s 会哑 11.7 秒”是 socket 复用那个 bug 造成的，已经用
+             * 每片 close + open 修掉了，不会再出现。 */
+            .timeout_ms = 10000,
             .buffer_size = RADIO_HTTP_BUFFER_BYTES,
         };
         esp_http_client_handle_t http = esp_http_client_init(&cfg);
