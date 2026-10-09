@@ -16,13 +16,16 @@
 #include "bms_service.h"
 #include "ble_provision_service.h"
 #include "button_driver.h"
+#include "charge_strategy.h"
 #include "device_settings_service.h"
 #include "i2s_audio_driver.h"
 #include "mid_snapshot.h"
+#include "news_service.h"
 #include "runtime_event_log.h"
 #include "status_led_service.h"
 #include "stc_service.h"
 #include "startup_coordinator.h"
+#include "tariff_service.h"
 #include "time_service.h"
 #include "timer_service.h"
 #include "weather_service.h"
@@ -321,6 +324,9 @@ esp_err_t app_manager_start(void)
     if ((err = ble_provision_service_init()) != ESP_OK) ESP_LOGW(TAG, "BLE init: %s", esp_err_to_name(err));
     if ((err = time_service_init()) != ESP_OK) ESP_LOGW(TAG, "time init: %s", esp_err_to_name(err));
     if ((err = weather_service_init()) != ESP_OK) ESP_LOGW(TAG, "weather init: %s", esp_err_to_name(err));
+    if ((err = tariff_service_init()) != ESP_OK) ESP_LOGW(TAG, "tariff init: %s", esp_err_to_name(err));
+    if ((err = news_service_init()) != ESP_OK) ESP_LOGW(TAG, "news init: %s", esp_err_to_name(err));
+    charge_strategy_init();
     if ((err = xiaozhi_activation_service_init()) != ESP_OK) {
         ESP_LOGW(TAG, "XiaoZhi activation init: %s", esp_err_to_name(err));
     }

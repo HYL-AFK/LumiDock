@@ -62,14 +62,14 @@ if ($maxBranchAt -lt 0 -or $numberedBranchAt -lt 0 -or $maxBranchAt -gt $numbere
 $tools = @(
     'self.timer.set_alarm', 'self.timer.cancel_alarm', 'self.timer.set_countdown',
     'self.timer.start_stopwatch', 'self.timer.pause_stopwatch', 'self.timer.stop_stopwatch',
-    'self.timer.stop_ringing', 'self.radio.play', 'self.radio.pause',
+    'self.timer.stop_ringing', 'self.radio.play', 'self.radio.next', 'self.radio.pause',
     'self.radio.resume', 'self.radio.stop'
 )
 $macros = @(
     'MCP_TOOL_SET_ALARM', 'MCP_TOOL_CANCEL_ALARM', 'MCP_TOOL_SET_COUNTDOWN',
     'MCP_TOOL_START_STOPWATCH', 'MCP_TOOL_PAUSE_STOPWATCH', 'MCP_TOOL_STOP_STOPWATCH',
-    'MCP_TOOL_STOP_RINGING', 'MCP_TOOL_RADIO_PLAY', 'MCP_TOOL_RADIO_PAUSE',
-    'MCP_TOOL_RADIO_RESUME', 'MCP_TOOL_RADIO_STOP'
+    'MCP_TOOL_STOP_RINGING', 'MCP_TOOL_RADIO_PLAY', 'MCP_TOOL_RADIO_NEXT',
+    'MCP_TOOL_RADIO_PAUSE', 'MCP_TOOL_RADIO_RESUME', 'MCP_TOOL_RADIO_STOP'
 )
 $catalogueStart = $mcp.IndexOf('static const char k_tools_list_result_json')
 $assertStart = $mcp.IndexOf('_Static_assert(sizeof(k_tools_list_result_json)')
@@ -105,7 +105,7 @@ for ($i = 0; $i -lt $tools.Count; $i++) {
     @{ Content = $mcp; Pattern = 'radio_stream_service_pause\(\)'; Message = 'The radio tools must drive the radio service.' },
     @{ Content = $mcp; Pattern = 'radio_stream_service_resume\(\)'; Message = 'The radio tools must drive the radio service.' },
     @{ Content = $mcp; Pattern = 'radio_stream_service_stop\(\)'; Message = 'The radio tools must drive the radio service.' },
-    @{ Content = $mcp; Pattern = [regex]::Escape('\"radio\":{\"playing\":%s}'); Message = 'get_device_status must report the radio state.' },
+    @{ Content = $mcp; Pattern = [regex]::Escape('\"radio\":{\"playing\":%s,\"station\":\"%s\"}}'); Message = 'get_device_status must report the radio state and the current channel.' },
     @{ Content = $mcp; Pattern = [regex]::Escape('\"countdown_remaining_seconds\":%lu'); Message = 'get_device_status must report the countdown remaining time.' },
     @{ Content = $mcp; Pattern = [regex]::Escape('\"stopwatch_seconds\":%lu'); Message = 'get_device_status must report the stopwatch elapsed time.' }
 ) | ForEach-Object {
@@ -279,8 +279,83 @@ if ($voice -notmatch 'mcp_service_set_radio_tools_blocked\(true\);') {
 if ($voice -notmatch 'mcp_service_set_radio_tools_blocked\(false\);') {
     throw 'The radio-tool mute must be lifted when the turn tears down.'
 }
-if ($voice -notmatch 'result == VOICE_IOT_COMMAND_RADIO_PLAY \|\|\s*result == VOICE_IOT_COMMAND_RADIO_HANDLED') {
+if ($voice -notmatch '(?s)result == VOICE_IOT_COMMAND_RADIO_PLAY \|\|\s*result == VOICE_IOT_COMMAND_RADIO_NEXT \|\|\s*result == VOICE_IOT_COMMAND_RADIO_HANDLED') {
     throw 'The mute must cover the stopped radio too, not only the deferred start.'
+}
+
+# ------------------------------------------- 换台：只有"换一个台"，没有点名
+# 云端曾用 self.radio.play 的 station 参数点名切台。那条路要求 ASR 把台名一字不差
+# 地吐出来，而实测它连"关闭电台"都会切成"电台。"；补救的办法只能是在设备侧堆字符串
+# 匹配去猜，猜错的表现是"用户说了没反应"。现在换台只剩一条路：顺着频道表走一格，
+# 台名不参与选台，天上地下都用同一个入口。
+if ($catalogue -match 'station') {
+    throw 'No advertised tool may take a channel argument any more: the device owns the channel list.'
+}
+if ($mcp -match 's_pending_radio_station') {
+    throw 'The deferred radio start must not carry a station name through the tool layer.'
+}
+if ($mcp -notmatch 'bool mcp_service_pending_radio_next\(void\)') {
+    throw 'The deferred radio start must carry the "switch" intent to the voice service.'
+}
+if ($mcpHeader -notmatch 'bool mcp_service_pending_radio_next\(void\)') {
+    throw 'The MCP header must expose the switch intent, or the voice service cannot read it.'
+}
+# 云端换台必须落到同一个入口，否则它会自己另走一条"再放一次默认台"的路。
+if ($dispatch -notmatch 'strcmp\(tool, MCP_TOOL_RADIO_NEXT\)') {
+    throw 'self.radio.next must be dispatched.'
+}
+if ($dispatch -notmatch 'is_radio_tool\(tool\)') {
+    throw 'The switch tool must sit inside the muted radio family.'
+}
+if ($mcp -notmatch '(?s)static bool is_radio_tool\(const char \*tool\)\s*\{[\s\S]{0,200}?MCP_TOOL_RADIO_NEXT') {
+    throw 'self.radio.next must be muted with the rest of the radio tools for the turn.'
+}
+# 云端那份"要换台"的意图必须在 clear 之前读走：clear 会把两个标志一起抹掉，
+# 读晚了就退化成"起默认台"，用户看到的是"说换台，切回了中国之声"。
+if ($voice -notmatch 'const bool switch_station = s_pending_radio_next \|\| mcp_service_pending_radio_next\(\);') {
+    throw 'The switch intent must be read before mcp_service_clear_pending_radio() wipes it.'
+}
+foreach ($site in [regex]::Matches($voice, 'const bool switch_station = s_pending_radio_next \|\| mcp_service_pending_radio_next\(\);')) {
+    $tail = $voice.Substring($site.Index, 400)
+    if ($tail -notmatch 'mcp_service_clear_pending_radio\(\);') {
+        throw 'Both deferred-start sites must clear the cloud intent after reading it.'
+    }
+}
+if ($voice -notmatch 's_pending_radio_next = \(result == VOICE_IOT_COMMAND_RADIO_NEXT\);') {
+    throw 'A locally recognised switch must be remembered as "switch", not as "play default".'
+}
+# 第三条释放路径：会话在应答播完之前就关掉时，延迟的启动由收尾兜底放出。这里同样
+# 得认"换台"意图——写死默认台的话，用户说了"换一个台"，听到的却是切回中国之声，
+# 而且这条路径只在异常收场时走，平时测不出来。
+if ($voice -notmatch 'const bool release_radio_switch = s_pending_radio_next \|\| mcp_service_pending_radio_next\(\);') {
+    throw 'The teardown release must snapshot the switch intent before the flags are cleared.'
+}
+if ($voice -notmatch '(?s)if \(release_radio_after_close\)\s*\{[\s\S]{0,500}?release_radio_switch \? radio_stream_service_play_next\(\)') {
+    throw 'The teardown release must honour the switch intent.'
+}
+if ($voice -match '(?s)if \(release_radio_after_close\)[\s\S]{0,300}?radio_stream_service_play_default\(\) != ESP_OK') {
+    throw 'The teardown release must not be hard-wired to the default channel.'
+}
+# 本地短语表：用户说"换一个台"就不该绕去云端。云端那一轮要是连不上，本地这条路
+# 就是唯一还能换台的地方。
+foreach ($phrase in @('"换一个台"', '"换台"', '"下一台"')) {
+    if ($iot -notmatch [regex]::Escape($phrase)) {
+        throw "The local radio vocabulary must cover the switch phrase $phrase."
+    }
+}
+if ($iotHeader -notmatch 'VOICE_IOT_COMMAND_RADIO_NEXT') {
+    throw 'A local switch needs its own result code, or the voice service cannot tell it from play.'
+}
+if ($iot -notmatch 'return VOICE_IOT_COMMAND_RADIO_NEXT;') {
+    throw 'The local switch must hand VOICE_IOT_COMMAND_RADIO_NEXT to the voice service.'
+}
+# 本地这条路上没有点名的余地："换一个台"永远是"下一格"，既不去读当前台名，
+# 也不把台名传给谁——台名一进本地逻辑，ASR 的变体就得在这里被猜一次。
+if ($iot -match 'radio_stream_service_station_name') {
+    throw 'The local switch must not read the current channel name; it only takes the next one.'
+}
+if ($iot -match 'play_station_by_name') {
+    throw 'The local switch must not name a station: the channel table decides.'
 }
 
 Write-Output 'MCP device control contract passed.'

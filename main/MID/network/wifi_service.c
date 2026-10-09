@@ -9,6 +9,8 @@
 #include "wifi_manager.h"
 #include "ble_provision.h"
 #include "mid_snapshot.h"
+#include "news_service.h"
+#include "tariff_service.h"
 #include "time_service.h"
 #include "xiaozhi_activation_service.h"
 #include "xiaozhi_voice_service.h"
@@ -69,6 +71,11 @@ static void wifi_status_changed(void)
          * otherwise the HTTP Date event can be consumed while it still reads offline. */
         time_service_notify_internet_online();
         xiaozhi_activation_service_notify_network();
+        /* 电价是充电策略的输入之一，同样要等公网探测通过才值得去拉。
+           断网分支会把 s_network_services_notified 清掉，所以重连后会再通知一次。 */
+        tariff_service_notify_network();
+        /* 新闻同理：开机时四个源连着拉要好几秒，只有公网确实通了才值得动手。 */
+        news_service_notify_network();
         s_network_services_notified = true;
         ble_provision_close_window();
     }

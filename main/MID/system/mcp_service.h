@@ -41,9 +41,9 @@ void mcp_service_reset(void);
 bool mcp_service_pending_countdown(void);
 void mcp_service_clear_pending_countdown(void);
 bool mcp_service_pending_radio(void);
-/* 云端在 self.radio.play 里点名的频道名；空串＝没点名，调用方放默认台。
-   返回值指向内部缓冲，只在下一次 clear 之前有效。 */
-const char *mcp_service_pending_radio_station(void);
+/* 这次待启动的是"换一个台"而不是"打开电台"：调用方据此选 play_next() 还是
+   play_default()。云端不点名频道，频道表只有 radio_stream_service 知道。 */
+bool mcp_service_pending_radio_next(void);
 void mcp_service_clear_pending_radio(void);
 
 /* Silences the cloud's own radio tools for the rest of the turn.
