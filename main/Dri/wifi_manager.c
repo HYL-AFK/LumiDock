@@ -47,7 +47,10 @@ static void internet_probe_delay(uint32_t delay_ms)
     const TickType_t slice = pdMS_TO_TICKS(500);
     while (remaining > 0) {
         const TickType_t current = remaining > slice ? slice : remaining;
-        vTaskDelay(current);
+        /* 用通知等待代替纯 vTaskDelay：wifi_manager_reconnect_sta() 触发重连后，
+           链路会走 DISCONNECTED -> GOT_IP，GOT_IP 会带一个任务通知过来，探测必须
+           立刻复测，不能傻等满一个巡检周期（在线巡检已拉到 10 秒，再叠上等待太久）。 */
+        if (ulTaskNotifyTake(pdTRUE, current) != 0U) return;
         watchdog_service_feed();
         remaining -= current;
     }
@@ -67,6 +70,21 @@ static void internet_probe_delay(uint32_t delay_ms)
 #define WIFI_RESCAN_FAILURE_THRESHOLD 2
 #define WIFI_STA_FAILURE_LIMIT 5U
 #define INTERNET_PROBE_RETRY_INTERVAL_MS 5000
+/* 在线巡检间隔。原设计是“探测成功一次就永久睡死、只在连接状态事件时醒来”，
+ * 但那正好漏掉最需要自愈的一类故障——IP 层假死：802.11 关联还在、IP 没变、包却
+ * 被链路静默丢掉，WIFI_EVENT_STA_DISCONNECTED 和 NETWORK_EVENT_STA_GOT_IP 一个
+ * 都不会来，探测任务永远醒不过来，“连续失败 3 次即重连”的规则就永远没机会执行。
+ * 实测表现是电台 11 次 http_open 全部报 28674、WSS 的 getaddrinfo 全部报 202，
+ * 而界面依旧打印 wifi=1 internet=1，设备一直卡到重启。
+ *
+ * 在线时改成定时自醒巡检。取 10 秒是折中：探测自身失败还要耗掉 5 秒超时；再密会让
+ * HTTP client 的分配/释放过于频繁，而内部 RAM 一向紧张。 */
+#define INTERNET_PROBE_ONLINE_POLL_INTERVAL_MS 10000
+/* 已经判为不健康之后的复测节拍。原来直接复用 5 秒的“离线重试”间隔，但假死期间每次
+ * 探测要么耗满 5 秒超时、要么立刻失败，失败次数是唯一还能压缩的变量：间隔收到 2 秒，
+ * 配合硬失败两次到线（分级见 internet_health_policy.h），判定时间能砍掉大半。
+ * 实测那次 33 秒的假死里，第一次硬失败之后两三秒其实就已经可以确认了。 */
+#define INTERNET_PROBE_UNHEALTHY_POLL_INTERVAL_MS 2000
 #define INTERNET_PROBE_TIMEOUT_MS 5000
 #define INTERNET_PROBE_URL "http://www.qq.com/favicon.ico"
 
@@ -228,11 +246,11 @@ static void reset_internet_health(void)
     portEXIT_CRITICAL(&s_internet_health_lock);
 }
 
-static internet_health_action_t record_internet_probe(bool probe_ok)
+static internet_health_action_t record_internet_probe(internet_probe_outcome_t outcome)
 {
     internet_health_action_t action;
     portENTER_CRITICAL(&s_internet_health_lock);
-    action = internet_health_policy_record(&s_internet_health, probe_ok);
+    action = internet_health_policy_record(&s_internet_health, outcome);
     portEXIT_CRITICAL(&s_internet_health_lock);
     return action;
 }
@@ -255,7 +273,7 @@ static uint8_t get_internet_probe_failures(void)
     return failures;
 }
 
-static bool probe_internet_once(void)
+static internet_probe_outcome_t probe_internet_once(void)
 {
     internet_probe_result_t response = {0};
     esp_http_client_config_t cfg = {
@@ -269,7 +287,8 @@ static bool probe_internet_once(void)
         .user_data = &response,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (client == NULL) return false;
+    /* 连 HTTP client 都建不出来，自然也建不起连接——按硬失败算。 */
+    if (client == NULL) return INTERNET_PROBE_OUTCOME_HARD_FAILURE;
 
     http_memory_log("before", "internet_probe");
     watchdog_service_set_current_task_blocking(true);
@@ -286,9 +305,19 @@ static bool probe_internet_once(void)
         APP_LOGW(TAG, "internet probe failed: err=%s status=%d body=%u content_type=%d",
                  esp_err_to_name(err), status, (unsigned)response.body_bytes,
                  response.content_type_valid);
+        /* 严重级别单独留痕：两者的判定门槛不同（两次 vs 三次），事后复盘必须能一眼
+           分开“压根连不上”和“有回包但不合规格”，否则又会把两种故障当成一种。 */
+        APP_LOGW(TAG, "internet probe outcome: %s",
+                 err != ESP_OK
+                     ? "hard failure: no new outbound connection could be opened"
+                     : "soft failure: the endpoint answered but the response was unusable");
     }
     if (probe_ok) (void)apply_http_date(response.date_header);
-    return probe_ok;
+    if (probe_ok) return INTERNET_PROBE_OUTCOME_OK;
+    /* err != ESP_OK 意味着这条请求根本没拿到回包（connect 超时、DNS 解析失败、
+       TLS/传输层报错），正是实测里把电台和唤醒一起打死的那种状态。 */
+    return err != ESP_OK ? INTERNET_PROBE_OUTCOME_HARD_FAILURE
+                         : INTERNET_PROBE_OUTCOME_SOFT_FAILURE;
 }
 
 static void internet_probe_task(void *arg)
@@ -304,28 +333,37 @@ static void internet_probe_task(void *arg)
         }
 
         const bool was_online = get_internet_online();
-        const bool probe_ok = probe_internet_once();
-        const internet_health_action_t action = record_internet_probe(probe_ok);
+        const internet_probe_outcome_t outcome = probe_internet_once();
+        const internet_health_action_t action = record_internet_probe(outcome);
         if (action == INTERNET_HEALTH_ONLINE && !was_online) {
             APP_LOGI(TAG, "internet probe online: %s", INTERNET_PROBE_URL);
             (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 1, 0, 0);
             notify_status_changed();
         } else if (action == INTERNET_HEALTH_RECONNECT) {
-            APP_LOGW(TAG, "internet probe failed 3 times; reconnecting STA");
-            (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 0, 3, 0);
+            /* 硬失败两次就到线、软失败要三次，同一个“重连”背后是两件不同的事，
+               日志必须分得开，否则下次复盘又会把它们当成同一种故障。 */
+            const bool unreachable = outcome == INTERNET_PROBE_OUTCOME_HARD_FAILURE;
+            APP_LOGW(TAG, "internet probe declared the link dead: %s; reconnecting STA",
+                     unreachable ? "no new outbound connection could be opened"
+                                 : "the endpoint kept answering with an unusable response");
+            (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 0,
+                                           unreachable ? 2U : 3U, 0);
             notify_status_changed();
             wifi_manager_reconnect_sta();
         }
 
         watchdog_service_feed();
-        /* A successful probe is a startup/reconnect gate, not a five-second
-         * background poll. It runs again only after a connection-state event
-         * resets the health state, preventing recurring client allocations. */
-        if (get_internet_online()) {
-            internet_probe_wait_for_connection_change();
-            continue;
-        }
-        internet_probe_delay(INTERNET_PROBE_RETRY_INTERVAL_MS);
+        /* 在线不等于健康，不能就此睡到“连接状态变化”。IP 层假死时
+           WIFI_EVENT_STA_DISCONNECTED / NETWORK_EVENT_STA_GOT_IP 都不会来
+           （见 INTERNET_PROBE_ONLINE_POLL_INTERVAL_MS 的说明），睡死就等于放弃
+           自愈。在线时按较长周期继续巡检；一旦已经判为不健康就切到最短节拍，
+           让失败次数尽快攒到线并触发 wifi_manager_reconnect_sta() 重新关联并
+           重新 DHCP——实测那次假死拖了 33 秒，判定慢是主因。 */
+        const uint32_t poll_ms = get_internet_probe_failures() > 0
+                                     ? INTERNET_PROBE_UNHEALTHY_POLL_INTERVAL_MS
+                                     : (get_internet_online() ? INTERNET_PROBE_ONLINE_POLL_INTERVAL_MS
+                                                              : INTERNET_PROBE_RETRY_INTERVAL_MS);
+        internet_probe_delay(poll_ms);
     }
 }
 
