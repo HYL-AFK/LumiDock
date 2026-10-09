@@ -63,6 +63,40 @@ static esp_err_t http_event(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
+/* Open-Meteo 的 daily 段是"每个字段一个数组"，下标 0=今天、1=明天。
+   长度或类型不对就整体放弃预报：宁可没有预报，也不能只填一半让充电策略拿
+   半个数据去算。这一段只是附加项，缺了不影响既有的温度/天气显示链路。 */
+static void parse_daily_forecast(const cJSON *root, weather_snapshot_t *snapshot)
+{
+    const cJSON *daily = cJSON_GetObjectItem(root, "daily");
+    if (!cJSON_IsObject(daily)) return;
+    const cJSON *tmin = cJSON_GetObjectItem(daily, "temperature_2m_min");
+    const cJSON *tmax = cJSON_GetObjectItem(daily, "temperature_2m_max");
+    const cJSON *precip = cJSON_GetObjectItem(daily, "precipitation_probability_max");
+    if (!cJSON_IsArray(tmin) || !cJSON_IsArray(tmax) || !cJSON_IsArray(precip)) return;
+    if (cJSON_GetArraySize(tmin) < 2 || cJSON_GetArraySize(tmax) < 2 ||
+        cJSON_GetArraySize(precip) < 2) {
+        return;
+    }
+    const cJSON *tmin0 = cJSON_GetArrayItem(tmin, 0);
+    const cJSON *tmin1 = cJSON_GetArrayItem(tmin, 1);
+    const cJSON *tmax0 = cJSON_GetArrayItem(tmax, 0);
+    const cJSON *tmax1 = cJSON_GetArrayItem(tmax, 1);
+    const cJSON *p0 = cJSON_GetArrayItem(precip, 0);
+    const cJSON *p1 = cJSON_GetArrayItem(precip, 1);
+    if (!cJSON_IsNumber(tmin0) || !cJSON_IsNumber(tmin1) || !cJSON_IsNumber(tmax0) ||
+        !cJSON_IsNumber(tmax1) || !cJSON_IsNumber(p0) || !cJSON_IsNumber(p1)) {
+        return;
+    }
+    snapshot->today_temp_min_c = (int8_t)tmin0->valueint;
+    snapshot->today_temp_max_c = (int8_t)tmax0->valueint;
+    snapshot->today_precip_prob = (uint8_t)p0->valueint;
+    snapshot->tomorrow_temp_min_c = (int8_t)tmin1->valueint;
+    snapshot->tomorrow_temp_max_c = (int8_t)tmax1->valueint;
+    snapshot->tomorrow_precip_prob = (uint8_t)p1->valueint;
+    snapshot->forecast_valid = true;
+}
+
 static void refresh_weather(void)
 {
     s_len = 0;
@@ -77,9 +111,15 @@ static void refresh_weather(void)
     }
 
     char url[512];
+    /* daily 段是给充电策略用的：低温掉电快、雨天阻力大，明天气温和降水概率
+     * 直接决定"今晚要不要补电"。显式写 forecast_days=2 —— 默认 7 天，多拉的
+     * 那五天只会让响应白白变大。 */
     int url_len = snprintf(
         url, sizeof(url),
-        "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&current=temperature_2m,weather_code&timezone=auto",
+        "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f"
+        "&current=temperature_2m,weather_code"
+        "&daily=temperature_2m_min,temperature_2m_max,precipitation_probability_max"
+        "&forecast_days=2&timezone=auto",
         location.latitude, location.longitude);
     if (url_len < 0 || (size_t)url_len >= sizeof(url)) {
         APP_LOGE(TAG, "weather URL buffer is too small");
@@ -135,6 +175,8 @@ static void refresh_weather(void)
                 has_weather_code = true;
             }
 
+            parse_daily_forecast(root, &snapshot);
+
             /* 只有完整响应才能覆盖上一份网络天气。 */
             if (has_temperature && has_weather_code) {
                 snapshot.valid = true;
@@ -143,10 +185,16 @@ static void refresh_weather(void)
                 snapshot.updated_at = time(NULL);
                 weather_snapshot_set(&snapshot);
                 APP_LOGI(TAG,
-                         "weather code=%d condition=%s temperature_x10=%d",
+                         "weather code=%d condition=%s temperature_x10=%d forecast=%d "
+                         "today=%d~%d precip=%u%% tomorrow=%d~%d precip=%u%%",
                          snapshot.weather_code,
                          weather_condition_name(snapshot.weather_code),
-                         (int)(snapshot.temperature_c * 10.0f));
+                         (int)(snapshot.temperature_c * 10.0f),
+                         (int)snapshot.forecast_valid,
+                         (int)snapshot.today_temp_min_c, (int)snapshot.today_temp_max_c,
+                         (unsigned)snapshot.today_precip_prob,
+                         (int)snapshot.tomorrow_temp_min_c, (int)snapshot.tomorrow_temp_max_c,
+                         (unsigned)snapshot.tomorrow_precip_prob);
                 runtime_event_log_append(RUNTIME_EVENT_WEATHER_SUCCESS,
                                          snapshot.weather_code,
                                          (int32_t)(snapshot.temperature_c * 10.0f),
