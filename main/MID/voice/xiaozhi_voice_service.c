@@ -34,18 +34,43 @@
 #define XIAOZHI_TEXT_MAX_BYTES 1024U
 #define XIAOZHI_BINARY_MAX_BYTES 2048U
 /* An MCP reply is the JSON-RPC object plus this envelope; the widest one is the
- * tools/list answer (its 13-tool catalogue alone is ~2.9 KB), so the frame
- * buffer below is sized with that headroom on top of the session id.  It must
- * stay larger than MCP_REPLY_MAX_BYTES in mcp_service.c. */
-#define XIAOZHI_MCP_FRAME_MAX_BYTES 5120U
+ * tools/list answer, so the frame buffer below carries headroom on top of the
+ * session id.  It MUST stay larger than MCP_REPLY_MAX_BYTES in mcp_service.c
+ * ——test_mcp_protocol_contract.ps1 卡的就是这一条。
+ * MCP_REPLY_MAX_BYTES 已从 4096 提到 6144（工具目录贴满旧上限，新工具加不进去），
+ * 这里同步提到 7168：6144 + 约 40 字节固定信封 + session_id 仍有余量。 */
+#define XIAOZHI_MCP_FRAME_MAX_BYTES 7168U
+/* WSS 心跳参数。配置和日志必须共用这两个宏：日志里原来把超时值写死了（旧值 20），
+ * 而配置早就改成 40，于是每次连上都把那个旧值当成实际值打出来——实测启动日志里
+ * "WSS heartbeat connected" 那行就是这么打的，排查的人会以为参数压根没生效，
+ * 然后朝错误的方向找。 */
+#define XIAOZHI_WSS_PING_INTERVAL_SEC 10
+#define XIAOZHI_WSS_PONGPONG_TIMEOUT_SEC 40
 #define XIAOZHI_HELLO_TIMEOUT_US (8LL * 1000LL * 1000LL)
 #define XIAOZHI_PREWARM_READY_TIMEOUT_US (30LL * 1000LL * 1000LL)
 #define XIAOZHI_UI_ERROR_HOLD_US (2LL * 1000LL * 1000LL)
+/* prewarm **失败后**的退避基数（见 prewarm_wss）。它管的是节流，起点 5 秒。
+   注意它不再是"链路断掉后隔多久重连"——那件事归下面的
+   XIAOZHI_PREWARM_IDLE_DELAY_US。两者原来共用这一个宏，正是唤醒变慢的根源。 */
 #define XIAOZHI_PREWARM_RETRY_US (5LL * 1000LL * 1000LL)
 /* 电台在播时用户随时可能打断，等 5 秒等于让每一次唤醒都落在“没有热连接”的窗口
  * 里，只能现建 TLS+握手（实测 1.0~2.5 秒）。电台一开播就先把 WSS 建好并保温，
  * 唤醒时直接复用这条连接。 */
 #define XIAOZHI_PREWARM_RADIO_DELAY_US (300LL * 1000LL)
+/* 链路断掉之后、把热连接接回来的延迟。
+ *
+ * 这个值原来直接借用上面的退避基数（5 秒），对"空闲保活"无所谓，对"刚出过故障"
+ * 就太长：实测 39791 链路断掉、排了一次 5 秒后的重连，用户 44121 就在这段
+ * 时间里唤醒——排队的重连还没到期、手上没有连接，唤醒只能冷启动，那次从发起
+ * 建连到 hello 用了 6 秒。用户感受到的"反应慢"里，有 4 秒是在等这个延迟走完。
+ *
+ * 收场之后用户随时可能再说一句，所以重连要尽早开始：连接一旦建起来，唤醒就能在
+ * wss_link_usable()/start_wss() 里复用（哪怕还在等 hello，start_wss 也会认下这条
+ * 链路继续等），不必再付一次 DNS+TLS。取 1 秒，比电台的 300 ms 宽——那是电台占着
+ * 资源时的实测值，这里留一点余量给 close_channel 自己的收尾（停电台、切 UI、
+ * 还扬声器都排在它后面）。失败仍然走 XIAOZHI_PREWARM_RETRY_US 起的指数退避，
+ * 所以缩短它不会变成重连风暴。 */
+#define XIAOZHI_PREWARM_IDLE_DELAY_US (1LL * 1000LL * 1000LL)
 #define XIAOZHI_PREWARM_RETRY_MAX_US (30LL * 1000LL * 1000LL)
 /* 电台让位是异步的：yield() 只置位，拉流任务要等自己那一轮循环退出才会关掉 HTTP/TLS
  * 并归还内部 RAM。而 WSS 的 websocket task 要 4096 字节连续内部 RAM，实测电台拉流时
@@ -56,8 +81,27 @@
 #define XIAOZHI_TRAFFIC_LOG_INTERVAL_US (1LL * 1000LL * 1000LL)
 #define XIAOZHI_OPUS_FRAME_INTERVAL_US (60LL * 1000LL)
 #define XIAOZHI_UPLINK_TAIL_FLUSH_FRAMES 2U
+/* WSS 单次发送的等待预算。
+ *
+ * 原来文本 500 ms、音频帧 1000 ms，都太紧。esp_websocket_client 在任意一次写失败
+ * 时会**同步拆掉整条连接**（esp_websocket_client.c 里 send 返回负值就调
+ * abort_connection），代价是整轮对话以错误音收场；而实测那次失败只不过是一次约
+ * 1 秒的瞬时拥塞——断开后 4 秒重连、之后收发全部正常，链路根本没死。
+ *
+ * 分片让这件事更糟：ws-client 按 buffer_size(1024) 把一条消息切成多片，那条 5 KB
+ * 的 MCP 工具列表要写 5 次 socket，任何一片卡住都全灭，而每片的预算原来只有 500 ms。
+ *
+ * 所以预算必须比"最坏的一次抖动"宽。取 2500/2000 ms：约为实测抖动时长的 2~2.5 倍，
+ * 又都压在 watchdog 的 3 秒 stale 阈值之下——拉长超时不能把看门狗告警引出来。
+ * 硬件 TWDT 是 8 秒，且单片失败即返回（不会把 5 片跑满），最坏阻塞远在其内。 */
+#define XIAOZHI_WSS_TEXT_SEND_TIMEOUT_MS 2500
+#define XIAOZHI_WSS_BIN_SEND_TIMEOUT_MS 2000
 #define XIAOZHI_UPLINK_TAIL_FLUSH_TIMEOUT_US (150LL * 1000LL)
-#define XIAOZHI_UPLINK_MAIN_WRITE_WAIT_TIMEOUT_US (1200LL * 1000LL)
+/* 主循环等待"在途 bin-main 写完"的上限。它必须比单次 bin 写超时
+   (XIAOZHI_WSS_BIN_SEND_TIMEOUT_MS) 更宽：否则上行还卡在 socket 上，主循环就已经
+   放弃等待并打出 "terminal main write wait timed out"，两侧对同一件事各说各话。
+   取 2500 ms——盖住一次完整写超时，同时仍压在 watchdog 的 3 秒 stale 阈值之下。 */
+#define XIAOZHI_UPLINK_MAIN_WRITE_WAIT_TIMEOUT_US (2500LL * 1000LL)
 #define XIAOZHI_WAKE_PRIMER_FRAMES 35U
 #define XIAOZHI_WAKE_PRIMER_TIMEOUT_US (10LL * 1000LL * 1000LL)
 /* Post-turn listening window.  6.4 s is enough for a speaker who wants
@@ -147,6 +191,12 @@
  * window running so it can expire and close the session normally. */
 #define XIAOZHI_FOLLOWUP_DIRECT_REPLY_MIN_PEAK 2500U
 #define XIAOZHI_CAPTURE_LOW_LEVEL_RMS 200U
+/* 低电平判定还要看峰值：只看平均值会把“对着设备正常说话”误判成没开口。
+ *
+ * 实测那一轮 rms=169 / peak=2867，用户说的正是“打开电台”，却因为平均值差 31 就被判
+ * 成没说话，抢在云端回复之前先播了一句超时提示。而电台泄漏进麦克风的量级是 300~900
+ * （同一份日志里的 VAD recent_peak），1500 足以把两者分开，又不会把轻声说话当成底噪。 */
+#define XIAOZHI_CAPTURE_LOW_LEVEL_PEAK 1500U
 #define XIAOZHI_MAX_OPUS_FRAME_BYTES 4096U
 #define XIAOZHI_SESSION_ID_MAX_BYTES 128U
 #define XIAOZHI_PIPELINE_INIT_STACK_BYTES 4096U
@@ -235,6 +285,9 @@ static uint32_t s_pending_cloud_tts_turn_id;
 /* Set when "play radio" is acknowledged: the radio starts once the cloud
  * acknowledgement TTS finishes (see VOICE_EVENT_TTS_PLAYBACK_FINISHED). */
 static bool s_pending_radio_play;
+/* 这次待启动的电台是"换一个台"还是"打开电台"。两者共用同一条延迟路径，
+ * 只在这里记下该切到下一个频道、还是回默认台。 */
+static bool s_pending_radio_next;
 /* Set when the current cloud STT reserved a countdown.  It is consumed once
  * by TTS PCM drain, or by close_channel() when the voice chain fails first. */
 static bool s_pending_countdown_start;
@@ -261,6 +314,11 @@ static uint8_t *s_uplink_frame_buffer;
 static bool s_initialized;
 static bool s_pipeline_ready;
 static bool s_client_started;
+/* 当前这条 client 是何时 start 的。start_wss() 在 hello 还没就绪时只能拿
+ * esp_websocket_client_is_connected() 判断能不能复用，可"刚建好、正在握手"和
+ * "握手早就卡死了"在连接状态上完全一样，只有时间能把两者分开。少了它，一条
+ * 卡死的半开连接会被永久当成热连接复用，现象就是"断过一次之后再怎么唤醒都建不起来"。 */
+static int64_t s_client_started_us;
 /* Stop/destroy is owned by the session cleanup path.  Disconnect callbacks
  * only enqueue an event, but a transport failure and that event can still
  * converge while the client is stopping. */
@@ -297,6 +355,17 @@ static bool s_followup_retry_used;
    follow-up 续轮不经过唤醒事件，所以这个标记在整段对话里保持不变，直到
    close_channel() 归还扬声器、或电台在本轮被拉起来时才清掉。 */
 static bool s_radio_on_before_turn;
+/* 唤醒那一刻电台到底在不在播，整轮对话期间恒定不变。
+ *
+ * 和 s_radio_on_before_turn 只差一点：本轮的电台启动路径会把它清成 false
+ * （"用户当场要听的结果，收场只归还扬声器"），而换台走的恰好是同一条路径——
+ * 云端换台就是再调一次 radio.play 并带上 station 参数。于是一句"换成经济之声"
+ * 会把标记改成 false，enter_followup_after_playback() 就把这段对话当成"本轮才开的
+ * 电台"，close_channel() 立刻收场，用户看到的就是"说一句换台，对话直接断了"。
+ *
+ * 所以判定"要不要留听音窗口"必须用这份不会被改写的副本；判定"收场停不停电台"
+ * 继续用 s_radio_on_before_turn，那是用户拍板的规则。两者语义不同，不能合并。 */
+static bool s_radio_requested_before_turn;
 static int64_t s_response_deadline_us;
 /* True while the local error tone is answering a failed turn (wake words are
  * ignored then, and close_channel returns to the idle UI without flashing the
@@ -349,6 +418,14 @@ static volatile bool s_boot_greeting_request_pending;
 static bool s_playing_boot_greeting;
 static bool s_playing_wake_greeting;
 static bool s_listen_start_sent_for_turn;
+/* 这段会话里用户到底有没有真的开过口。唤醒后一直不说话是最正常的情况，但收场
+   要分两种：
+   - 没开过口：按用户拍板的流程走完——6.4 秒窗口 → “没听清”再开一个 6.4 秒 →
+     还是没说话就来一句退出语，最后停掉电台回主页；
+   - 开过口：用户是真的在跟设备对话，电台又还等着，收场直接把直播接回来，
+     不再多问一句。
+   在 send_detect()（新会话开始）与 close_channel()（会话结束）复位。 */
+static bool s_turn_had_speech;
 static bool s_waiting_for_wake_primer;
 static bool s_wake_primer_candidate_speech;
 static int64_t s_wake_primer_deadline_us;
@@ -432,9 +509,33 @@ static void log_wss_wifi_state(void)
 static char s_session_id[XIAOZHI_SESSION_ID_MAX_BYTES];
 static char s_authorization[600];
 /* MCP replies live here instead of on the session task stack: a tools/list
- * answer can reach ~3 KB and that task only has 6 KB total.  process_text()
- * is the only writer, so one buffer is enough. */
-static char s_mcp_tx_frame[XIAOZHI_MCP_FRAME_MAX_BYTES];
+ * answer can reach ~4 KB and that task only has 6 KB total.  process_text()
+ * is the only writer, so one buffer is enough.
+ *
+ * 缓冲搬到 PSRAM：让出的这块常驻内部 RAM 收益很大（内部 RAM 要留给 WiFi / AFE /
+ * 音频链路），而 MCP 回复既不走 DMA、也不在中断里用，只是 snprintf 写进去、再由
+ * send_ws_text_raw 拷走，放 PSRAM 没有任何限制。惰性分配，第一次用时取，之后复用。 */
+static char *s_mcp_tx_frame;
+static size_t s_mcp_tx_frame_capacity;
+
+static bool ensure_mcp_tx_frame(void)
+{
+    if (s_mcp_tx_frame != NULL)
+        return true;
+    /* 优先 PSRAM；拿不到再退回内部 RAM，那样只是没省下这块常驻内存。 */
+    s_mcp_tx_frame = heap_caps_malloc(XIAOZHI_MCP_FRAME_MAX_BYTES,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_mcp_tx_frame == NULL)
+        s_mcp_tx_frame = heap_caps_malloc(XIAOZHI_MCP_FRAME_MAX_BYTES, MALLOC_CAP_8BIT);
+    if (s_mcp_tx_frame == NULL)
+    {
+        ESP_LOGE(TAG, "MCP tx frame allocation failed (%u bytes)",
+                 (unsigned)XIAOZHI_MCP_FRAME_MAX_BYTES);
+        return false;
+    }
+    s_mcp_tx_frame_capacity = XIAOZHI_MCP_FRAME_MAX_BYTES;
+    return true;
+}
 static websocket_accumulator_t s_rx;
 
 /* The exit / timeout / fallback wording used to be cloud text wrapped in
@@ -457,6 +558,30 @@ static void notify_uplink_task(void)
 static void websocket_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static esp_err_t start_wss(bool foreground_session);
 static void opus_frame_ready(const uint8_t *opus, size_t opus_bytes, void *context);
+
+/* 心跳多久没来就认为这条连接已经不可用。ping_interval 是 10 s、pong_timeout 是
+   20 s，取 20 s 与库自己的断连阈值对齐。 */
+#define XIAOZHI_WSS_PONG_STALE_US (20LL * 1000LL * 1000LL)
+
+/* 这条 WSS 连接能不能直接接住新一轮会话。
+ *
+ * 不能只看 esp_websocket_client_is_connected()。电台把 WiFi 接收窗口占满时，TCP
+ * 还没断、websocket 库也自认 connected，但 pong 已经不来了：实测日志里最后一次
+ * pong 在 159797（此前每 10 s 一条），之后到日志结束的 37 秒里一次都没有，而唤醒
+ * 时的热连接判定照样放行——于是 listen/detect 发给了一条死连接，用户看到的就是
+ * “电台那边出问题之后连不上小智了”。
+ * 心跳陈旧就等于连接已死，必须和“根本没连上”一样走重建。 */
+static bool wss_link_usable(void)
+{
+    if (s_client == NULL || !s_hello_ready)
+        return false;
+    if (!esp_websocket_client_is_connected(s_client))
+        return false;
+    if (s_wss_last_pong_us != 0 &&
+        esp_timer_get_time() - s_wss_last_pong_us > XIAOZHI_WSS_PONG_STALE_US)
+        return false;
+    return true;
+}
 
 static void publish_ui_state(voice_ui_state_t state)
 {
@@ -616,6 +741,7 @@ static void cleanup_init_failure(void)
     s_session_task = NULL;
     s_pipeline_ready = false;
     s_initialized = false;
+    s_client_started_us = 0;
     s_client_cleanup_in_progress = false;
 }
 
@@ -911,9 +1037,25 @@ static bool send_ws_text_raw(const char *text)
     const bool connected = s_client != NULL && esp_websocket_client_is_connected(s_client);
     const bool healthy = s_wss_health != XIAOZHI_WSS_HEALTH_STALE &&
                          s_wss_health != XIAOZHI_WSS_HEALTH_FAILED;
-    const int result = connected && s_client_started && healthy
-                           ? esp_websocket_client_send_text(s_client, text, strlen(text), pdMS_TO_TICKS(500))
-                           : 0;
+    int result = 0;
+    if (connected && s_client_started && healthy)
+    {
+        const size_t text_len = strlen(text);
+        result = esp_websocket_client_send_text(s_client, text, text_len,
+                                                pdMS_TO_TICKS(XIAOZHI_WSS_TEXT_SEND_TIMEOUT_MS));
+        /* 失败后只有一种情况值得立刻再来一次：连接还在。
+         *
+         * 底层在写失败时会同步拆掉连接，那种失败重试纯属白费——错误音才是正确的收场。
+         * 但 ws-client 抢不到内部锁时返回 -1，而连接是完好的，再来一次就能成。用
+         * is_connected 把这两者分开，不盲目重试。 */
+        if (result <= 0 && s_client != NULL && esp_websocket_client_is_connected(s_client))
+        {
+            ESP_LOGW(TAG, "WSS text send failed(%d) but the link is still up; retrying once",
+                     result);
+            result = esp_websocket_client_send_text(s_client, text, text_len,
+                                                    pdMS_TO_TICKS(XIAOZHI_WSS_TEXT_SEND_TIMEOUT_MS));
+        }
+    }
     ESP_LOGI(TAG, "WSS text send: result=%d connected=%d healthy=%d session=%s turn=%u payload=%s", result,
              connected ? 1 : 0, healthy ? 1 : 0,
              s_session_id[0] != '\0' ? s_session_id : "-", (unsigned)s_turn_id,
@@ -1061,6 +1203,39 @@ static bool request_cloud_fallback_prompt(void)
     ESP_LOGI(TAG, "fallback prompt playing: turn=%u", (unsigned)s_fallback_prompt_turn_id);
     publish_ui_state(VOICE_UI_THINKING);
     return true;
+}
+
+/* 把空闲预连接的重连排进队列。
+ *
+ * 抽成独立函数是为了让“只排重连、不附带收场副作用”成为一条可选路径：正常的回合
+ * 收场走 close_channel()，它会顺带停电台、切 UI、重置音频管道；而空闲链路被对端
+ * reset 时根本没有回合可收，那些副作用一个都不该发生，只需要把连接接回来。 */
+static void schedule_idle_prewarm(bool radio_starting_after_close)
+{
+    if (!s_initialized)
+        return;
+    /* 凭据可能只是“暂时”没有：断网时 activation_service_network_lost() 会把 activated
+       清掉，网络回来之后重新注册才恢复。这一刻排不上队，但请求不能丢——丢掉的是
+       “唯一一次重连”，之后没有任何人会补，设备会一直播着电台、手里却一条 WSS 链路
+       都没有，等用户唤醒时才发现要冷启动，正撞在最坏的网络上（实测：电台在播、
+       断网 27 秒后唤醒，DNS 直接 EAI_FAIL）。
+       所以这里只拒绝“永远用不上”的情况，暂时没凭据就交给主循环的空闲不变式，
+       凭据一回来立刻补排。日志照打，免得下次再“静默丢一次”。 */
+    if (!xiaozhi_activation_service_is_activated())
+    {
+        ESP_LOGI(TAG, "WSS idle prewarm deferred: activation unavailable");
+        return;
+    }
+    /* 电台（含让位/暂停）在播期间保持热连接。radio_starting_after_close 说明电台是
+       在本次关闭之后才启动的，所以它也要算进来。 */
+    const bool prewarm_radio_on =
+        radio_starting_after_close || radio_stream_service_is_requested();
+    const int64_t prewarm_delay_us =
+        prewarm_radio_on ? XIAOZHI_PREWARM_RADIO_DELAY_US : XIAOZHI_PREWARM_IDLE_DELAY_US;
+    s_prewarm_retry_us = esp_timer_get_time() + prewarm_delay_us;
+    s_prewarm_retry_delay_us = 0; /* fresh schedule: reset the backoff ramp */
+    ESP_LOGI(TAG, "WSS idle prewarm scheduled: delay_ms=%lld radio=%d",
+             (long long)(prewarm_delay_us / 1000LL), (int)prewarm_radio_on);
 }
 
 /* play_error_tone_then_close below may close the session directly when the
@@ -1382,25 +1557,19 @@ static void consume_deferred_media_starts(void)
     }
     if (s_pending_radio_play || mcp_service_pending_radio())
     {
-        /* 必须在 clear 之前取：它指向的正是 clear 要清的那块缓冲。 */
-        char wanted_station[24];
-        strncpy(wanted_station, mcp_service_pending_radio_station(), sizeof(wanted_station) - 1U);
-        wanted_station[sizeof(wanted_station) - 1U] = '\0';
+        /* 换台和开台共用这条延迟路径：都得等应答 TTS 让出共享播放通道，
+           当场动电台只会被它静音。本地识别和云端 self.radio.next 表达的是同一个
+           意图，先拍板再清标志——clear 会把云端那份意图一并抹掉。 */
+        const bool switch_station = s_pending_radio_next || mcp_service_pending_radio_next();
         s_pending_radio_play = false;
+        s_pending_radio_next = false;
         mcp_service_clear_pending_radio();
         /* 电台是这一轮才要求的，收场时不该为它留听音窗口。 */
         s_radio_on_before_turn = false;
-        ESP_LOGI(TAG, "deferred radio start released by the idle tick");
-        esp_err_t radio_err = radio_stream_service_play_default();
-        if (wanted_station[0] != '\0')
-        {
-            radio_err = radio_stream_service_play_station_by_name(wanted_station);
-            if (radio_err == ESP_ERR_NOT_FOUND)
-            {
-                ESP_LOGW(TAG, "cloud named an unknown station; falling back to the default");
-                radio_err = radio_stream_service_play_default();
-            }
-        }
+        ESP_LOGI(TAG, "deferred radio start released by the idle tick: switch=%d",
+                 switch_station ? 1 : 0);
+        const esp_err_t radio_err = switch_station ? radio_stream_service_play_next()
+                                                   : radio_stream_service_play_default();
         if (radio_err != ESP_OK)
         {
             ESP_LOGW(TAG, "radio start failed from the idle tick: %s", esp_err_to_name(radio_err));
@@ -1428,6 +1597,10 @@ static void close_channel(bool refresh_credentials)
      * function instead of being dropped with the rest of the turn state. */
     const bool release_radio_after_close =
         s_pending_radio_play || mcp_service_pending_radio();
+    /* 这次要起的是"下一个台"还是默认台。意图必须和上面的标志一起在清零之前拍下：
+       收尾释放时才发现是换台，已经无从查起，只能放默认台——用户说"换一个台"，
+       听到的却是切回中国之声。 */
+    const bool release_radio_switch = s_pending_radio_next || mcp_service_pending_radio_next();
     /* 用户拍板：唤醒时电台就已经在播的那段对话，一旦收场就把电台一并结束，
        下次要听重新说"打开电台"。本轮自己打开的不算——启动电台时会把
        s_radio_on_before_turn 清掉，那是用户当场要听的结果，收场只归还扬声器。 */
@@ -1473,10 +1646,14 @@ static void close_channel(bool refresh_credentials)
     s_pending_cloud_tts_after_prompt = false;
     s_pending_cloud_tts_turn_id = 0U;
     s_pending_radio_play = false;
+    s_pending_radio_next = false;
     mcp_service_clear_pending_radio();
     /* 本地电台命令的屏蔽只服务本轮：下一轮从头判断云端该不该碰电台。 */
     mcp_service_set_radio_tools_blocked(false);
     s_hello_ready = false;
+    /* 这条链路到此为止：下一次 start_wss() 必须重新计时，否则上一轮的启动时刻
+       会让新 client 一建出来就被判成"握手已超时"。 */
+    s_client_started_us = 0;
     s_pending_wake = false;
     s_wait_for_turn_silence = false;
     s_post_playback_silence_deadline_us = 0;
@@ -1510,6 +1687,7 @@ static void close_channel(bool refresh_credentials)
     s_exit_tts_first_packet_deadline_us = 0;
     s_exit_tts_playback_deadline_us = 0;
     s_listen_start_sent_for_turn = false;
+    s_turn_had_speech = false;
     s_waiting_for_wake_primer = false;
     s_wake_primer_candidate_speech = false;
     s_wake_primer_deadline_us = 0;
@@ -1550,7 +1728,15 @@ static void close_channel(bool refresh_credentials)
                              (xSemaphoreTake(s_ws_tx_lock, pdMS_TO_TICKS(300)) == pdTRUE);
         if (!lock_ok)
         {
-            ESP_LOGW(TAG, "WSS close skipped: tx lock busy (uplink stuck in send_bin)");
+            /* 和 start_wss 里的 stale-client 分支同理：抢不到锁不能让 s_client 留在
+               原地。收场路径留着它，下一次 start_wss 就会用新句柄把它覆盖掉，旧的
+               client 连同 task/socket/TLS 全部泄漏；这个悬空句柄还会被后面任何一次
+               close_channel 再 stop() 一遍。交给 websocket 任务退出时自销毁：
+               非阻塞，且当场把全局句柄清干净。 */
+            (void)esp_websocket_client_destroy_on_exit(s_client);
+            s_client = NULL;
+            s_client_started = false;
+            ESP_LOGW(TAG, "WSS close handed to destroy-on-exit: tx lock busy (uplink stuck in send_bin)");
         }
         else
         {
@@ -1569,34 +1755,39 @@ static void close_channel(bool refresh_credentials)
     }
     if (refresh_credentials)
         xiaozhi_activation_service_refresh_credentials();
-    if (s_initialized && xiaozhi_activation_service_is_activated())
-    {
-        /* 电台（含让位/暂停）在播期间保持热连接。release_radio_after_close 说明
-           电台是在本次关闭之后才启动的，所以它也要算进来。 */
-        const bool prewarm_radio_on =
-            release_radio_after_close || radio_stream_service_is_requested();
-        const int64_t prewarm_delay_us =
-            prewarm_radio_on ? XIAOZHI_PREWARM_RADIO_DELAY_US : XIAOZHI_PREWARM_RETRY_US;
-        s_prewarm_retry_us = esp_timer_get_time() + prewarm_delay_us;
-        s_prewarm_retry_delay_us = 0; /* fresh schedule: reset the backoff ramp */
-        ESP_LOGI(TAG, "WSS idle prewarm scheduled: delay_ms=%lld radio=%d",
-                 (long long)(prewarm_delay_us / 1000LL), (int)prewarm_radio_on);
-    }
+    schedule_idle_prewarm(release_radio_after_close);
     /* Released last: every playback abort above would have killed a stream that
      * had been started earlier in this teardown. */
     if (release_radio_after_close)
     {
-        ESP_LOGI(TAG, "deferred radio start released after the voice chain closed");
-        if (radio_stream_service_play_default() != ESP_OK)
+        ESP_LOGI(TAG, "deferred radio start released after the voice chain closed: switch=%d",
+                 release_radio_switch ? 1 : 0);
+        const esp_err_t radio_err = release_radio_switch ? radio_stream_service_play_next()
+                                                        : radio_stream_service_play_default();
+        if (radio_err != ESP_OK)
         {
-            ESP_LOGW(TAG, "radio start failed after the voice chain closed");
+            ESP_LOGW(TAG, "radio start failed after the voice chain closed: %s",
+                     esp_err_to_name(radio_err));
         }
         (void)radio_stream_service_regain();
     }
+    /* 电台是唤醒前就在播的那一台，按既定策略收场即停——但这只对“正常收场”成立：
+       用户说完话、告别语放完，停电台是他要的结果。异常收场（写不进 WSS、错误音
+       收场）不是用户的意图，此时顺手把电台一起停掉，等于一次网络抖动同时夺走电台
+       和这次对话；实测那次唤醒失败后电台一起静了，用户得重新说一遍“打开电台”。
+       判据复用 clean_exit：它只在正常收场路径置位，异常路径不置位。 */
     else if (radio_played_through_turn)
     {
-        ESP_LOGI(TAG, "voice session over; the radio that played through it stops here");
-        (void)radio_stream_service_stop();
+        if (clean_exit)
+        {
+            ESP_LOGI(TAG, "voice session over; the radio that played through it stops here");
+            (void)radio_stream_service_stop();
+        }
+        else
+        {
+            ESP_LOGI(TAG, "voice session ended abnormally; the radio keeps playing");
+            (void)radio_stream_service_regain();
+        }
     }
     else
     {
@@ -1607,6 +1798,7 @@ static void close_channel(bool refresh_credentials)
     s_client_cleanup_in_progress = false;
     /* 这段对话结束，下一次唤醒重新判定"电台是不是已经在放"。 */
     s_radio_on_before_turn = false;
+    s_radio_requested_before_turn = false;
 }
 
 static bool send_uplink_packet(const uint8_t *opus, size_t opus_len, const char *operation)
@@ -1619,24 +1811,38 @@ static bool send_uplink_packet(const uint8_t *opus, size_t opus_len, const char 
                                   esp_websocket_client_is_connected(s_client);
     const int64_t now_us = esp_timer_get_time();
     const bool heartbeat_stale = s_wss_last_pong_us != 0 &&
-                                 now_us - s_wss_last_pong_us > 20LL * 1000LL * 1000LL;
+                                 now_us - s_wss_last_pong_us > XIAOZHI_WSS_PONG_STALE_US;
     if (heartbeat_stale)
         s_wss_health = XIAOZHI_WSS_HEALTH_STALE;
     s_last_uplink_send_connected = connected_before;
-    s_last_uplink_send_result = s_last_uplink_send_connected && s_wss_health != XIAOZHI_WSS_HEALTH_STALE && s_wss_health != XIAOZHI_WSS_HEALTH_FAILED
-                                    ? esp_websocket_client_send_bin(
-                                          s_client, (const char *)opus, (int)opus_len,
-                                          pdMS_TO_TICKS(1000))
-                                    : 0;
+    s_last_uplink_send_result = 0;
+    if (s_last_uplink_send_connected && s_wss_health != XIAOZHI_WSS_HEALTH_STALE &&
+        s_wss_health != XIAOZHI_WSS_HEALTH_FAILED)
+    {
+        s_last_uplink_send_result = esp_websocket_client_send_bin(
+            s_client, (const char *)opus, (int)opus_len,
+            pdMS_TO_TICKS(XIAOZHI_WSS_BIN_SEND_TIMEOUT_MS));
+        /* 与文本发送同一套判据：只有连接还在时才值得重来一次（见 send_ws_text_raw）。
+           音频帧本身丢一帧无所谓，但"因为一次瞬时拥塞就丢掉整轮对话"代价太大。 */
+        if (s_last_uplink_send_result <= 0 && s_client != NULL &&
+            esp_websocket_client_is_connected(s_client))
+        {
+            ESP_LOGW(TAG, "Opus uplink write failed(%d) but the link is still up; retrying once",
+                     s_last_uplink_send_result);
+            s_last_uplink_send_result = esp_websocket_client_send_bin(
+                s_client, (const char *)opus, (int)opus_len,
+                pdMS_TO_TICKS(XIAOZHI_WSS_BIN_SEND_TIMEOUT_MS));
+        }
+    }
     const bool connected_after = s_client != NULL && s_client_started &&
                                  esp_websocket_client_is_connected(s_client);
     xSemaphoreGive(s_ws_tx_lock);
-    ESP_LOGI(TAG, "Opus uplink op=%s result=%d connected_before=%d connected_after=%d health=%d state=%d turn=%u terminal_gen=%u bytes=%u timeout_ms=1000",
+    ESP_LOGI(TAG, "Opus uplink op=%s result=%d connected_before=%d connected_after=%d health=%d state=%d turn=%u terminal_gen=%u bytes=%u timeout_ms=%d",
              operation,
              s_last_uplink_send_result, connected_before ? 1 : 0, connected_after ? 1 : 0,
              s_wss_health,
              s_state, (unsigned)s_turn_id, (unsigned)s_uplink_terminal_generation,
-             (unsigned)opus_len);
+             (unsigned)opus_len, XIAOZHI_WSS_BIN_SEND_TIMEOUT_MS);
     s_uplink_tx_operation = "idle";
     if (s_last_uplink_send_result > 0)
         return true;
@@ -1796,6 +2002,7 @@ static void start_listen(bool enable_capture)
         return;
     }
     s_state = XIAOZHI_VOICE_LISTENING;
+    s_turn_had_speech = true;
     ESP_LOGI(TAG, "voice VAD: speech started; Opus uplink enabled turn=%u",
              (unsigned)s_turn_id);
     publish_ui_state(VOICE_UI_LISTENING);
@@ -1920,7 +2127,7 @@ static void begin_boot_greeting(void)
     if (s_boot_greeting_attempted)
         return;
     s_boot_greeting_attempted = true;
-    if (!s_hello_ready || s_client == NULL || !esp_websocket_client_is_connected(s_client))
+    if (!wss_link_usable())
     {
         finish_boot_greeting_failure("WSS not ready");
         return;
@@ -2100,8 +2307,20 @@ static void send_detect(bool start_current_speech)
     ESP_LOGI(TAG, "voice wake accepted; waiting for speech greeting_turn=%u",
              (unsigned)s_greeting_turn_id);
     publish_ui_state(VOICE_UI_LISTENING);
-    if (start_current_speech)
-        start_listen(true);
+    s_turn_had_speech = false;
+    /* 两种取值都必须真的传下去。旧代码写的是 `if (start_current_speech)
+       start_listen(true);`，而这条路径上的调用点传的都是 false（begin_channel 的
+       热连接分支与 prewarm 握手后的 pending_wake 分支），于是整段 if 变成空操作：
+       只发了一条 listen/detect，既没发 listen/start，也没送静音 primer，然后停在
+       WAIT_SPEECH 等 VAD。云端收不到任何上行音频，约 3 秒后主动 RST
+       （MBEDTLS_ERR_NET_CONN_RESET），收场就成了“错误音 + 停电台 + 回主页”——
+       用户要的聆听窗口一次都没开起来。
+
+       走 start_listen(false) 之后：先发 listen/start，再送 XIAOZHI_WAKE_PRIMER_FRAMES
+       帧静音把连接养住；primer 发完由 VOICE_EVENT_WAKE_PRIMER_DONE 按“primer 期间
+       有没有人开口”分派到 start_listen(true) 或 WAIT_FOLLOWUP +
+       XIAOZHI_FOLLOWUP_WINDOW_US（6.4 秒），后面才是“没听清/退出语”那条链。 */
+    start_listen(start_current_speech);
 }
 
 /* A follow-up already belongs to the established cloud session.  Sending a
@@ -2234,9 +2453,10 @@ static void enter_followup_after_playback(void)
        要一直挂到下一次 close_channel 才清，压在后面会把"开电台"那一轮截走。 */
     if (radio_stream_service_is_requested())
     {
-        if (s_radio_on_before_turn)
+        if (s_radio_requested_before_turn)
         {
-            /* 用户是打断正在播的电台进来的：先把听音窗口留满，再归还扬声器。窗口期间
+            /* 用户是打断正在播的电台进来的（说"换个台"同样是打断）：先把听音窗口
+               留满，再归还扬声器。窗口期间
                电台保持让位——也就是"停拉流、关解码"的哑状态——麦克风收到的是安静的
                房间，所以不存在旧版那种"对着麦克风放电台"的自激上行。窗口内用户直接
                开口就能接上下一轮；到期由 tick 直接归还扬声器恢复直播。 */
@@ -2288,8 +2508,7 @@ static void enter_followup_after_playback(void)
     /* Keep the established WSS/session for the next turn. A follow-up is
      * opened only when the original connection is still healthy; a dead
      * connection ends this turn instead of replaying audio on a new session. */
-    const bool wss_ready = s_client != NULL && s_hello_ready &&
-                           esp_websocket_client_is_connected(s_client);
+    const bool wss_ready = wss_link_usable();
     if (!wss_ready)
     {
         ESP_LOGW(TAG, "follow-up WSS health check failed after PCM drain; ending turn");
@@ -2391,7 +2610,7 @@ static void release_deferred_cloud_tts_on_audio(uint32_t connection_seq)
 
 static esp_err_t start_wss(bool foreground_session)
 {
-    if (s_client != NULL && s_hello_ready && esp_websocket_client_is_connected(s_client))
+    if (wss_link_usable())
     {
         if (foreground_session)
         {
@@ -2402,7 +2621,35 @@ static esp_err_t start_wss(bool foreground_session)
     }
     if (s_client != NULL && s_client_started)
     {
-        if (esp_websocket_client_is_connected(s_client))
+        /* 握手还没走完（hello 未到）时不能用心跳判定：那会儿本来就不会有 pong。
+           hello 一旦就绪就必须过这一关，否则一条已经静默死掉的连接还会被当成
+           热连接继续用。
+
+           坑在于"还没握手完"和"握手早就卡死了"在 is_connected() 上长得一模一样：
+           一条半开连接可以一直返回 true。于是每次唤醒都把它当热连接复用、每次都等
+           不到 hello——这正是"断过一次之后再怎么唤醒都失败"的一个来源。超过 hello
+           自己的超时预算还在等，就按僵死处理，强制重建。 */
+        const bool handshake_stale =
+            !s_hello_ready && s_client_started_us != 0 &&
+            esp_timer_get_time() - s_client_started_us > XIAOZHI_HELLO_TIMEOUT_US;
+        /* 未 hello 时不能再问 is_connected()：它要等 WS 握手完成（HTTP 101）才肯
+           变 true——esp_websocket_client.c 里 state 是 esp_transport_connect() 把
+           101 带回来之后才置成 CONNECTED 的。于是"正在建连"和"根本没连上"被归成
+           一类，唤醒时会把一条已经跑了几秒的连接判成 stale 拆掉重来：提前保活白
+           做，用户等的是从头再来的 DNS+TLS+upgrade。
+           实测那次唤醒中的建连，TLS 在 45371 就验完了（发起后 1.2 秒），剩下
+           4.8 秒全花在 upgrade 往返上——恰恰是这段最不该丢掉。
+           连接真的失败会由 ERROR/DISCONNECTED 事件告诉我们（回调里清句柄、置
+           FAILED），不必靠 is_connected() 猜；上面 8 秒的 handshake_stale 仍然兜住
+           "一声不吭卡住"的那种。所以未 hello 时改问"这条链路是不是本次已经 start
+           过的"：是就让它把剩下的握手走完。唤醒处理的 s_pending_wake 一直挂着，
+           hello 一到就会补发 detect（见 s_pending_wake 的消费点），用户等的只是
+           握手的剩余时间。 */
+        const bool started_link_ok =
+            !handshake_stale &&
+            (s_hello_ready ? wss_link_usable()
+                           : s_client_started);
+        if (started_link_ok)
         {
             if (foreground_session)
             {
@@ -2411,12 +2658,22 @@ static esp_err_t start_wss(bool foreground_session)
             }
             return ESP_OK;
         }
-        ESP_LOGW(TAG, "replacing stale started-but-disconnected WSS client: seq=%u",
-                 (unsigned)s_wss_connection_seq);
+        ESP_LOGW(TAG, "replacing stale started WSS client: seq=%u hello=%d handshake_stale=%d",
+                 (unsigned)s_wss_connection_seq, (int)s_hello_ready, (int)handshake_stale);
         if (s_ws_tx_lock != NULL &&
             xSemaphoreTake(s_ws_tx_lock, pdMS_TO_TICKS(300)) != pdTRUE)
         {
-            ESP_LOGW(TAG, "WSS stale-client replace skipped: tx lock busy (uplink stuck in send_bin)");
+            /* 抢不到锁说明上行任务正卡在 send_bin 里。这里绝不能让 s_client 原样留到
+               下面——紧跟着的 esp_websocket_client_init() 会直接覆盖这个句柄，旧的
+               client 连同它的 task、socket、TLS 上下文就再也没人释放了。内部 RAM
+               本来就紧，LWIP_MAX_SOCKETS 又只有 10，漏几次之后新连接一律建不起来，
+               现象正是"断连之后再怎么唤醒都失败，断电重启就没事"。
+               改成交给 websocket 任务退出时自销毁：非阻塞，且当场把全局句柄清干净，
+               不留悬空指针，与断连回调里的处理保持一致。 */
+            (void)esp_websocket_client_destroy_on_exit(s_client);
+            s_client = NULL;
+            s_client_started = false;
+            ESP_LOGW(TAG, "WSS stale client handed to destroy-on-exit: tx lock busy (uplink stuck in send_bin)");
         }
         else
         {
@@ -2428,9 +2685,12 @@ static esp_err_t start_wss(bool foreground_session)
             s_client = NULL;
             if (s_ws_tx_lock != NULL)
                 xSemaphoreGive(s_ws_tx_lock);
-            s_hello_ready = false;
-            s_session_id[0] = '\0';
         }
+        /* 两条分支都要走到这里：销毁没做成的时候更不能把"旧链路已就绪"留在状态里，
+           否则下面新建的 client 会带着上一轮的 hello/session 判定跑。 */
+        s_hello_ready = false;
+        s_client_started_us = 0;
+        s_session_id[0] = '\0';
     }
     if (s_client != NULL)
         close_channel(false);
@@ -2455,7 +2715,7 @@ static esp_err_t start_wss(bool foreground_session)
         .buffer_size = 1024,
         .reconnect_timeout_ms = 2000,
         .network_timeout_ms = 5000,
-        .ping_interval_sec = 10,
+        .ping_interval_sec = XIAOZHI_WSS_PING_INTERVAL_SEC,
         /* 40 而不是 20。实测日志 89256：上行推到一半连接被判死，
            uplink failure context 里 last_pong_age_us=15022881——最后一次 PONG
            已经过去 15 秒。ping_interval 是 10 秒，也就是说连续两拍没等到回应。
@@ -2463,7 +2723,7 @@ static esp_err_t start_wss(bool foreground_session)
            网络都在抢，回包更慢。20 秒的超时会把“只是慢”误判成“已经死了”：
            断开 → 本轮上行失败 → 播故障音收场，用户看到的就是“报错闪退”。
            心跳超时不等于连接不可用，宁可多等一拍也别把正在说话的一轮砍掉。 */
-        .pingpong_timeout_sec = 40,
+        .pingpong_timeout_sec = XIAOZHI_WSS_PONGPONG_TIMEOUT_SEC,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     ++s_wss_connection_seq;
@@ -2535,6 +2795,9 @@ static esp_err_t start_wss(bool foreground_session)
         return ESP_FAIL;
     }
     s_client_started = true;
+    /* 从这里开始计时：hello 若在 XIAOZHI_HELLO_TIMEOUT_US 内还没到，这条连接就会
+       被判成"握手僵死"，下一次 start_wss() 强制重建，而不是一直复用等不到 hello。 */
+    s_client_started_us = esp_timer_get_time();
     s_prewarm_retry_delay_us = 0;
     return ESP_OK;
 }
@@ -2597,7 +2860,7 @@ static void begin_channel(void)
     s_wait_for_turn_silence = true;
     s_followup_deadline_us = 0;
     publish_ui_state(VOICE_UI_CONNECTING);
-    if (s_client != NULL && s_hello_ready && esp_websocket_client_is_connected(s_client))
+    if (wss_link_usable())
     {
         send_detect(false);
         s_pending_wake = false;
@@ -2686,20 +2949,24 @@ static void process_text(const uint8_t *data, size_t data_len)
                     ESP_LOGI(TAG, "countdown start deferred until cloud TTS completion: turn=%u",
                              (unsigned)s_waiting_turn_id);
                 }
-                /* The cloud's response is the standalone spoken answer.  The
-                 * local prompt below is only a transient acknowledgment; a
-                 * radio command still starts after that response drains. */
-                if (result == VOICE_IOT_COMMAND_RADIO_PLAY)
-                {
-                    s_pending_radio_play = true;
-                }
                 /* 本地刚动过电台：这一轮云端的电台工具一律让路。日志里"关闭电台"
                    被云端 ASR 截成"电台。"，同一个模型据此调 self.radio.play，
-                   把刚停掉的电台重新拉起来。 */
+                   把刚停掉的电台重新拉起来。换台同理——本地已经切过去了，云端
+                   再调一次 play 只会把它拉回默认台，调 next 则是多切一格。 */
                 if (result == VOICE_IOT_COMMAND_RADIO_PLAY ||
+                    result == VOICE_IOT_COMMAND_RADIO_NEXT ||
                     result == VOICE_IOT_COMMAND_RADIO_HANDLED)
                 {
                     mcp_service_set_radio_tools_blocked(true);
+                    /* The cloud's response is the standalone spoken answer.  The
+                     * local prompt below is only a transient acknowledgment; a
+                     * start or a switch still happens after that response drains.
+                     * 换一个台只是"起流时从哪一格开始"不同，走同一条延迟路径。 */
+                    if (result != VOICE_IOT_COMMAND_RADIO_HANDLED)
+                    {
+                        s_pending_radio_play = true;
+                        s_pending_radio_next = (result == VOICE_IOT_COMMAND_RADIO_NEXT);
+                    }
                 }
                 /* Immediate "正在执行" confirmation before the cloud ack. */
                 extern const uint8_t prompt_executing_pcm_start[] asm(
@@ -2984,12 +3251,12 @@ static void process_text(const uint8_t *data, size_t data_len)
          * tools we answer, so this branch is what makes "提高音量" work. */
         const cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
         const char *reply = mcp_service_handle(payload);
-        if (reply != NULL)
+        if (reply != NULL && ensure_mcp_tx_frame())
         {
-            const int written = snprintf(s_mcp_tx_frame, sizeof(s_mcp_tx_frame),
+            const int written = snprintf(s_mcp_tx_frame, s_mcp_tx_frame_capacity,
                                          "{\"session_id\":\"%s\",\"type\":\"mcp\",\"payload\":%s}",
                                          s_session_id[0] != '\0' ? s_session_id : "-", reply);
-            if (written > 0 && (size_t)written < sizeof(s_mcp_tx_frame))
+            if (written > 0 && (size_t)written < s_mcp_tx_frame_capacity)
             {
                 if (!send_ws_text_raw(s_mcp_tx_frame))
                 {
@@ -3309,6 +3576,9 @@ static void handle_event(voice_event_t *event)
            时刻唤醒的对话答完立刻把扬声器交回去。is_requested 在电台刚启动(还在
            CONNECTING)时同样为真，覆盖更完整；用户暂停过电台时它为假，走普通窗口。 */
         s_radio_on_before_turn = radio_stream_service_is_requested();
+        /* 同一时刻留一份不会被改写的副本：这段对话后面无论是启动电台还是换台，
+           都拿它判断"本轮到底是不是打断电台进来的"。 */
+        s_radio_requested_before_turn = s_radio_on_before_turn;
         (void)radio_stream_service_yield();
         if (s_state == XIAOZHI_VOICE_WAIT_HELLO)
             s_pending_wake = true;
@@ -3419,7 +3689,10 @@ static void handle_event(voice_event_t *event)
             finish_listen_with_tail_flush();
         break;
     case VOICE_EVENT_CAPTURE_FINISHED:
-        if (event->value >= XIAOZHI_CAPTURE_LOW_LEVEL_RMS)
+        /* 平均值和峰值任一达标都算“用户开了口”。只看平均值会把轻声说话误判成
+           没说话（实测 rms=169 / peak=2867 那一轮说的正是“打开电台”）。 */
+        if (event->value >= XIAOZHI_CAPTURE_LOW_LEVEL_RMS ||
+            event->detail >= XIAOZHI_CAPTURE_LOW_LEVEL_PEAK)
             break;
         if (s_state != XIAOZHI_VOICE_STOPPING && s_state != XIAOZHI_VOICE_WAIT_RESPONSE)
         {
@@ -3470,8 +3743,32 @@ static void handle_event(voice_event_t *event)
         if (s_client == NULL && !s_session_active && !s_hello_ready &&
             s_state == XIAOZHI_VOICE_WAIT_WAKE)
         {
-            ESP_LOGI(TAG, "duplicate WSS disconnect ignored: seq=%u idle already",
+            /* 这四个条件成立有两种来源，必须分开对待：
+             *
+             * 1) 连接已经收过场、重连也已排队 —— websocket 回调在投递本事件之前
+             *    就清空了 s_client/s_hello_ready（见回调里的 destroy_on_exit 分支），
+             *    所以“s_client == NULL”并不等于“没有连接断掉”。这种重复回调再调度
+             *    一次只会把退避计时往后推，忽略是对的。
+             * 2) 空闲预连接被服务端 reset —— 同样满足这四个条件，但这是唯一一次断开，
+             *    没有任何人负责重连。
+             *
+             * 原来的代码把 2) 和 1) 一起 break 掉了，代价是致命的：close_channel()
+             * 是唯一会置 s_prewarm_retry_us 的地方，跳过它等于永不再连。实测 125577
+             * 链路被 reset（errno=104）之后 WSS 静默 21.5 秒，直到用户唤醒才被迫重建，
+             * 而那次重建正撞在电台占着资源上、largest 只剩 1984 B。
+             *
+             * 用“是否已经有重连在排队”区分这两者，并且只排重连、不调 close_channel：
+             * 空闲状态没有回合需要收场，那套副作用（停电台、切 UI、重置音频管道）一个
+             * 都不应该发生。 */
+            if (s_prewarm_retry_us != 0)
+            {
+                ESP_LOGI(TAG, "duplicate WSS disconnect ignored: seq=%u prewarm already queued",
+                         (unsigned)event->value);
+                break;
+            }
+            ESP_LOGW(TAG, "idle WSS link lost with no prewarm queued; scheduling a reconnect (seq=%u)",
                      (unsigned)event->value);
+            schedule_idle_prewarm(false);
             break;
         }
         if (s_state == XIAOZHI_VOICE_ERROR_TONE)
@@ -3642,27 +3939,18 @@ static void handle_event(voice_event_t *event)
         }
         if (s_pending_radio_play || mcp_service_pending_radio())
         {
-            /* 必须在 clear 之前取：它指向的正是 clear 要清的那块缓冲。 */
-            char wanted_station[24];
-            strncpy(wanted_station, mcp_service_pending_radio_station(), sizeof(wanted_station) - 1U);
-            wanted_station[sizeof(wanted_station) - 1U] = '\0';
+            /* 先拍板再清标志，理由同上面的 idle tick：clear 会把云端那份
+               "要换一个台"的意图一起抹掉。 */
+            const bool switch_station = s_pending_radio_next || mcp_service_pending_radio_next();
             s_pending_radio_play = false;
+            s_pending_radio_next = false;
             mcp_service_clear_pending_radio();
             /* 电台是这一轮才要求的，收场时不该为它留听音窗口。 */
             s_radio_on_before_turn = false;
-            ESP_LOGI(TAG, "radio acknowledgement finished; starting radio stream");
-            /* 云端点名的频道走包含匹配（ASR 变体的容错在 radio 侧做）。名字对不上就
-               退回默认台：宁可放中国之声，也不能让这一轮变得没声音。 */
-            esp_err_t radio_err = radio_stream_service_play_default();
-            if (wanted_station[0] != '\0')
-            {
-                radio_err = radio_stream_service_play_station_by_name(wanted_station);
-                if (radio_err == ESP_ERR_NOT_FOUND)
-                {
-                    ESP_LOGW(TAG, "cloud named an unknown station; falling back to the default");
-                    radio_err = radio_stream_service_play_default();
-                }
-            }
+            ESP_LOGI(TAG, "radio acknowledgement finished; starting radio stream: switch=%d",
+                     switch_station ? 1 : 0);
+            const esp_err_t radio_err = switch_station ? radio_stream_service_play_next()
+                                                       : radio_stream_service_play_default();
             if (radio_err != ESP_OK)
             {
                 ESP_LOGW(TAG, "radio start failed after acknowledgement: %s",
@@ -3815,13 +4103,18 @@ static void voice_session_task(void *arg)
                 publish_ui_state(VOICE_UI_IDLE);
                 if (s_client == NULL && xiaozhi_activation_service_is_activated())
                 {
-                    /* 电台在播时立刻保温；其余场景沿用 5 秒，避免刚关掉会话就立刻
-                       重连去和用户的追问抢 core 1。 */
+                    /* 这里必须和 schedule_idle_prewarm() 用同一个延迟语义，否则 UI
+                       一回到待机就会把刚排好的那次重连覆盖回旧值——前面缩短它等于
+                       白做。电台在播时用户打断得更频繁，单独给 300 ms。
+                       原来这里写的是"其余场景沿用 5 秒，避免刚关掉会话就立刻重连去
+                       和用户的追问抢 core 1"，那个顾虑被实测推翻了：不把链路提前
+                       建好，用户追问时只能现做 DNS+TLS（实测建连到 hello 要 6 秒），
+                       而提前建好之后唤醒可以直接复用（哪怕还在等 hello）。 */
                     const bool prewarm_radio_on = radio_stream_service_is_requested();
                     s_prewarm_retry_delay_us = 0; /* fresh schedule: reset the backoff ramp */
                     s_prewarm_retry_us = esp_timer_get_time() +
                                          (prewarm_radio_on ? XIAOZHI_PREWARM_RADIO_DELAY_US
-                                                           : XIAOZHI_PREWARM_RETRY_US);
+                                                           : XIAOZHI_PREWARM_IDLE_DELAY_US);
                 }
             }
         }
@@ -3968,15 +4261,11 @@ static void voice_session_task(void *arg)
             esp_timer_get_time() >= s_followup_deadline_us)
         {
             s_followup_deadline_us = 0;
-            /* 电台还等着这次窗口：不请求"拜拜"、不再占用扬声器，直接把直播接回来。
-               用户打断电台只是想问一句，收场时再补一句告别反而多余。 */
-            if (s_radio_on_before_turn && radio_stream_service_is_requested())
-            {
-                ESP_LOGI(TAG, "电台让位窗口到期；直接归还扬声器恢复直播");
-                s_session_exit_clean = true;
-                close_channel(false);
-            }
-            else if (s_boot_greeting_question)
+            /* 收场一律走完整链条，不按“本轮有没有开过口”分叉。用户明确要求：主动
+               唤醒小智对话时，无论如何都要有本地询问和第二轮聆听窗口；谁都不许直接
+               把扬声器交回去。电台的收场交给 close_channel() 的
+               radio_played_through_turn 分支：走完退出语再停电台、回主页面。 */
+            if (s_boot_greeting_question)
             {
                 /* 开机问候后的那段聆听窗口没等到人接话：跳过“我没听清”那句重试提示音，
                    直接走告别语收场。
@@ -3998,7 +4287,8 @@ static void voice_session_task(void *arg)
                    XIAOZHI_FOLLOWUP_WINDOW_US 的窗口，这里不需要手工 arm，也不该
                    走 exit 分支——exit 分支会在播完后直接 close_channel。 */
                 s_followup_retry_used = true;
-                ESP_LOGI(TAG, "follow-up window silent; playing the retry prompt and re-arming once");
+                ESP_LOGI(TAG, "follow-up window silent（本轮%s）；播本地询问并再开一轮窗口",
+                         s_turn_had_speech ? "开过口" : "没开过口");
                 if (!request_cloud_timeout_prompt())
                     play_error_tone_then_close(false);
             }
@@ -4058,6 +4348,19 @@ static void voice_session_task(void *arg)
             s_prewarm_retry_us = 0;
             prewarm_wss();
         }
+        /* 空闲预连接是**常驻不变式**，不是一次性事件：只要还闲着、手上没有连接、
+           凭据也在，就一定有一次预连接排在队里。
+           上面那次“到期就发”只认已经排上的队列，而断网会把凭据清掉、让
+           schedule_idle_prewarm() 排不上（它只能推迟到凭据回来）。没有这一条，
+           那一次被推迟的重连就再没人补：设备会一直播着电台、链路一直没人建。
+           只在 s_prewarm_retry_us == 0 时补，所以不会踩掉 prewarm_wss() 失败时
+           设的退避（那个分支会把 s_prewarm_retry_us 设成非零）。 */
+        if (s_prewarm_retry_us == 0 && s_client == NULL && !s_session_active &&
+            s_state == XIAOZHI_VOICE_WAIT_WAKE && s_ui_idle_deadline_us == 0 &&
+            xiaozhi_activation_service_is_activated())
+        {
+            schedule_idle_prewarm(false);
+        }
         /* Timer service tick: alarm expiry, countdown progress, ring heartbeat. */
         if (esp_timer_get_time() - s_last_timer_tick_us >= 1000000LL)
         {
@@ -4093,6 +4396,27 @@ static bool uplink_operation_equal(const char *left, const char *right)
     if (left == right) return true;
     if (left == NULL || right == NULL) return false;
     return strcmp(left, right) == 0;
+}
+
+/* esp_websocket_client 投递事件时用的是**未清零的栈上局部变量**
+ * （esp_websocket_client.c:217 `esp_websocket_event_data_t event_data;`），
+ * 而 error_handle 里那四个 tls/socket 字段只在 error_type == TCP_TRANSPORT 时
+ * 才被赋值（同文件 229-236 行），其余情况原封不动带着上一次调用留在栈上的内容
+ * 发出来。实测就是一对固定的大数：tls_stack=1011054384、tls_flags=1011054352、
+ * sock_errno=1008919604 —— 它们看着像真错误码，其实是指针残渣，足够把下一次
+ * 排查引向一个根本不存在的 TLS/socket 故障。
+ *
+ * error_type 自己每次都被赋值（同文件 237 行），可信；依赖它的那几个字段必须先
+ * 过这道关。归一成 0 是准确的说法：非 TCP_TRANSPORT 的失败本来就没有 tls/socket
+ * 错误码可报。 */
+static void sanitize_wss_error_codes(esp_websocket_error_codes_t *codes)
+{
+    if (codes->error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT)
+        return;
+    codes->esp_tls_last_esp_err = 0;
+    codes->esp_tls_stack_err = 0;
+    codes->esp_tls_cert_verify_flags = 0;
+    codes->esp_transport_sock_errno = 0;
 }
 
 static void websocket_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -4137,8 +4461,9 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
         s_wss_last_pong_us = 0;
         s_wss_last_rx_us = s_wss_last_connected_us;
         s_wss_health = XIAOZHI_WSS_HEALTH_HEALTHY;
-        ESP_LOGI(TAG, "WSS heartbeat connected: seq=%u ping_interval_sec=10 pong_timeout_sec=20",
-                 (unsigned)connection_seq);
+        ESP_LOGI(TAG, "WSS heartbeat connected: seq=%u ping_interval_sec=%d pong_timeout_sec=%d",
+                 (unsigned)connection_seq, XIAOZHI_WSS_PING_INTERVAL_SEC,
+                 XIAOZHI_WSS_PONGPONG_TIMEOUT_SEC);
         log_wss_wifi_state();
         post_event_value(VOICE_EVENT_WSS_CONNECTED, connection_seq);
     }
@@ -4157,19 +4482,24 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
         const esp_websocket_event_data_t *data = (const esp_websocket_event_data_t *)event_data;
         if (data != NULL)
         {
-            s_wss_last_error = data->error_handle;
+            /* 先过净化：error_type 不是 TCP_TRANSPORT 时，后面那几个字段是栈残渣
+               （见 sanitize_wss_error_codes），存下来和打出来都会误导排障。 */
+            esp_websocket_error_codes_t codes = data->error_handle;
+            sanitize_wss_error_codes(&codes);
+            s_wss_last_error = codes;
             s_wss_last_close_code = data->close_status_code;
             ESP_LOGW(TAG, "WSS transport diagnostics: error_type=%d tls_esp=%d tls_stack=%d tls_flags=%d handshake=%d sock_errno=%d close_code=%d",
-                     data->error_handle.error_type,
-                     (int)data->error_handle.esp_tls_last_esp_err,
-                     data->error_handle.esp_tls_stack_err,
-                     data->error_handle.esp_tls_cert_verify_flags,
-                     data->error_handle.esp_ws_handshake_status_code,
-                     data->error_handle.esp_transport_sock_errno,
+                     codes.error_type,
+                     (int)codes.esp_tls_last_esp_err,
+                     codes.esp_tls_stack_err,
+                     codes.esp_tls_cert_verify_flags,
+                     codes.esp_ws_handshake_status_code,
+                     codes.esp_transport_sock_errno,
                      data->close_status_code);
             if (data->error_handle.error_type == WEBSOCKET_ERROR_TYPE_PONG_TIMEOUT)
             {
-                ESP_LOGW(TAG, "WSS heartbeat timeout: no PONG within 20 seconds");
+                ESP_LOGW(TAG, "WSS heartbeat timeout: no PONG within %d seconds",
+                         XIAOZHI_WSS_PONGPONG_TIMEOUT_SEC);
             }
             log_wss_wifi_state();
         }

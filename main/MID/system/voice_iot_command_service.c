@@ -352,6 +352,13 @@ voice_iot_command_result_t voice_iot_command_service_execute(
     static const char *const radio_play_phrases[] = {
         "放电台", "播放电台", "打开电台", "开电台", "打开一下电台", "开一下电台",
     };
+    /* “换一个台”类：四个频道里循环，用户不用记台名。长形式必须单列——
+       “换一个台”里并没有连续的“换台”两个字，只收短形式会把它漏掉。 */
+    static const char *const radio_next_phrases[] = {
+        "换一个台", "换一个电台", "换个台", "换个电台", "换台", "换电台",
+        "换个频道", "换频道", "下一个台", "下一个电台", "下一台",
+        "切换电台", "切换台", "切台",
+    };
     static const char *const radio_pause_phrases[] = {"暂停电台", "暂停播放"};
     /* 只收“截断形”和完整词，不设“电台关”这类宽前缀：它会误伤
        “把电台关小点”这种还没说完的调音量话。 */
@@ -437,6 +444,7 @@ voice_iot_command_result_t voice_iot_command_service_execute(
         contains_any(transcript, query_stopwatch_phrases, sizeof(query_stopwatch_phrases) / sizeof(query_stopwatch_phrases[0]));
     const bool radio_requested =
         contains_any(transcript, radio_play_phrases, sizeof(radio_play_phrases) / sizeof(radio_play_phrases[0])) ||
+        contains_any(transcript, radio_next_phrases, sizeof(radio_next_phrases) / sizeof(radio_next_phrases[0])) ||
         contains_any(transcript, radio_pause_phrases, sizeof(radio_pause_phrases) / sizeof(radio_pause_phrases[0])) ||
         contains_any(transcript, radio_stop_phrases, sizeof(radio_stop_phrases) / sizeof(radio_stop_phrases[0]));
     /* Silencing a ringing timer stays local whatever the cloud offers: the
@@ -494,6 +502,14 @@ voice_iot_command_result_t voice_iot_command_service_execute(
                                &target)) {
             return apply_local_volume(transcript, target);
         }
+    }
+    /* 换台判在开台前面：两张短语表没有交集，先后不影响结果，但换台更具体，
+       放前面读起来更清楚。 */
+    if (contains_any(transcript, radio_next_phrases, sizeof(radio_next_phrases) / sizeof(radio_next_phrases[0]))) {
+        /* 和开台共用同一条延迟路径，理由也一样：那段应答 TTS 占着共享播放
+         * 通道，当场切过去只会被它静音，用户听到的是"换了但没声"。 */
+        set_announce(announce, announce_size, "好的，正在为你换台");
+        return VOICE_IOT_COMMAND_RADIO_NEXT;
     }
     if (contains_any(transcript, radio_play_phrases, sizeof(radio_play_phrases) / sizeof(radio_play_phrases[0]))) {
         /* Acknowledge through the cloud reply, then start the stream after it

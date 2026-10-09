@@ -25,15 +25,27 @@ $sendDetect = $voice.IndexOf('static void send_detect(bool start_current_speech)
 $startWss = $voice.IndexOf('static esp_err_t start_wss', $sendDetect)
 $sendDetectBlock = $voice.Substring($sendDetect, $startWss - $sendDetect)
 if ($sendDetectBlock -notmatch 'static void send_detect\(bool start_current_speech\)' -or
-    $sendDetectBlock -notmatch 'if \(start_current_speech\) start_listen\(true\);') {
-    throw 'The detect helper must explicitly distinguish a wake-word tail from an already-validated follow-up question.'
+    $sendDetectBlock -notmatch 'start_listen\(start_current_speech\);') {
+    throw 'The detect helper must forward the wake-word tail decision to start_listen: a wake turn still needs listen/start plus the silence primer, not a bare WAIT_SPEECH wait.'
+}
+# 旧写法 `if (start_current_speech) start_listen(true);` 会在唤醒路径（传 false）上
+# 什么都不做：只发了一条 listen/detect，既没发 listen/start，也没送静音 primer，设备停在
+# WAIT_SPEECH 等 VAD；云端收不到任何上行音频，约 3 秒后主动 RST，收场变成“错误音 +
+# 停电台 + 回主页”，6.4 秒聆听窗口一次都没开起来。
+if ($sendDetectBlock -match '(?m)^\s*if \(start_current_speech\)\s*start_listen\(true\);') {
+    throw 'send_detect must not silently drop the wake path: gating start_listen on start_current_speech leaves the wake turn with neither listen/start nor the primer.'
 }
 if ($sendDetectBlock -match 'if \(s_vad_speech\) start_listen\(\);') {
     throw 'send_detect must not infer that every VAD-active input is a question.'
 }
 
-$followupStart = $voice.IndexOf('if (s_state == XIAOZHI_VOICE_WAIT_FOLLOWUP)')
-$followupEnd = $voice.IndexOf('} else if (s_state == XIAOZHI_VOICE_WAIT_SPEECH', $followupStart)
+$followupStart = $voice.IndexOf('else if (s_state == XIAOZHI_VOICE_WAIT_FOLLOWUP)')
+# 锚点必须是实际存在的文本：源码里这两个分支是“}\n        else if …”，中间没有
+# “} else if …”，旧锚点永远 IndexOf 不到（返回 -1），Substring 直接抛异常。
+$followupEnd = $voice.IndexOf('else if (s_state == XIAOZHI_VOICE_WAIT_SPEECH', $followupStart)
+if ($followupStart -lt 0 -or $followupEnd -lt 0) {
+    throw 'The follow-up VAD start branch boundaries are missing.'
+}
 $followupBlock = $voice.Substring($followupStart, $followupEnd - $followupStart)
 if ($followupBlock -match 'send_detect\(' -or
     $followupBlock -notmatch 'start_followup_listen\(\);') {

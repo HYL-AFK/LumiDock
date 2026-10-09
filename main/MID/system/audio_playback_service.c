@@ -463,3 +463,18 @@ void audio_playback_service_abort(audio_playback_source_t source, uint32_t epoch
     if (aborted_current) mute_output_serialized();
     if (s_playout.task != NULL) xTaskNotifyGive(s_playout.task);
 }
+
+uint32_t audio_playback_service_pending_frames(audio_playback_source_t source, uint32_t epoch)
+{
+    if (s_playout.frames == NULL || s_playout.lock == NULL) return 0U;
+    uint32_t pending = 0U;
+    xSemaphoreTake(s_playout.lock, portMAX_DELAY);
+    /* 拿 lock 只是为了把“会话还是不是它”和“水位是多少”读成一致的一拍。播放任务
+       自己也是在同一个 lock 下读这个队列长度的（日志那行），不持 io_lock，所以
+       这里不会和它对上锁序。 */
+    if (s_playout.active && s_playout.source == source && s_playout.epoch == epoch) {
+        pending = (uint32_t)uxQueueMessagesWaiting(s_playout.frames);
+    }
+    xSemaphoreGive(s_playout.lock);
+    return pending;
+}

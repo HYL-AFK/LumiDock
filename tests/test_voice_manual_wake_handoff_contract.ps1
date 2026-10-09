@@ -2,8 +2,10 @@ $ErrorActionPreference = 'Stop'
 
 $voice = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\MID\voice\xiaozhi_voice_service.c"
 
-$ttsStart = $voice.IndexOf('if (greeting_turn) {')
-$ttsEnd = $voice.IndexOf('if (boot_greeting_turn) {', $ttsStart)
+# 锚点必须跟着实现走：TTS 分支早已不再用 `if (greeting_turn) {` / `if (boot_greeting_turn) {`
+# 这两个块（改为 guard 变量），旧锚点 IndexOf 返回 -1，直接抛 IndexOutOfRange。
+$ttsStart = $voice.IndexOf('strcmp(state->valuestring, "start") == 0')
+$ttsEnd = $voice.IndexOf('strcmp(state->valuestring, "stop") == 0', $ttsStart)
 if ($ttsStart -lt 0 -or $ttsEnd -lt 0) {
     throw 'Manual wake greeting TTS handoff boundaries are missing.'
 }

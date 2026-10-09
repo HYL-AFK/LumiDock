@@ -6,7 +6,7 @@ $driver = Get-Content -Raw -LiteralPath "$PSScriptRoot\..\main\Dri\i2s_audio_dri
 if ($voice -notmatch 'if \(response_turn\)\s*\{\s*s_boot_greeting_reply_deadline_us\s*=\s*0') {
     throw 'A cloud response must suspend the boot greeting deadline while TTS is being generated.'
 }
-if ($voice -notmatch '(?s)if \(boot_greeting_window_active\) \{\s*s_boot_greeting_reply_deadline_us\s*=\s*esp_timer_get_time\(\) \+\s*XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US') {
+if ($voice -notmatch '(?s)if \(boot_greeting_window_active\)\s*\{\s*s_boot_greeting_reply_deadline_us\s*=\s*esp_timer_get_time\(\) \+\s*XIAOZHI_BOOT_GREETING_REPLY_WINDOW_US') {
     throw 'The boot greeting reply window must be re-armed after each response playback drain.'
 }
 if ($voice -notmatch 's_boot_greeting_reply_deadline_us\s*=\s*0;\s*s_state\s*=\s*XIAOZHI_VOICE_WAIT_SPEECH;\s*start_listen\(true\)') {

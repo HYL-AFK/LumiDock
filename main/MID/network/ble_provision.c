@@ -80,6 +80,32 @@ static void blufi_start_advertising(void);
 static void blufi_start_wifi_scan(void);
 static void blufi_apply_pending_sta_config(void);
 
+/* 这里曾经有一个「窗口到期后把 BLE 栈拆掉、把内部 RAM 还给 WiFi」的实现
+ * （esp_blufi_profile_deinit + nimble_port_stop + nimble_port_deinit，并在
+ * ble_provision_open_window 里重新 blufi_stack_init）。已经删除，不要加回来。
+ *
+ * 原因：ESP32-S3 上没有定义 SOC_ESP_NIMBLE_CONTROLLER，所以 esp_nimble_init()
+ * 是一次不折不扣的全量 host 初始化——里面 npl_freertos_mempool_init() 会执行
+ * os_mempool_init(&ble_freertos_ev_pool, 10, ...)，而 ev 池总共只有 10 个块。
+ *
+ * 于是只要在 host 任务还活着的时候再跑一次 esp_nimble_init()，就是拿
+ * os_mempool_init 去重排一个正在被 os_memblock_get 使用的链表：
+ *   os_mempool_init     : mp_num_free = blocks        (os_mempool.c:150)
+ *     ← 这里是抢占窗口 →
+ *   os_memblock_get     : 读到 mp_num_free > 0，但 SLIST_FIRST(mp) 还是被抽干后的
+ *                         NULL → SLIST_NEXT(NULL) → LoadProhibited
+ * 实机表现：开机约 1.7 秒必 panic 并无限重启，栈是
+ *   ble_hs_event_start_stage2 → ble_hs_start → npl_freertos_callout_init
+ *   → npl_freertos_event_init → os_memblock_get (os_mempool.c:359)，EXCVADDR=0。
+ *
+ * 触发路径就在 ble_provision_init() 内部：它先把窗口定时器建好、之后才调用
+ * blufi_stack_init()、最后才置位 s_stack_started；这段窗口里 network_coordinator_task
+ * 上的并发调用者（NETWORK_EVENT_OPEN_BLUFI / wifi_status_changed）一进
+ * ble_provision_open_window()，就会看到 s_stack_started 仍为假而第二次拉栈。
+ *
+ * 结论：BLE 栈全进程只允许被 ble_provision_init() 拉起一次；栈不在了就只能重启后
+ * 再配网，不能在本进程内重建。 */
+
 static void ble_window_expire(void)
 {
     if (!s_window_active) return;
@@ -232,6 +258,15 @@ static void blufi_start_advertising(void)
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    /* 清零后的 itvl_min/itvl_max 是 0，NimBLE 会按 conn_mode 填默认档：UND 落在
+       ble_gap_adv_dflt_itvls() 的 FAST_INTERVAL1，也就是 30~60 ms 一次，约每 45 ms
+       就要占一回射频，而开机换网窗口正好 60 s，恰好盖住了开机后语音会话最集中的
+       那一段。蓝牙每广播一次，WiFi 都要在共存调度里排队让路；实测三次“WSS 上行
+       写不出去”全部落在这 60 s 内，窗口结束后同样时长、同样码率的语音会话一次
+       都没复现过。改成 1000~2000 ms 后射频占用从约 2% 降到 0.07%，手机扫描最多
+       多等两秒就能看到设备，代价远低于一次唤醒对话被打断。 */
+    adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(1000);
+    adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(2000);
     int64_t remaining_ms = (s_window_deadline_us - esp_timer_get_time()) / 1000;
     if (remaining_ms <= 0) {
         ble_window_expire();
@@ -815,6 +850,20 @@ esp_err_t ble_provision_open_window(void)
     (void)xTimerStop(s_window_timer, 0);
     if (xTimerStart(s_window_timer, 0) != pdPASS) return ESP_FAIL;
     (void)runtime_event_log_append(RUNTIME_EVENT_BLE_WINDOW_OPEN, 0, 0, 0);
+    /* 本函数只负责窗口本身（定时器 + 广播），绝不允许拉起 BLE 栈——栈的启动唯一
+       归属 ble_provision_init()，且全进程只能做一次。
+
+       开机时本函数会被并发调用（network_coordinator_task 上的
+       NETWORK_EVENT_OPEN_BLUFI / wifi_status_changed，与主任务上的
+       ble_provision_init 并行），而那时 ble_provision_init 已经把窗口定时器建好、
+       却还没跑到 blufi_stack_init()。若在这里补一次拉栈，就是第二次
+       esp_nimble_init()：它会把 10 个块的 ble_freertos_ev_pool 就地重排，
+       正在跑 nimble_port_run() 的 host 任务立刻 os_mempool.c:359 空指针 panic
+       （开机 1.7 秒无限重启，详见上面 blufi_stack_release 处的说明）。
+
+       这里直接返回是安全的：窗口状态和定时器上面已经设好，
+       blufi_event_callback(ESP_BLUFI_EVENT_INIT_FINISH) 看到 s_window_requested
+       会带着同一个窗口再进来一次，那时 s_ready 为真，自然走到下面的开广播。 */
     if (s_ready && !s_connected) {
         if (s_advertising) (void)esp_blufi_adv_stop();
         s_advertising = false;

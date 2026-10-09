@@ -77,7 +77,10 @@ if ($sessionTask -notmatch 's_exit_prompt_retried\s*=\s*true;[\s\S]*?retried\s*=
 if ($sessionTask -notmatch 's_timeout_prompt_retried\s*=\s*true;[\s\S]*?retried\s*=\s*request_cloud_timeout_prompt\(\);') {
     throw 'A timed-out timeout prompt must be retried once via request_cloud_timeout_prompt.'
 }
-if ($sessionTask -notmatch 'if \(!retried\) \{[\s\S]*?play_error_tone_then_close\(true\);') {
+# 锁的是"重试用尽之后要用本地错误音收场，而不是弹回主页面"，不是大括号摆在哪一行。
+# 原断言要求 `if (!retried) {` 必须同一行，源码换成换行写法之后它就永久变红——红线
+# 一旦长期存在，真正的回归就再也看不见了。
+if ($sessionTask -notmatch 'if \(!retried\)\s*\{[\s\S]*?play_error_tone_then_close\(true\);') {
     throw 'A prompt timeout that cannot be retried must answer with the local error tone instead of bouncing back to the main page.'
 }
 if ($voice -notmatch 'static bool s_exit_prompt_retried;[\s\S]*?static bool s_timeout_prompt_retried;[\s\S]*?static bool s_fallback_prompt_retried;') {

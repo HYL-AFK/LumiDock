@@ -18,7 +18,8 @@ foreach ($config in @($defaults, $sdkconfig)) {
     }
     if ($config -notmatch '(?m)^CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3\s*$' -or
         $config -notmatch '(?m)^CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6\s*$' -or
-        $config -notmatch '(?m)^CONFIG_ESP_WIFI_RX_BA_WIN=3\s*$' -or
+        $config -notmatch '(?m)^CONFIG_ESP_WIFI_RX_BA_WIN=4\s*$' -or
+        $config -notmatch '(?m)^CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8\s*$' -or
         $config -notmatch '(?m)^CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16\s*$') {
         throw 'ESP32-S3 voice builds must use the constrained-memory Wi-Fi/LWIP baseline.'
     }

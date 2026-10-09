@@ -24,6 +24,10 @@ typedef enum {
      * (mangled) transcript, and given "电台。" it picks "play" - which used to
      * restart the station the local shortcut had just stopped. */
     VOICE_IOT_COMMAND_RADIO_HANDLED,
+    /* "换一个台"类：不点名，直接切下一个频道。和 RADIO_PLAY 一样要延迟到云端
+     * 应答播完之后才动电台——那段 TTS 占着共享播放通道，当场切过去只会被静音，
+     * 用户听到的就是"换了但没声"。 */
+    VOICE_IOT_COMMAND_RADIO_NEXT,
 } voice_iot_command_result_t;
 
 /* Executes only the small local-command allowlist (device control + timers).
