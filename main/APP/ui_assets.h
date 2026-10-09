@@ -10,6 +10,8 @@ extern const lv_image_dsc_t ui_icon_battery;
 extern const lv_image_dsc_t ui_icon_mic_error;
 extern const lv_image_dsc_t ui_icon_timer;
 extern const lv_image_dsc_t ui_icon_alarm;
+extern const lv_image_dsc_t ui_icon_radio_next;
+extern const lv_image_dsc_t ui_icon_radio_next_left;
 extern const lv_image_dsc_t ui_weather_icon_sunny;
 extern const lv_image_dsc_t ui_weather_icon_cloudy;
 extern const lv_image_dsc_t ui_weather_icon_rain;

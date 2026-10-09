@@ -37,6 +37,38 @@ foreach ($character in $uiHanCharacters) {
         throw "The UI CJK subset is missing glyph U+$code ($character)."
     }
 }
+
+# 电台那一行用的是另一份 20px 子集（ui_cjk_font_radio），字形要单独核对：台名来自
+# radio_stream_service.c 的频道表，状态文案来自 update_radio_strip()。只查
+# ui_cjk_font.c 的话，“台名换成没收录的字”在实机上就是一个方框。
+$radioFace = Get-Content -Raw -Encoding UTF8 -LiteralPath "$PSScriptRoot\..\main\APP\ui_cjk_font_radio.c"
+if ($cjkHeader -notmatch 'LV_FONT_DECLARE\(ui_cjk_font_radio\)' -or
+    $radioFace -notmatch 'ui_cjk_font_radio' -or
+    $cmake -notmatch 'APP/ui_cjk_font_radio\.c') {
+    throw 'The 20px radio face must be declared, generated and compiled; each of the three missing means a link error far from the change.'
+}
+$radioSource = Get-Content -Raw -Encoding UTF8 -LiteralPath "$PSScriptRoot\..\main\MID\system\radio_stream_service.c"
+$radioText = @([regex]::Matches($radioSource, '\{"([^"]+)",\s*"http') | ForEach-Object { $_.Groups[1].Value })
+$strip = [regex]::Match($ui, '(?s)static void update_radio_strip\(bool radio_idle\).*?\n\}\n').Value
+if ($strip.Length -eq 0) {
+    throw 'Could not locate the radio strip builder; the glyph check below would be vacuous.'
+}
+$radioText += [regex]::Matches($strip, '"(?:\\.|[^"\\])*"') | ForEach-Object { $_.Value }
+if ($radioText.Count -lt 5) {
+    throw "Expected the channel names plus the status format string, found $($radioText.Count) strings."
+}
+foreach ($character in @($radioText.ToCharArray() |
+    Where-Object { ([int][char]$_ -ge 0x3400) -and ([int][char]$_ -le 0x9FFF) } |
+    Sort-Object -Unique)) {
+    $code = ('{0:X4}' -f [int][char]$character)
+    if ($radioFace -notmatch "U\+$code") {
+        throw "The radio CJK subset is missing glyph U+$code ($character)."
+    }
+}
+# 分隔符也是字：台名和状态之间那个竖线加两个空格。
+if ($strip -notmatch '"%s \| %s"' -or $radioFace -notmatch 'U\+007C' -or $radioFace -notmatch 'U\+0020') {
+    throw 'The radio line keeps a "name | status" separator, so its face needs space and the bar glyph.'
+}
 if ($ui -notmatch 's_scene\.main_time\s*=\s*make_label\([^;]*ui_time_font_64' -or
     $ui -notmatch '#include "ui_time_font\.h"') {
     throw 'The time label must use the dedicated native 64 px numeric font for sharp rendering.'

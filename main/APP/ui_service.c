@@ -50,6 +50,34 @@
 #define UI_VOICE_THINK_EYE_HEIGHT 68
 #define UI_VOICE_SPEAK_EYE_WIDTH 91
 #define UI_VOICE_SPEAK_EYE_HEIGHT 76
+/* 电台驻留（在播或已暂停）时不再画脸：整块屏幕只报“哪个台、在不在放”。
+   电平表 + 台名 + 两侧的“下一台”图标全部居中摆在屏幕中央。
+   这一组是用户盯着看的东西，所以刻意比正文大一号：条 12px 宽、最高 30px，台名
+   和状态走 ui_cjk_font_radio（20px）而不是正文的 14px。 */
+#define UI_RADIO_BAR_COUNT 5U
+#define UI_RADIO_BAR_WIDTH 12
+#define UI_RADIO_BAR_GAP 8
+/* 五根条 12px 宽、8px 间隔，正好 92px，居中摆在 (320-92)/2 = 114。 */
+#define UI_RADIO_BAR_LEFT 114
+#define UI_RADIO_BAR_BASE_Y 100
+#define UI_RADIO_BAR_MIN_HEIGHT 12
+/* 律动幅度：相位 0..3 步，最高 12 + 3*6 = 30px，顶端到 y=70。 */
+#define UI_RADIO_BAR_STEP_HEIGHT 6
+#define UI_RADIO_LABEL_TOP 108
+/* 两侧各摆一个“下一台”图标（双箭头）。32px 的正方形取居中：这一组从电平表最高
+   时的 y=70 到台名底部的 y=132，中心 101，所以图标顶边在 101-16=85。 */
+#define UI_RADIO_ICON_SIZE 32
+#define UI_RADIO_ICON_LEFT_X 12
+#define UI_RADIO_ICON_RIGHT_X (ST7789_WIDTH - UI_RADIO_ICON_LEFT_X - UI_RADIO_ICON_SIZE)
+#define UI_RADIO_ICON_Y 85
+/* 台名最长 4 个汉字（12 字节），状态最长 3 个汉字（9 字节），加分隔符远不到 40。 */
+#define UI_RADIO_LABEL_MAX 48U
+/* 状态栏下面那条分隔线。状态栏图标占 6..29（24px 高，起点 6），主页面头部组
+   从 y=31 开始，所以线只能压在 30 这一行上——再往下就切到时钟了。
+   只有语音页和充电页要它：主页面头部本身就是一整块横向信息区，再压一条通栏线
+   只是把屏幕白白切成两半。 */
+#define UI_STATUS_BAR_DIVIDER_Y 30
+#define UI_STATUS_BAR_DIVIDER_HEIGHT 2
 #define UI_STANDBY_EYE_LEFT_CENTER 105
 #define UI_STANDBY_EYE_RIGHT_CENTER 215
 #define UI_STANDBY_EYE_CENTER_Y 85
@@ -107,6 +135,8 @@ typedef struct
     lv_obj_t *battery;
     lv_obj_t *protocol;
     lv_obj_t *clock;
+    /* 状态栏下面那条横向分隔线，三页共用（主页面/充电页/语音页）。 */
+    lv_obj_t *divider;
 } ui_status_bar_t;
 
 typedef struct
@@ -154,6 +184,14 @@ typedef struct
     lv_obj_t *voice_thinking_dots[3];
     lv_obj_t *voice_error_left;
     lv_obj_t *voice_error_right;
+    /* 电台驻留期间才出现的元素：两侧各一个“下一台”图标，中间一条电平表和
+       一行“台名 | 状态”。它们和语音表情共用同一页，由 update_radio_strip()
+       一起显隐。 */
+    lv_obj_t *radio_icon_left;
+    lv_obj_t *radio_icon_right;
+    lv_obj_t *radio_bars[UI_RADIO_BAR_COUNT];
+    lv_obj_t *radio_label;
+    char radio_label_cache[UI_RADIO_LABEL_MAX];
     ui_page_t page;
     bool first_frame_presented;
     int displayed_weather_code;
@@ -328,7 +366,7 @@ static void set_status_icon(lv_obj_t *icon, const lv_image_dsc_t *online, bool i
     }
 }
 
-static void create_status_bar(lv_obj_t *parent, ui_status_bar_t *bar, bool compact_clock)
+static void create_status_bar(lv_obj_t *parent, ui_status_bar_t *bar, bool compact_clock, bool divider)
 {
     bar->wifi = lv_image_create(parent);
     bar->mic_error = lv_image_create(parent);
@@ -347,6 +385,21 @@ static void create_status_bar(lv_obj_t *parent, ui_status_bar_t *bar, bool compa
        幕上是同一个样子，反而看不出充电状态到底有没有上报。 */
     bar->protocol = make_label(parent, "--", &lv_font_montserrat_14, color(UI_ACCENT));
     lv_obj_align(bar->protocol, LV_ALIGN_TOP_RIGHT, -14, 8);
+    /* 状态栏与正文之间那条横线。三个带状态栏的页面共用这一个构造函数，要不要线
+       由调用方说清楚：主页面头部本身就是一整块横向信息区，线只是把屏幕白白切成
+       两半，语音页和充电页才需要靠它把状态栏和正文分开。
+       不要线时把指针置空，而不是建一个再隐藏——隐藏的对象照样占一份 LVGL 对象，
+       也照样每帧走一遍刷新判断。 */
+    bar->divider = NULL;
+    if (divider)
+    {
+        bar->divider = lv_obj_create(parent);
+        lv_obj_remove_style_all(bar->divider);
+        lv_obj_set_style_bg_color(bar->divider, color(UI_INK), 0);
+        lv_obj_set_style_bg_opa(bar->divider, LV_OPA_COVER, 0);
+        lv_obj_set_size(bar->divider, ST7789_WIDTH, UI_STATUS_BAR_DIVIDER_HEIGHT);
+        lv_obj_set_pos(bar->divider, 0, UI_STATUS_BAR_DIVIDER_Y);
+    }
     bar->clock = NULL;
     if (compact_clock)
     {
@@ -645,7 +698,7 @@ static void create_main_page(lv_obj_t *root)
     s_scene.main_weather_layer = lv_image_create(s_scene.main_page);
     lv_image_set_src(s_scene.main_weather_layer, &ui_main_scene);
     lv_obj_set_pos(s_scene.main_weather_layer, 0, 0);
-    create_status_bar(s_scene.main_page, &s_scene.main_status, false);
+    create_status_bar(s_scene.main_page, &s_scene.main_status, false, false);
     s_scene.main_weather_text = NULL;
     s_scene.main_weather_loading = NULL;
     s_scene.main_weather_spinner = NULL;
@@ -745,7 +798,7 @@ static void create_charging_page(lv_obj_t *root)
     lv_obj_set_style_bg_color(s_scene.charging_page, color(UI_BACKGROUND), 0);
     lv_obj_set_style_bg_opa(s_scene.charging_page, LV_OPA_COVER, 0);
     lv_obj_add_flag(s_scene.charging_page, LV_OBJ_FLAG_HIDDEN);
-    create_status_bar(s_scene.charging_page, &s_scene.charging_status, true);
+    create_status_bar(s_scene.charging_page, &s_scene.charging_status, true, true);
     s_scene.charge_bolt = lv_line_create(s_scene.charging_page);
     lv_line_set_points(s_scene.charge_bolt, s_bolt_points, sizeof(s_bolt_points) / sizeof(s_bolt_points[0]));
     lv_obj_set_pos(s_scene.charge_bolt, 92, 55);
@@ -816,7 +869,7 @@ static void create_voice_page(lv_obj_t *root)
     lv_obj_set_style_bg_color(s_scene.voice_page, color(UI_BACKGROUND), 0);
     lv_obj_set_style_bg_opa(s_scene.voice_page, LV_OPA_COVER, 0);
     lv_obj_add_flag(s_scene.voice_page, LV_OBJ_FLAG_HIDDEN);
-    create_status_bar(s_scene.voice_page, &s_scene.voice_status, true);
+    create_status_bar(s_scene.voice_page, &s_scene.voice_status, true, true);
     s_scene.voice_eye_left = lv_obj_create(s_scene.voice_page);
     s_scene.voice_eye_right = lv_obj_create(s_scene.voice_page);
     style_standby_eye(s_scene.voice_eye_left);
@@ -846,6 +899,43 @@ static void create_voice_page(lv_obj_t *root)
     lv_obj_set_pos(s_scene.voice_error_right, 198, 48);
     lv_obj_add_flag(s_scene.voice_error_left, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_scene.voice_error_right, LV_OBJ_FLAG_HIDDEN);
+    /* 电台两侧的“下一台”图标：同一个双箭头左右各摆一个，表示这边可以在频道
+       之间前后走。它们是位图而不是画出来的，因为那个双箭头的折角用矩形拼不出来。 */
+    s_scene.radio_icon_left = lv_image_create(s_scene.voice_page);
+    s_scene.radio_icon_right = lv_image_create(s_scene.voice_page);
+    /* 左边那张是右边那张的水平镜像（radio_next_left_icon 就是 radio_next_icon 逐像素翻
+       面来的），单独一份位图而不是运行时转 180°。转出来的像素其实一样，但要过 LVGL
+       的变换管线（每帧重新采样，还依赖全局的 LV_DRAW_SW_COMPLEX），哪天那个开关被关
+       掉，左箭头会不声不响地又指回右边；镜像位图是死数据，零运行时成本也零依赖。 */
+    lv_image_set_src(s_scene.radio_icon_left, &ui_icon_radio_next_left);
+    lv_image_set_src(s_scene.radio_icon_right, &ui_icon_radio_next);
+    lv_obj_set_pos(s_scene.radio_icon_left, UI_RADIO_ICON_LEFT_X, UI_RADIO_ICON_Y);
+    lv_obj_set_pos(s_scene.radio_icon_right, UI_RADIO_ICON_RIGHT_X, UI_RADIO_ICON_Y);
+    lv_obj_add_flag(s_scene.radio_icon_left, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_scene.radio_icon_right, LV_OBJ_FLAG_HIDDEN);
+    /* 电台的电平表：五根圆角短条，底边对齐，高度由 update_radio_strip() 每帧改写。
+       底边固定而不是顶边固定，条才会像电平表一样从中间往上蹿。 */
+    for (size_t i = 0; i < UI_RADIO_BAR_COUNT; ++i)
+    {
+        s_scene.radio_bars[i] = lv_obj_create(s_scene.voice_page);
+        lv_obj_remove_style_all(s_scene.radio_bars[i]);
+        lv_obj_set_style_bg_color(s_scene.radio_bars[i], color(UI_INK), 0);
+        lv_obj_set_style_bg_opa(s_scene.radio_bars[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(s_scene.radio_bars[i], 3, 0);
+        lv_obj_set_size(s_scene.radio_bars[i], UI_RADIO_BAR_WIDTH, UI_RADIO_BAR_MIN_HEIGHT);
+        lv_obj_set_pos(s_scene.radio_bars[i], UI_RADIO_BAR_LEFT + (lv_coord_t)i * (UI_RADIO_BAR_WIDTH + UI_RADIO_BAR_GAP),
+                       UI_RADIO_BAR_BASE_Y - UI_RADIO_BAR_MIN_HEIGHT);
+        lv_obj_add_flag(s_scene.radio_bars[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    /* 台名和状态合成一行，摆在电平表下面。文案在 update_radio_strip() 里定，
+       这里只建对象：空串不占字形，也不会让字体契约多要一个汉字。
+       用 ui_cjk_font_radio（20px）而不是正文的 ui_cjk_font_14：这一行是用户盯着
+       看的东西（哪个台、在不在放），14px 在 320x170 上太小了。它不是把 14px 的
+       字形放大的——ui_cjk_font_17 那种复用同一张位图的做法只改行距，字还是 14px，
+       所以这里是真的另生成了一份 20px 子集（见 scripts/gen_ui_cjk_font.ps1）。 */
+    s_scene.radio_label = make_label(s_scene.voice_page, "", &ui_cjk_font_radio, color(UI_INK));
+    lv_obj_align(s_scene.radio_label, LV_ALIGN_TOP_MID, 0, UI_RADIO_LABEL_TOP);
+    lv_obj_add_flag(s_scene.radio_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_scene.voice_eye_left);
     lv_obj_move_foreground(s_scene.voice_eye_right);
     lv_obj_move_foreground(s_scene.voice_mouth);
@@ -1333,7 +1423,10 @@ static void update_activation_page(const lumidock_snapshot_t *snapshot)
     lv_label_set_text(s_scene.activation_code, snapshot->voice_activation.activation_code);
 }
 
-static void update_voice_eyes(voice_ui_state_t state)
+/* radio_idle：会话已经收尾、电台还挂着（在播或用户暂停）。它是一张 UI 自己的脸，
+ * 不是会话状态——语音服务永远不会报出这个状态，所以不往 voice_ui_state_t 里加值，
+ * 免得那个枚举说谎。 */
+static void update_voice_eyes(voice_ui_state_t state, bool radio_idle)
 {
     lv_coord_t width = UI_STANDBY_EYE_CLOSED_WIDTH;
     lv_coord_t height = UI_STANDBY_EYE_CLOSED_HEIGHT;
@@ -1341,11 +1434,23 @@ static void update_voice_eyes(voice_ui_state_t state)
     const bool speaking = state == VOICE_UI_SPEAKING;
     const bool thinking = state == VOICE_UI_THINKING;
     const bool connecting = state == VOICE_UI_CONNECTING;
+    /* 每次进来先把眼睛放回来，再按需藏掉。眼睛是全项目唯一会隐藏又复用的表情
+       元素，漏清一次就是“下次唤醒没有脸”——所以恢复和隐藏必须写在同一条路径上，
+       不能靠别处顺手把它清回来。 */
+    lv_obj_remove_flag(s_scene.voice_eye_left, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_scene.voice_eye_right, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_scene.voice_mouth, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_scene.voice_error_left, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_scene.voice_error_right, LV_OBJ_FLAG_HIDDEN);
     for (size_t i = 0; i < 3; ++i)
         lv_obj_add_flag(s_scene.voice_thinking_dots[i], LV_OBJ_FLAG_HIDDEN);
+    /* 电台驻留时不画脸：屏幕上只留电平表、台名和两侧的箭头图标。 */
+    if (radio_idle)
+    {
+        lv_obj_add_flag(s_scene.voice_eye_left, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_scene.voice_eye_right, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
     if (error)
     {
         lv_obj_clear_flag(s_scene.voice_error_left, LV_OBJ_FLAG_HIDDEN);
@@ -1406,17 +1511,79 @@ static void update_voice_eyes(voice_ui_state_t state)
         lv_obj_set_size(s_scene.voice_eye_right, right_width, right_height);
 }
 
+/* 电台驻留期间才显示的整组元素：两侧的“下一台”图标、中间的电平表和
+ *“台名 | 状态”。
+ *
+ * 收起来的时候只在“上一次还显示着”时动手：这组对象每帧 set 一次 flag 会白白
+ * 让 LVGL 走一遍刷新判断，而电台驻留是长时间状态，一帧一次就是几万次。
+ * 台名文本同理，拼好先和缓存比一次再决定要不要交给 LVGL 重画。 */
+static void update_radio_strip(bool radio_idle)
+{
+    if (!radio_idle)
+    {
+        if (s_scene.radio_label_cache[0] != '\0')
+        {
+            s_scene.radio_label_cache[0] = '\0';
+            lv_obj_add_flag(s_scene.radio_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_scene.radio_icon_left, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_scene.radio_icon_right, LV_OBJ_FLAG_HIDDEN);
+            for (size_t i = 0; i < UI_RADIO_BAR_COUNT; ++i)
+                lv_obj_add_flag(s_scene.radio_bars[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    lv_obj_clear_flag(s_scene.radio_icon_left, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_scene.radio_icon_right, LV_OBJ_FLAG_HIDDEN);
+    const bool paused = radio_stream_service_is_user_paused();
+    /* 只有真在出声才让电平表律动。暂停和重连都压平——“没声音”就该看起来没声音，
+       否则断流那几十秒里条还在跳，和“设备死了”一样让人摸不着头脑。 */
+    const bool flowing = !paused && radio_stream_service_is_active();
+    for (size_t i = 0; i < UI_RADIO_BAR_COUNT; ++i)
+    {
+        lv_obj_clear_flag(s_scene.radio_bars[i], LV_OBJ_FLAG_HIDDEN);
+        const uint32_t phase = (s_scene.voice_pulse_frame / 3U + i * 2U) % 6U;
+        const lv_coord_t step = (lv_coord_t)(phase < 3U ? phase : 6U - phase);
+        const lv_coord_t height =
+            flowing ? UI_RADIO_BAR_MIN_HEIGHT + step * UI_RADIO_BAR_STEP_HEIGHT
+                    : UI_RADIO_BAR_MIN_HEIGHT;
+        lv_obj_set_size(s_scene.radio_bars[i], UI_RADIO_BAR_WIDTH, height);
+        lv_obj_set_pos(s_scene.radio_bars[i],
+                       UI_RADIO_BAR_LEFT + (lv_coord_t)i * (UI_RADIO_BAR_WIDTH + UI_RADIO_BAR_GAP),
+                       UI_RADIO_BAR_BASE_Y - height);
+    }
+    char text[UI_RADIO_LABEL_MAX];
+    /* 三种状态要说清楚：播着、用户按了暂停、正在接流。第三种最要紧——重连期间要是
+       还写着“播放中”，用户会以为设备死了；实测日志里一次断流重连要十几秒，够他把
+       电源拔了。 */
+    const char *status = paused ? "已暂停" : (flowing ? "播放中" : "连接中");
+    /* 用返回值判定而不是丢掉它：GCC 的 -Wformat-truncation 只盯“返回值没用上”的
+       snprintf，而这里也真的该关心截断——拼不下就宁可什么都不写，也别显示半截台名。 */
+    const int written = snprintf(text, sizeof(text), "%s | %s",
+                                 radio_stream_service_station_name(), status);
+    if (written < 0 || (size_t)written >= sizeof(text))
+        return;
+    if (strcmp(text, s_scene.radio_label_cache) == 0)
+        return;
+    strncpy(s_scene.radio_label_cache, text, sizeof(s_scene.radio_label_cache) - 1U);
+    s_scene.radio_label_cache[sizeof(s_scene.radio_label_cache) - 1U] = '\0';
+    lv_obj_clear_flag(s_scene.radio_label, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_scene.radio_label, text);
+}
+
 static void update_voice_page(const lumidock_snapshot_t *snapshot)
 {
     update_status_bar(&s_scene.voice_status, snapshot, true);
-    voice_ui_state_t state = snapshot->voice_session.state;
-    /* 电台在播就是“小智在说话”，只是音源不是云端 TTS：这一轮对话已经收尾，
-       voice_session.state 回落成 IDLE，照搬就会显示安静闭眼的脸，和正在出声的
-       听感正好相反。这里把“电台出声中”当成说话状态，让眼睛和嘴一起动起来。
-       真的在处理语音回合时（连接/聆听/思考）仍以会话状态为准。 */
-    if (state == VOICE_UI_IDLE && radio_stream_service_is_requested())
-        state = VOICE_UI_SPEAKING;
-    update_voice_eyes(state);
+    const voice_ui_state_t state = snapshot->voice_session.state;
+    /* 电台驻留：会话已经收尾，但电台还挂着（在播、重连中，或用户暂停后没退出）。
+       它不再冒用“说话”的脸——大眼加脉冲嘴是“小智在长篇回答”的样子，电台能连放
+       半小时，用户根本分不清设备到底在干什么，也看不到自己停的是哪个台。这里给它
+       自己的显示：两侧的“下一台”图标 + 电平表 + 一行“台名 | 状态”。真的在处理
+       语音回合时（连接/聆听/思考）仍以会话状态为准，电台那几个元素随即让位。 */
+    const bool radio_idle = state == VOICE_UI_IDLE &&
+                            (radio_stream_service_is_requested() ||
+                             radio_stream_service_is_user_paused());
+    update_voice_eyes(state, radio_idle);
+    update_radio_strip(radio_idle);
     if ((s_scene.voice_pulse_frame++ % 6U) == 0U && state == VOICE_UI_SPEAKING)
     {
         const lv_coord_t pulse = ((s_scene.voice_pulse_frame / 6U) % 2U) != 0U ? 4 : 0;
@@ -1581,11 +1748,12 @@ static void update_page_state(const lumidock_snapshot_t *snapshot, int64_t now_u
             }
             return;
         }
-        /* 电台在播时停在语音页：电台是同一轮对话拉起来的“小智在说话”，只是音源
-           不同，会话结束就把屏幕翻回时钟会让人以为播放被打断了。只有用户说
-           “退出电台”终止电台后，这里才恢复回主页面。充电页优先级更高，交给下面
-           的充电分支处理。 */
-        if (!radio_stream_service_is_requested())
+        /* 电台还挂着时就停在语音页：在播算，“暂停但没退出”也算。会话一结束就
+           翻回时钟，用户既看不到自己停的是哪个台，也找不到“继续播放”的入口。
+           只有“退出电台”真正终止它（stop 会把两个标志一起清掉）才回主页面。
+           充电页优先级更高，交给下面的充电分支处理。 */
+        if (!radio_stream_service_is_requested() &&
+            !radio_stream_service_is_user_paused())
             set_page(charging_active(snapshot) ? UI_PAGE_CHARGING : UI_PAGE_MAIN);
     }
     if (charging_active(snapshot))

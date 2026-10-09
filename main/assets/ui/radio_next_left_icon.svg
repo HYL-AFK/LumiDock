@@ -1,0 +1,7 @@
+<?xml version="1.0" standalone="no"?>
+<!-- radio_next_left_icon = radio_next_icon 的水平镜像（translate(1024,0) + scale(-1,1) 就是绕
+     x=512 这条中线翻面，正好落在像素边界上，所以翻转后的 32x32 位图是精确的，没有半像素
+     采样误差）。路径数据与 radio_next_icon.svg 完全相同，改图标时两个文件要一起改：
+     右图标用 radio_next_icon.svg，左图标用本文件。 -->
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg class="icon" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="32" height="32"><g transform="translate(1024,0) scale(-1,1)"><path d="M587.1232 150.656l418.9056 324.736a46.2976 46.2976 0 0 1 0 73.216L587.136 873.344C556.544 897.024 512 875.328 512 836.736V187.264c0-38.592 44.544-60.3008 75.1232-36.608z m-512 0l418.9056 324.736a46.2976 46.2976 0 0 1 0 73.216L75.136 873.344C44.544 897.024 0 875.328 0 836.736V187.264c0-38.592 44.544-60.3008 75.1232-36.608z m529.9712 131.4688v459.7504L901.632 512 605.0944 282.1248z m-512 0v459.7504L389.632 512 93.0944 282.1248z" fill="#000000"/></g></svg>
