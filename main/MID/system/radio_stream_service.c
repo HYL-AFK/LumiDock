@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 
 #include "audio_playback_service.h"
+#include "device_data.h"
 #include "i2s_audio_driver.h"
 
 #define RADIO_PCM_BUFFER_BYTES 8192U
@@ -336,6 +337,8 @@ static bool hls_read_playlist(radio_hls_t *hls, bool reopen)
                                            (int)(sizeof(body) - 1U - used));
         if (n <= 0) break;
         used += (size_t)n;
+        /* 播放列表只有几 KB，但同属 HLS 拉取，一并记账，免得流量口径留缺口。 */
+        device_data_traffic_add_rx((size_t)n);
     }
     body[used] = '\0';
 
@@ -513,7 +516,11 @@ static int hls_read(radio_hls_t *hls, uint8_t *buf, size_t len)
             stalls = 0U;
         }
         const int n = esp_http_client_read(hls->http, (char *)buf, (int)len);
-        if (n > 0) return n;
+        if (n > 0)
+        {
+            device_data_traffic_add_rx((size_t)n);
+            return n;
+        }
         /* 返回 0 的两种含义在这里分开：响应体没读完就是读超时，原地重试同一片；
            读完了才收流换下一片。以前合并成一个分支，一次抖动就被当成“片读完”
            跳过去，剩下的数据永远不再补，用户听到的就是一段静音。 */

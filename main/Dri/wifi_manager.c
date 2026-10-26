@@ -184,6 +184,8 @@ static esp_err_t internet_probe_http_event(esp_http_client_event_t *event)
     internet_probe_result_t *result = (internet_probe_result_t *)event->user_data;
     if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
         result->body_bytes += (size_t)event->data_len;
+        /* 顺带记进设备数据区：探测的响应体也是实打实的下行流量。 */
+        device_data_traffic_add_rx((size_t)event->data_len);
     } else if (event->event_id == HTTP_EVENT_ON_HEADER &&
                event->header_key != NULL && event->header_value != NULL) {
         if (strcasecmp(event->header_key, "Content-Type") == 0) {

@@ -21,6 +21,7 @@
 
 #include "app_weather.h"
 #include "app_log.h"
+#include "device_data.h"
 #include "http_memory_log.h"
 #include "location_snapshot.h"
 #include "time_snapshot.h"
@@ -90,6 +91,11 @@ static esp_err_t app_time_apply_timezone_offset(int32_t offset_seconds)
 static esp_err_t location_http_event(esp_http_client_event_t *event)
 {
     watchdog_service_feed();
+    /* 记账要抢在下面那个提前 return 之前。data 为 NULL 只代表"这次没带正文"，
+       但只要 data_len > 0，字节就已经从网上下来了。 */
+    if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
+        device_data_traffic_add_rx((size_t)event->data_len);
+    }
     if (event->event_id != HTTP_EVENT_ON_DATA || event->data == NULL ||
         event->data_len == 0) {
         return ESP_OK;

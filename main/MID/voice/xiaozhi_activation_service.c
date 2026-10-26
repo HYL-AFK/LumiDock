@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 
+#include "device_data.h"
 #include "mid_snapshot.h"
 #include "http_memory_log.h"
 #include "wifi_manager.h"
@@ -114,6 +115,11 @@ static esp_err_t load_or_create_client_id(void)
 
 static esp_err_t response_event(esp_http_client_event_t *event)
 {
+    /* 本回调跑在 PSRAM 栈的激活任务上。记账只动自旋锁和内存、不碰 NVS，
+       所以这里不存在"PSRAM 栈写 Flash"那个坑。 */
+    if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
+        device_data_traffic_add_rx((size_t)event->data_len);
+    }
     if (event->event_id != HTTP_EVENT_ON_DATA || event->data == NULL) return ESP_OK;
     if (s_state.body_len + event->data_len >= sizeof(s_state.body)) {
         s_state.body_overflow = true;
@@ -283,6 +289,7 @@ static void activation_task(void *arg)
                 ESP_LOGW(TAG, "OTA registration retry pending");
             } else if (s_state.activated) {
                 ESP_LOGI(TAG, "device activation confirmed");
+                device_data_mark_activated();
             } else {
                 ESP_LOGI(TAG, "device activation code received");
             }

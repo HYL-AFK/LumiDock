@@ -15,6 +15,7 @@
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "app_log.h"
+#include "device_data.h"
 #include "http_memory_log.h"
 #include "weather_snapshot.h"
 #include "location_snapshot.h"
@@ -52,6 +53,11 @@ static const char *weather_condition_name(int weather_code)
 static esp_err_t http_event(esp_http_client_event_t *event)
 {
     watchdog_service_feed();
+    /* 下行流量在事件回调里统一记账，一处覆盖所有分片。刻意记在 memcpy 之前，
+       而且不看缓冲装不装得下——数据已经过了网卡，不能因为要丢弃就漏记。 */
+    if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
+        device_data_traffic_add_rx((size_t)event->data_len);
+    }
     if (event->event_id == HTTP_EVENT_ON_DATA && event->data != NULL &&
         s_len + event->data_len < sizeof(s_body)) {
         memcpy(s_body + s_len, event->data, event->data_len);

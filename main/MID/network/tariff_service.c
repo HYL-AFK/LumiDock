@@ -15,6 +15,7 @@
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
+#include "device_data.h"
 #include "http_memory_log.h"
 #include "time_snapshot.h"
 #include "watchdog_service.h"
@@ -116,6 +117,9 @@ static void apply_fallback(void)
 static esp_err_t http_event(esp_http_client_event_t *event)
 {
     watchdog_service_feed();
+    if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
+        device_data_traffic_add_rx((size_t)event->data_len);
+    }
     if (event->event_id == HTTP_EVENT_ON_DATA && event->data != NULL) {
         if (s_body != NULL && s_body_len + (size_t)event->data_len < TARIFF_BODY_BYTES) {
             memcpy(s_body + s_body_len, event->data, (size_t)event->data_len);

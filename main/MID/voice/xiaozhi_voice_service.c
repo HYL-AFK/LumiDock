@@ -19,6 +19,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "device_data.h"
 #include "xiaozhi_activation_service.h"
 #include "xiaozhi_audio_pipeline.h"
 #include "audio_playback_service.h"
@@ -1061,6 +1062,12 @@ static bool send_ws_text_raw(const char *text)
              s_session_id[0] != '\0' ? s_session_id : "-", (unsigned)s_turn_id,
              text != NULL ? text : "-");
     xSemaphoreGive(s_ws_tx_lock);
+    /* 记在放锁之后，和 send_bin 一个口径：只有成功的那次算数，重试后仍失败时
+       result <= 0 自然不入账。 */
+    if (result > 0)
+    {
+        device_data_traffic_add_tx((size_t)result);
+    }
     if (result <= 0)
     {
         ESP_LOGW(TAG, "cloud text send result=%d", result);
@@ -1832,6 +1839,11 @@ static bool send_uplink_packet(const uint8_t *opus, size_t opus_len, const char 
             s_last_uplink_send_result = esp_websocket_client_send_bin(
                 s_client, (const char *)opus, (int)opus_len,
                 pdMS_TO_TICKS(XIAOZHI_WSS_BIN_SEND_TIMEOUT_MS));
+        }
+        /* 两次发送只有一次可能成功（失败的那次返回 <=0），所以在这里统一记账不会重复。 */
+        if (s_last_uplink_send_result > 0)
+        {
+            device_data_traffic_add_tx((size_t)s_last_uplink_send_result);
         }
     }
     const bool connected_after = s_client != NULL && s_client_started &&
@@ -4473,6 +4485,13 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
         if (data != NULL && data->op_code == WS_TRANSPORT_OPCODES_PONG)
         {
             s_wss_last_ping_us = esp_timer_get_time();
+        }
+        /* 下行流量在这里一次记完：TTS 音频、云端 JSON、心跳都走这个事件，不必再钻进
+           receive_websocket_payload 里找分叉点。data_len 是本次片段长度，分片消息会
+           分几次进来，累加起来正好是整条消息的字节数。 */
+        if (data != NULL && data->data_len > 0)
+        {
+            device_data_traffic_add_rx((size_t)data->data_len);
         }
         receive_websocket_payload((const esp_websocket_event_data_t *)event_data, connection_seq);
     }
