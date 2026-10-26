@@ -17,6 +17,7 @@
 #include "ble_provision_service.h"
 #include "button_driver.h"
 #include "charge_strategy.h"
+#include "device_data.h"
 #include "device_settings_service.h"
 #include "i2s_audio_driver.h"
 #include "mid_snapshot.h"
@@ -255,6 +256,11 @@ esp_err_t app_manager_start(void)
         err = nvs_flash_init();
     }
     if (err != ESP_OK) return err;
+    /* 设备数据区紧跟在 NVS 之后：开机计数应当尽早落地，后面任何一步失败返回都不该
+     * 把它漏掉。初始化失败不阻断启动——它是记录，不是关键路径。 */
+    if ((err = device_data_init()) != ESP_OK) {
+        ESP_LOGW(TAG, "device data init: %s", esp_err_to_name(err));
+    }
     err = runtime_event_log_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "runtime event log init failed: %s", esp_err_to_name(err));

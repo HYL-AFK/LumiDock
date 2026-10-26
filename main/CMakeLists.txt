@@ -42,6 +42,7 @@ idf_component_register(
         "MID/system/radio_stream_service.c"
         "MID/system/charge_strategy.c"
         "COM/app_config.c"
+        "COM/device_data.c"
         "COM/location_snapshot.c"
         "COM/runtime_event_log.c"
         "COM/time_snapshot.c"
