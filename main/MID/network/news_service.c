@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "device_data.h"
 #include "http_memory_log.h"
 #include "watchdog_service.h"
 
@@ -140,6 +141,12 @@ static uint8_t parse_items(const char *xml, char titles[NEWS_MAX_ITEMS][NEWS_TIT
 
 static esp_err_t on_http_event(esp_http_client_event_t *evt)
 {
+    /* 先记账再处理。单份 RSS 15~17 KB、分片很多，账就是在这里逐片累加出来的；
+       下面那两个提前 return（s_body 为空、缓冲满）都不能让它漏掉。 */
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0)
+    {
+        device_data_traffic_add_rx((size_t)evt->data_len);
+    }
     if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data == NULL || evt->data_len <= 0)
     {
         return ESP_OK;
@@ -263,6 +270,17 @@ const char *news_service_category_name(news_category_t category)
     }
 }
 
+/* 初始化中途失败时把已经拿到的东西还回去。留着半成品最坏：get()/count() 只看
+   s_lock 是否为空就放行，调用方会以为服务可用，实际 s_titles 是空的。 */
+static void news_service_deinit_on_failure(void)
+{
+    if (s_titles != NULL) { heap_caps_free(s_titles); s_titles = NULL; }
+    if (s_body != NULL) { heap_caps_free(s_body); s_body = NULL; }
+    if (s_lock != NULL) { vSemaphoreDelete(s_lock); s_lock = NULL; }
+    if (s_wake != NULL) { vSemaphoreDelete(s_wake); s_wake = NULL; }
+    s_body_len = 0U;
+}
+
 esp_err_t news_service_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
@@ -270,6 +288,7 @@ esp_err_t news_service_init(void)
     if (s_lock == NULL || s_wake == NULL)
     {
         ESP_LOGE(TAG, "新闻服务锁创建失败");
+        news_service_deinit_on_failure();
         return ESP_ERR_NO_MEM;
     }
 
@@ -278,6 +297,7 @@ esp_err_t news_service_init(void)
     if (s_titles == NULL || s_body == NULL)
     {
         ESP_LOGE(TAG, "新闻缓冲分配失败：titles=%p body=%p", (void *)s_titles, (void *)s_body);
+        news_service_deinit_on_failure();
         return ESP_ERR_NO_MEM;
     }
     memset(s_titles, 0, NEWS_TITLE_BYTES);
@@ -287,6 +307,7 @@ esp_err_t news_service_init(void)
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         ESP_LOGE(TAG, "新闻任务创建失败");
+        news_service_deinit_on_failure();
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "新闻服务就绪：%u 个源，标题缓存 %u 字节、正文缓冲 %u 字节（均在 PSRAM）",
@@ -326,5 +347,10 @@ uint8_t news_service_count(news_category_t category)
     {
         return 0U;
     }
-    return s_counts[category];
+    /* 和 get() 用同一把锁：刷新任务可能在另一核上改 s_counts。单字节读虽很难
+       撕裂，但两处风格不一致会让人怀疑这里到底有没有保护。 */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const uint8_t count = s_counts[category];
+    xSemaphoreGive(s_lock);
+    return count;
 }
