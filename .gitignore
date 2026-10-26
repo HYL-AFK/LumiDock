@@ -78,6 +78,11 @@ tmp/
 outputs/
 preview/
 
+# Local firmware and full-flash backups
+# The full-flash dump carries the WiFi credentials and device keys, so the whole
+# directory stays out of the repository instead of relying on the *.bin rule alone.
+backup_20261026/
+
 # User-specific configuration files
 *.user
 *.workspace # General workspace files, can be from various tools
