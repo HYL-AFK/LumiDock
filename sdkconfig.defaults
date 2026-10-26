@@ -8,13 +8,20 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # Keep TLS handshake and certificate allocations in PSRAM on N8R2.
 # The reference XiaoZhi project uses the same external allocator strategy.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
-CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 # CONFIG_MBEDTLS_DYNAMIC_BUFFER is not set
+# 上面这行必须保持关闭：DYNAMIC_BUFFER 会在握手结束后释放证书与私钥，下一次握手
+# 得重新注册，而 WSS 断线重连正是反复握手。代价是握手峰值内存偏高，这部分已经由
+# MBEDTLS_EXTERNAL_MEM_ALLOC 挪进 PSRAM 消化。
+# 原先这里还有一行 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y：它的 Kconfig 依赖
+# MBEDTLS_DYNAMIC_BUFFER，父项关闭时该行会被静默丢弃、从未生效（连带
+# MBEDTLS_DYNAMIC_FREE_CA_CERT 也一并失效）。留着只会让人以为握手内存已经省过。
 # ESP32-S3 at 240 MHz gains no TLS throughput from hardware AES; software
 # AES keeps TLS allocations in the external-memory allocator instead of the
 # constrained internal DMA heap.
 # CONFIG_MBEDTLS_HARDWARE_AES is not set
-CONFIG_LV_MEM_SIZE_KILOBYTES=32
+# LVGL 的内存走标准 malloc（见下方 CONFIG_LV_USE_CLIB_MALLOC=y），而
+# LV_MEM_SIZE_KILOBYTES 只在 LV_USE_BUILTIN_MALLOC 下有效。原先这里写着 =32，
+# 两者互斥、该值从未生效；删掉以免被当成"LVGL 堆限到 32 KB"去推理内存。
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y

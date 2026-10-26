@@ -1,51 +1,86 @@
-# LumiDock ESP32-S3
+# LumiDock
 
-## 1.0 中文版本备注
+LumiDock 是一台桌面智能终端固件，跑在 ESP32-S3（N8R2：8 MB Flash + 2 MB PSRAM）上，
+把语音助手、网络电台、天气时间与充电管理收进一块 320×170 的小屏里。
 
-本版本为 LumiDock ESP32-S3 固件 1.0，重点增强 XiaoZhi 语音链路的终止稳定性：
+## 目录结构
 
-- VAD 结束后，150ms 仅用于尾音捕获，不会中断已经开始的 `bin-main` WebSocket 写入。
-- 主语音写入完成后，终止路径按顺序发送最多 2 帧尾音和 `listen/stop`，避免 TX 任务抢先关闭当前会话。
-- 增加主写入等待耗时、写入结果、连接状态、主动问候首个可解码 PCM、短包和 Opus 解码失败计数日志。
-- 保留单 WSS/session、`mode:"manual"`、主动问候直接回复窗口及播放后静音门控。
+`main/` 按四层组织、路径扁平。`tests/test_architecture_layout.ps1` 与
+`tests/test_layer_file_placement.ps1` 会检查它们没有倒退到旧布局。
 
-本版本已完成静态语音契约测试；构建和烧录请在本地 ESP-IDF 环境中执行，并通过连续主动问候及追问采集实机日志。
+| 层 | 职责 |
+|---|---|
+| `main/APP` | 应用编排与界面：启动协调、页面服务、字体与图像资产 |
+| `main/COM` | 只放跨层共享的公共物：`app_config`、`runtime_event_log` 与三份快照（location / time / weather） |
+| `main/Dri` | 硬件驱动与底层策略：ST7789、I2S、WS2812、按键、Wi-Fi 管理、公网健康判定 |
+| `main/MID` | 业务中间层，按领域分四个子目录 |
 
-当前工程是 LumiDock 的第一版 ESP-IDF 软件骨架，按四层组织：
+`main/MID` 的划分由 `tests/test_mid_directory_layout.ps1` 固化：
 
-```text
-main/APP   启动编排、页面服务
-main/COM   Wi-Fi、蓝牙配网接口、时间天气、BMS、SW3518S 业务通信
-main/MID   统一快照和事件优先级
-main/Dri   ST7789、I2C、UART、雷达、WS2812、按键、MOS 硬件驱动
-```
+- `network/` — Wi-Fi 与蓝牙配网、SNTP 时间、天气、新闻、电价
+- `protocol/` — BMS 电池、STC8H 顶板链路
+- `system/` — MCP 工具、电台、音频播放、定时器、充电策略、设置持久化、状态灯、看门狗
+- `voice/` — 小智语音链路：激活、音频管线、会话
 
-## 已实现
+业务服务一律沉到 `MID`，`COM` 只留公共快照与配置。历史上的 `COM/WiTime` 目录已废弃，
+契约测试会拒绝它重新出现。
 
-- ST7789 开机页和主页面：电池电量优先显示，其次是时间、时区、天气、实时温度、Wi-Fi、BT、充电协议、BMS 在线状态；电量和天气使用填充位图式图形，不使用线框图标。
-- SW3518S I2C 只读轮询：7 位地址 `0x3C`，SDA=`GPIO15`，SCL=`GPIO16`，每秒读取协议和电压/电流状态。
-- VoltPilot BMS 协议适配：`ESCOREDATA` 请求、`AAA0AAA` 帧头、Modbus CRC16、128/130/132 字节帧兼容解析；UART2 TX=`GPIO37`、RX=`GPIO38`，无 DE/RE。解析器按 14S/15S 字段顺序读取 6 个状态字节，并兼容不同固件追加的保留字节。
-- WiTime 方案的 APSTA、标准 BluFi、SNTP/时区、定位和 Open-Meteo 天气任务已复制到 `main/COM/WiTime` 并由 COM 适配层调用。
-- 雷达按当前引脚图使用 `GPIO44` 有效高输出；UART 距离帧暂不占用 WS2812 数据脚。
-- MOS 上电默认为关闭；单线 UART、按键行为、MOS 实际负载策略均保留接口。
+## 主要功能
+
+- **语音助手**：小智云端链路。单条 WSS 会话 + 唤醒词（WakeNet）+ VAD，Opus 编解码，
+  云端 TTS 播放。开机问候语由云端 LLM 现场生成，固件不再拼接本地音频片段。
+- **网络电台**：央广四台 HLS（AAC/TS）直播，支持「打开电台」「换一个台」。
+- **充电策略**：结合电价时段、明天气温与降水、当前 SOC 给出充电建议，经 MCP 交给云端播报。
+- **新闻播报**：四个分类源，刷新标题缓存后供云端朗读。
+- **天气与时间**：SNTP 授时 + 时区换算，Open-Meteo 当前天气与两日预报。
+- **定时器**：闹钟、倒计时、正计时，配本地提示音。
+- **配网**：BluFi。首次无凭据走 `BLE_WINDOW_PROVISION`（超时进深睡）；已配网设备开机时
+  走 `BLE_WINDOW_BOOT`（短窗口，超时恢复联网）。
+- **电源与协议**：SW3518S 快充状态（I2C 只读）、VoltPilot BMS（UART2）、STC8H 顶板（UART0）。
+- **界面**：LVGL 9，开机动画、主页面、充电页、待机表情、天气场景。
+
+## 硬件
+
+引脚集中在 `main/Dri/board_pins.h`，改动前请与实物核对。
+
+| 功能 | 引脚 |
+|---|---|
+| LCD（SPI2） | SCLK=1, MOSI=2, RST=11, DC=4, CS=5, BL=6 |
+| 音频（I2S） | BCLK=10, LRCLK=9, MIC=8, AMP=7, MCLK=38 |
+| ES8311（I2C，400 kHz） | SDA=17, SCL=18 |
+| 按键 | 12 |
+| WS2812 | 灯带=13/14（24 颗），板载=48 |
+| BMS（UART2） | TX=39, RX=40 |
+| STC8H（UART0） | TX=43, RX=44 |
 
 ## 构建
 
-在已安装 ESP-IDF 的终端中执行：
+需要 ESP-IDF v5.3.x：
 
 ```text
 idf.py set-target esp32s3
 idf.py build
+idf.py -p <PORT> flash monitor
 ```
 
-本工程按 ESP32-S3 N8R2 配置，固件镜像和分区表均使用 8MB Flash。烧录前请确认 `main/Dri/board_pins.h` 与实物焊盘一致。
+Flash 为 8 MB 单 app 分区、无 OTA，见表 `partitions.csv`。配置以 `sdkconfig.defaults`
+为准；`sdkconfig` 是生成物，不入库。
 
-## 事件优先级
+## 运行时约定
 
-```text
-硬件保护/故障 > 系统控制 > 本地按键 > 雷达 > 充电/BMS/外设通信 > 云端 > ASR > UI刷新
-```
+改动相关代码时请一并遵守，`tests/*.ps1` 会逐条断言：
 
-## 暂缓项
+- **单条 WSS 会话**：同一时刻只允许一条小智链路，收场与重连由 `xiaozhi_voice_service`
+  统一编排。
+- **任务栈的内存归属**：会写 Flash/NVS 的任务必须用内部 RAM（PSRAM 上的栈不能写 Flash），
+  其余才允许放 PSRAM。见各服务里的 `xTaskCreatePinnedToCoreWithCaps`。
+- **音频设备单一持有者**：Opus 编解码与 I2S 通道由音频管线统一持有，不重复创建。
+- **电台与语音共存**：电台播放期间唤醒语音会先让出扬声器，收场时再按收场性质决定
+  归还电台还是停掉它。
 
-单线 UART 协议、MOS1/MOS2 负载、按键短按/长按/双击行为、MQTT/HTTP 云端选型、ASR 云端/离线方案，以及电池详细页面字段等待最终协议确认。
+验证请在本地运行 `tests/` 下的 PowerShell 契约测试。
+
+## 相关文档
+
+- `docs/天气接口字段与WMO码映射.md`
+- `docs/xiaozhi-voice-test-handoff-2026-08-12.md`
