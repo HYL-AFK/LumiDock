@@ -19,6 +19,7 @@
 #include "charge_strategy.h"
 #include "device_data.h"
 #include "device_settings_service.h"
+#include "hourly_chime_service.h"
 #include "i2s_audio_driver.h"
 #include "mid_snapshot.h"
 #include "news_service.h"
@@ -27,6 +28,7 @@
 #include "stc_service.h"
 #include "startup_coordinator.h"
 #include "tariff_service.h"
+#include "thermal_service.h"
 #include "time_service.h"
 #include "timer_service.h"
 #include "weather_service.h"
@@ -128,6 +130,10 @@ static void snapshot_bridge_task(void *arg)
         wifi_service_poll();
         time_service_poll();
         weather_service_poll();
+        /* 温控和报时都挂在这条 1 Hz 的拍子上：前者靠采样率换平滑，后者只需要
+         * 在整点那一分钟内被叫到一次。 */
+        thermal_service_poll();
+        hourly_chime_service_poll();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -333,6 +339,14 @@ esp_err_t app_manager_start(void)
     if ((err = tariff_service_init()) != ESP_OK) ESP_LOGW(TAG, "tariff init: %s", esp_err_to_name(err));
     if ((err = news_service_init()) != ESP_OK) ESP_LOGW(TAG, "news init: %s", esp_err_to_name(err));
     charge_strategy_init();
+    /* 温控和报时都不依赖网络，也不依赖语音：ES8311 不通时它们照常运行，
+     * 前者保住板子，后者只在日志里留下"扬声器不可用"。 */
+    if ((err = thermal_service_init()) != ESP_OK) {
+        ESP_LOGW(TAG, "thermal init: %s", esp_err_to_name(err));
+    }
+    if ((err = hourly_chime_service_init()) != ESP_OK) {
+        ESP_LOGW(TAG, "hourly chime init: %s", esp_err_to_name(err));
+    }
     if ((err = xiaozhi_activation_service_init()) != ESP_OK) {
         ESP_LOGW(TAG, "XiaoZhi activation init: %s", esp_err_to_name(err));
     }

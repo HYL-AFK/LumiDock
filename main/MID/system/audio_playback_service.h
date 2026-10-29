@@ -13,6 +13,9 @@ typedef enum {
     AUDIO_PLAYOUT_SOURCE_TIMER_CHIME,
     AUDIO_PLAYOUT_SOURCE_ERROR_TONE,
     AUDIO_PLAYOUT_SOURCE_LOCAL_PROMPT,
+    /* 整点报时单独占一个音源：它和闹钟响铃不是一回事，共用 TIMER_CHIME 会让
+     * 两边互相 abort，闹钟正响着的时候整点报时一开就把铃掐了。 */
+    AUDIO_PLAYOUT_SOURCE_HOURLY_CHIME,
 } audio_playback_source_t;
 
 typedef enum {
@@ -40,3 +43,9 @@ void audio_playback_service_abort(audio_playback_source_t source, uint32_t epoch
  * 缺口；水位够高才回到摊平节奏。只有当前会话就是这条 source/epoch 时才返回真实
  * 水位，其余情况一律报 0，所以调用方要先确认电台确实在出声（armed）再拿它下判断。 */
 uint32_t audio_playback_service_pending_frames(audio_playback_source_t source, uint32_t epoch);
+
+/* 扬声器现在归谁。空闲返回 AUDIO_PLAYOUT_SOURCE_NONE。
+ *
+ * 播放服务同一时刻只认一条会话，begin() 会直接把上一条丢掉，所以想在“别人正在
+ * 说话”时插一脚的调用方必须先问这里，不能指望 begin() 自己避让。 */
+audio_playback_source_t audio_playback_service_active_source(void);

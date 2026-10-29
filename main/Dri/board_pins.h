@@ -3,6 +3,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/spi_master.h"
+#include "hal/adc_types.h"
 
 /* LumiDock ESP32-S3-Zero board contract. Keep all GPIO decisions here. */
 #define LUMIDOCK_WS2812_1_GPIO GPIO_NUM_13
@@ -33,6 +34,21 @@
 #define LUMIDOCK_LCD_BL_GPIO GPIO_NUM_6
 
 #define LUMIDOCK_BUTTON_GPIO GPIO_NUM_12
+
+/* NTC thermistor (10k, B=3950) on the only free ADC1 channel.
+ * Divider is VCC -- NTC -- node -- 10k -- GND, so the node rises with
+ * temperature. That polarity matters: GPIO3 is a strapping pin (JTAG source
+ * select), and this way the pin stays high at reset instead of being pulled
+ * low by a hot thermistor. */
+#define LUMIDOCK_NTC_ADC_GPIO GPIO_NUM_3
+#define LUMIDOCK_NTC_ADC_CHANNEL ADC_CHANNEL_2
+#define LUMIDOCK_NTC_ADC_UNIT ADC_UNIT_1
+
+/* 4-wire fan. PWM takes the Intel 25 kHz control input, FG is the open
+ * collector tachometer output that pulses twice per revolution. */
+#define LUMIDOCK_FAN_PWM_GPIO GPIO_NUM_15
+#define LUMIDOCK_FAN_FG_GPIO GPIO_NUM_16
+#define LUMIDOCK_FAN_PWM_FREQ_HZ 25000U
 
 #define LUMIDOCK_BMS_UART_PORT UART_NUM_2
 #define LUMIDOCK_BMS_TX_GPIO GPIO_NUM_39

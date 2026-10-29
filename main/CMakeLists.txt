@@ -30,12 +30,16 @@ idf_component_register(
         "Dri/onboard_led_driver.c"
         "Dri/i2s_audio_driver.c"
         "Dri/button_driver.c"
+        "Dri/ntc_sensor.c"
+        "Dri/fan_control.c"
         "MID/mid_snapshot.c"
         "MID/system/watchdog_service.c"
         "MID/system/audio_playback_service.c"
         "MID/system/status_led_service.c"
         "MID/system/timer_service.c"
         "MID/system/timer_chime_audio.c"
+        "MID/system/thermal_service.c"
+        "MID/system/hourly_chime_service.c"
         "MID/system/voice_iot_command_service.c"
         "MID/system/mcp_service.c"
         "MID/system/device_settings_service.c"
@@ -91,6 +95,25 @@ idf_component_register(
         # 源文件仍留在 main/assets/audio/ 下（约 1.45 MB 仓库体积），删掉它们不影响
         # 构建。留着是因为一旦云端问候出问题，用 generate_prompt_tones.py 把这几行
         # 加回来就能退回本地拼接方案。
+        #
+        # 例外：整点报时（hourly_chime_service.c）把 07~21 共 15 个片段单独加回来
+        # 了，约 660 KB。报时不适合走云端——整点那一刻断网就彻底不响，而本地素材
+        # 是唯一与网络无关的做法。00~06 和 22~23 不在报时时段，继续留在源码树里。
+        "assets/audio/prompt_hour_07_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_08_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_09_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_10_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_11_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_12_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_13_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_14_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_15_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_16_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_17_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_18_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_19_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_20_16k_mono_s16le.pcm"
+        "assets/audio/prompt_hour_21_16k_mono_s16le.pcm"
         "assets/audio/prompt_exit_16k_mono_s16le.pcm"
         "assets/audio/prompt_timeout_16k_mono_s16le.pcm"
         "assets/audio/prompt_fallback_16k_mono_s16le.pcm"
@@ -107,16 +130,19 @@ idf_component_register(
     REQUIRES
         bt
         driver
+        esp_adc
         esp_driver_gpio
         esp_driver_i2c
         esp_driver_i2s
         esp_driver_ledc
+        esp_driver_pcnt
         esp_driver_spi
         esp_rom
         esp_app_format
         esp_event
         esp_http_client
         esp_netif
+        esp_psram
         esp_system
         esp_timer
         esp_wifi

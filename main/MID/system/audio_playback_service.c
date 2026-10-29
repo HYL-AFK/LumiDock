@@ -478,3 +478,15 @@ uint32_t audio_playback_service_pending_frames(audio_playback_source_t source, u
     xSemaphoreGive(s_playout.lock);
     return pending;
 }
+
+audio_playback_source_t audio_playback_service_active_source(void)
+{
+    if (s_playout.lock == NULL) return AUDIO_PLAYOUT_SOURCE_NONE;
+    audio_playback_source_t source = AUDIO_PLAYOUT_SOURCE_NONE;
+    xSemaphoreTake(s_playout.lock, portMAX_DELAY);
+    /* active 在 finish 一路的 finish_current_playback() 里才清掉，所以队列已经
+     * 排空但最后一批 PCM 还在 DAC 里的那一小段也算“占着”，正是我们要的结果。 */
+    if (s_playout.active) source = s_playout.source;
+    xSemaphoreGive(s_playout.lock);
+    return source;
+}

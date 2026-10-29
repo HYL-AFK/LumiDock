@@ -117,7 +117,10 @@ HOUR_PHRASES = [
     ("prompt_hour_04_16k_mono_s16le.pcm", "现在是凌晨4点"),
     ("prompt_hour_05_16k_mono_s16le.pcm", "现在是凌晨5点"),
     ("prompt_hour_06_16k_mono_s16le.pcm", "现在是凌晨6点"),
-    ("prompt_hour_07_16k_mono_s16le.pcm", "现在是凌晨7点"),
+    # 07 点说「凌晨」是错的：凌晨只覆盖 0-5 点，7 点天已经大亮。这条文案
+    # 最早只服务开机问候，那时 7 点档没人细究；接进整点报时之后，每天 7:00
+    # 都会把这句话播一遍，措辞错得很显眼。
+    ("prompt_hour_07_16k_mono_s16le.pcm", "现在是早上7点"),
     ("prompt_hour_08_16k_mono_s16le.pcm", "现在是上午8点"),
     ("prompt_hour_09_16k_mono_s16le.pcm", "现在是上午9点"),
     ("prompt_hour_10_16k_mono_s16le.pcm", "现在是上午10点"),

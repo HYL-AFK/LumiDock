@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 
 #include "app_log.h"
+#include "device_data.h"
 #include "runtime_event_log.h"
 #include "internet_health_policy.h"
 #include "watchdog_service.h"
