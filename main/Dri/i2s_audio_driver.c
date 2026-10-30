@@ -31,7 +31,7 @@ static const char *TAG = "i2s_audio";
 #define ES8311_ADC_REG16 0x16
 #define ES8311_MIC_GAIN_REG16_VALUE 0x24
 /* Requested product playback level; the amplifier path remains unchanged. */
-#define ES8311_OUTPUT_VOLUME_PERCENT 40.0f
+#define ES8311_OUTPUT_VOLUME_PERCENT 4.0f
 #define ES8311_MUTE_RETRY_COUNT 3U
 #define ES8311_MUTE_RETRY_DELAY_MS 5U
 #define ES8311_OUTPUT_PRE_ROLL_BYTES 960U

@@ -52,6 +52,26 @@ static SemaphoreHandle_t i2s_audio_driver_init_lock;
 #define VOICE_WSS_TASK_STACK_BYTES 4096U
 #define VOICE_WSS_STACK_RELEASE_WAIT_MS 2000U
 
+/* 台架调试：上电后自动开一次默认台，免去每次靠说话触发，用来观察电台和
+ * 网络的长时间稳定性。延迟要盖过网络探测和语音链路初始化——太早开台，测到
+ * 的是开机竞争而不是电台本身。置 0 即关闭。 */
+#define LUMIDOCK_RADIO_AUTOSTART_DELAY_MS 30000U
+
+#if LUMIDOCK_RADIO_AUTOSTART_DELAY_MS > 0
+static void radio_autostart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(LUMIDOCK_RADIO_AUTOSTART_DELAY_MS));
+    const esp_err_t err = radio_stream_service_play_default();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "radio autostart failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "radio autostart: default station requested");
+    }
+    vTaskDelete(NULL);
+}
+#endif
+
 static esp_err_t init_audio_owner(bool mute_after_init)
 {
     if (i2s_audio_driver_init_lock == NULL ||
@@ -366,6 +386,13 @@ esp_err_t app_manager_start(void)
         return ESP_ERR_NO_MEM;
     }
     mid_snapshot_set_startup_complete(true);
+
+#if LUMIDOCK_RADIO_AUTOSTART_DELAY_MS > 0
+    if (xTaskCreatePinnedToCore(radio_autostart_task, "radio_autostart", 3072, NULL, 2,
+                                NULL, 0) != pdPASS) {
+        ESP_LOGW(TAG, "radio autostart task unavailable");
+    }
+#endif
 
 #if LUMIDOCK_NETWORK_UI_TEST_MODE
     ESP_LOGI(TAG, "network/UI test profile started; voice_test=%d", LUMIDOCK_VOICE_TEST_MODE);

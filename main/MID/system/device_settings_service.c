@@ -172,13 +172,15 @@ void device_settings_service_init(void)
  * 静音是个“当场按下”的动作，跨一次断电不该继续生效：开机后一点声音都没有，
  * 用户只会以为设备坏了（或者忘了自己静音过），而不是想起“哦我静音了”。给一个
  * 能听见但不刺耳的下限，他听到第一声就知道设备活着；真想再静音，按一下就行。 */
-#define DEVICE_SETTINGS_BOOT_VOLUME_FLOOR 10
+#define DEVICE_SETTINGS_BOOT_VOLUME_FLOOR 0
 
 bool device_settings_service_apply_saved_volume(void)
 {
     if (!s_target_valid) return false;
-    const int volume =
+    int volume =
         s_target_volume <= 0 ? DEVICE_SETTINGS_BOOT_VOLUME_FLOOR : s_target_volume;
+    /* TEMP DEBUG：公共场合验证，开机静音。恢复时删掉下面这一行。 */
+    volume = 0;
     if (i2s_audio_driver_set_output_volume((float)volume) != ESP_OK)
     {
         ESP_LOGW(TAG, "applying the stored speaker volume failed");
