@@ -30,9 +30,12 @@ static const char *TAG = "thermal_service";
  * 风扇就会贴着 40 C 一秒一启停，比一直转着还吵。 */
 #define THERMAL_HYSTERESIS_C 2.0f
 
-/* 探头读数为无效值（开路/短路/悬空）连续这么多轮之后，才认定是真故障。一根长
- * 引线偶尔被干扰一次是正常的，为这个把风扇拍到满速没有必要。 */
-#define THERMAL_PROBE_FAULT_SAMPLES 2U
+/* 连续这么多次坏读数才认为探头真的坏了。2 次（2 秒）太短：NTC 分压在
+ * 风扇 PWM 附近工作时，单组采样里偶尔会混进两个尖峰，一秒接着一秒地碰上
+ * 就足以把一个好探头锁成全速。实测两分钟内误锁 3 次，风扇在 50% 和 100%
+ * 之间来回跳。放宽到 5 次之后，真正的悬空依然在 5 秒内被发现（悬空时均值
+ * 乱跳，几乎不可能连着 5 次都落在正常范围），而偶发干扰被过滤掉了。 */
+#define THERMAL_PROBE_FAULT_SAMPLES 5U
 
 /* 保护一旦进入，要连续这么多次可信读数才解除。放松这个门槛，保护就会被一次
  * 侥幸蒙混过关的伪读数撤销——实测过：悬空引脚偶尔能连续 8 次落在噪声谷底，
@@ -153,8 +156,17 @@ static void log_temperature(float celsius, int millivolts)
     const bool heartbeat = !s_have_log || (now_us - s_last_log_us) >= THERMAL_LOG_HEARTBEAT_US;
     if (!moved && !heartbeat) return;
 
-    ESP_LOGI(TAG, "temp %.2f C | node %d mV | tier=%s fan=%u%%", (double)celsius, millivolts,
-             tier_name(s_tier), (unsigned)s_fan_percent);
+    if (s_fan_percent > 0U) {
+        /* 风扇转着的时候把实测转速一起带上。FG 没接、上拉缺失、或者风扇根本
+         * 不支持测速，都会直接表现为 rpm 恒为 0——不把它打出来，这三种情况
+         * 就只能靠猜。 */
+        ESP_LOGI(TAG, "temp %.2f C | node %d mV | tier=%s fan=%u%% | %u rpm",
+                 (double)celsius, millivolts, tier_name(s_tier),
+                 (unsigned)s_fan_percent, (unsigned)thermal_service_get_fan_rpm());
+    } else {
+        ESP_LOGI(TAG, "temp %.2f C | node %d mV | tier=%s fan=%u%%", (double)celsius,
+                 millivolts, tier_name(s_tier), (unsigned)s_fan_percent);
+    }
 
     s_last_log_c = celsius;
     s_last_log_us = now_us;

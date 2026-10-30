@@ -71,6 +71,12 @@ static esp_err_t init_fg_counter(void)
     err = pcnt_new_channel(s_pcnt, &chan_cfg, &channel);
     if (err != ESP_OK) return err;
 
+    /* 引脚归 PCNT 管了，上拉要重新声明一次：上面那次 gpio_config 是在通道
+     * 接管之前做的，驱动重新配置引脚时不一定保留它。FG 是开漏输出，没上拉
+     * 就是浮空输入——实测转速恒为 0、每秒只碰运气抓到 1 个脉冲，就是这个
+     * 表现。 */
+    (void)gpio_config(&fg_cfg);
+
     /* Count rising edges only: every pulse on FG is one edge, so holding the
      * count on the falling edge keeps the pulse count exact. */
     err = pcnt_channel_set_edge_action(channel,

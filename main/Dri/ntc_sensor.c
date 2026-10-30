@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "board_pins.h"
+#include "driver/gpio.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -17,9 +18,13 @@ static const char *TAG = "ntc_sensor";
 #define NTC_R25_OHMS 10000.0f
 #define NTC_BETA_K 3950.0f
 #define NTC_T25_KELVIN 298.15f
-/* The fixed leg of the divider, same value as R25 so the node sits at half
- * rail at 25 C - the most linear part of the curve. */
-#define NTC_SERIES_OHMS 10000.0f
+/* 分压电阻。理论上应该用 10k —— 和 R25 相等时节点落在半轨 1650 mV，正好是
+ * 曲线最线性的一段。现在手头只有 910Ω，节点降到 275 mV，落在 ADC 的低压区，
+ * 低温段（10 C 以下）会不准；但 40~90 C 这段——也就是风扇真正关心的区间——
+ * 对应的 484~1628 mV 恰好是 ADC 表现最好的部分，所以工程上可以接受。
+ *
+ * 换成 10k 电阻之后，把这个值改回 10000.0f 即可，别忘了一起重烧。 */
+#define NTC_SERIES_OHMS 910.0f
 #define NTC_RAIL_MV 3300
 
 /* Averaging window: the oneshot read is cheap, and the thermistor sits next to
@@ -36,9 +41,18 @@ static const char *TAG = "ntc_sensor";
 /* A wire with nothing on the other end is a high impedance antenna: it wanders
  * over hundreds of millivolts, and most of that range sits comfortably between
  * the two rail guards. Without a spread check those readings pass as valid and
- * turn into a confident rubbish temperature. A working divider stays well
- * inside this over the ~2.4 ms the samples span. */
-#define NTC_SPREAD_LIMIT_MV 60
+ * turn into a confident rubbish temperature.
+ *
+ * 阈值取决于工作点，而不是一个固定值。分压电阻是 910 Ω 时节点只有 275 mV，
+ * 噪声占满量程的比例比 10k/10k 的 1650 mV 大得多：同样的 25 mV 绝对噪声，
+ * 在旧工作点上只占 1.5%，现在占 9%。而且散布随节点电压一起变大——实测
+ * 25 C 时 89 mV，37 C 时 127 mV，43 C（节点 540 mV）时到 189 mV。固定 60 mV
+ * 会让开机第一秒就报错，固定 100 mV 在高温段又每半分钟误报一次。
+ *
+ * 150 mV 能盖住实测到的整个工作范围，而真正悬空的散布是几百毫伏到满量程
+ * （拔线实测 200 mV 以上，均值乱跳），依然抓得住。漏网的少数情况还有
+ * thermal_service 那边的 rail guard 和连续 5 次容错兜底。 */
+#define NTC_SPREAD_LIMIT_MV 150
 
 /* Both fault paths are polled once a second, so they need their own throttle or
  * a missing probe fills the log. */
@@ -60,6 +74,13 @@ static bool fault_log_due(void)
 esp_err_t ntc_sensor_init(void)
 {
     if (s_ready) return ESP_OK;
+
+    /* GPIO3 是 JTAG 的 strapping 引脚，复位后带着内部上拉（约 45 kΩ）——这是
+     * bootloader 用来选 JTAG 信号源的，之后就没人管它了。ADC 采样期间这个上拉
+     * 一直挂着：910 分压的节点阻抗只有 833 Ω，上拉会往节点注入 70 µA 左右，
+     * 把 275 mV 抬到 330 mV，换算成温度要差将近 5 C。所以显式关掉，让引脚
+     * 回到真正的浮空输入。 */
+    (void)gpio_set_pull_mode(LUMIDOCK_NTC_ADC_GPIO, GPIO_FLOATING);
 
     const adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = LUMIDOCK_NTC_ADC_UNIT,
@@ -112,10 +133,8 @@ bool ntc_sensor_is_ready(void)
 
 static esp_err_t read_millivolts(int *out_mv, int *out_spread_mv)
 {
-    int32_t sum_mv = 0;
+    int samples[NTC_SAMPLE_COUNT];
     int valid = 0;
-    int min_mv = 0;
-    int max_mv = 0;
     for (int index = 0; index < NTC_SAMPLE_COUNT; ++index) {
         int raw = 0;
         if (adc_oneshot_read(s_adc, LUMIDOCK_NTC_ADC_CHANNEL, &raw) != ESP_OK) continue;
@@ -125,15 +144,33 @@ static esp_err_t read_millivolts(int *out_mv, int *out_spread_mv)
         } else {
             mv = (raw * NTC_RAIL_MV) / 4095;
         }
-        if (valid == 0 || mv < min_mv) min_mv = mv;
-        if (valid == 0 || mv > max_mv) max_mv = mv;
-        sum_mv += mv;
-        ++valid;
+        samples[valid++] = mv;
         esp_rom_delay_us(NTC_SAMPLE_GAP_US);
     }
     if (valid == 0) return ESP_FAIL;
-    *out_mv = (int)(sum_mv / valid);
-    *out_spread_mv = max_mv - min_mv;
+
+    /* 插入排序。样本只有 8 个，插入排序比调 qsort 省事，也不用把比较函数
+     * 拖进来。 */
+    for (int index = 1; index < valid; ++index) {
+        const int key = samples[index];
+        int slot = index - 1;
+        while (slot >= 0 && samples[slot] > key) {
+            samples[slot + 1] = samples[slot];
+            --slot;
+        }
+        samples[slot + 1] = key;
+    }
+
+    /* 中位数而不是均值：一个被中断打断的离群点会把均值拉偏，对中位数没有
+     * 影响。风扇 PWM 和排针上的相邻信号都会偶尔插进来这样一个点。 */
+    *out_mv = samples[valid / 2];
+
+    /* 散布同样避开极值：丢掉最低和最高的各一个，用剩下样本的极差。单个尖峰
+     * 不再把整组判死，而真正的悬空——噪声横跨几百毫伏——剔掉两个点也无济于
+     * 事，依然会被抓住。 */
+    const int lo = (valid >= 4) ? 1 : 0;
+    const int hi = (valid >= 4) ? valid - 2 : valid - 1;
+    *out_spread_mv = samples[hi] - samples[lo];
     return ESP_OK;
 }
 
