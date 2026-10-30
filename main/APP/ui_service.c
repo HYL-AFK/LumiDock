@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -20,6 +21,7 @@
 #include "watchdog_service.h"
 
 #define LUMIDOCK_LVGL_BUFFER_ROWS 8U
+#define LUMIDOCK_LVGL_DRAW_BUFFER_BYTES (ST7789_WIDTH * LUMIDOCK_LVGL_BUFFER_ROWS * sizeof(lv_color_t))
 #define UI_STANDBY_TIMEOUT_US (264000000LL)
 #define UI_CHARGE_ENTER_MA 500
 #define UI_CHARGE_EXIT_MA 300
@@ -237,7 +239,19 @@ typedef struct
 
 static TaskHandle_t s_task;
 static lv_display_t *s_display;
-static lv_color_t s_draw_buffer[ST7789_WIDTH * LUMIDOCK_LVGL_BUFFER_ROWS];
+/* LVGL 的绘制缓冲放 PSRAM，不再占内部 RAM。
+ *
+ * 原来是 static lv_color_t[240*8]，实打实 7680 字节内部 RAM，而且是 .bss 里的
+ * 一块连续区——它连同旁边的 s_terminal_tail_frames(8192)、sigmoid_table(5680)、
+ * s_fill_buffer(5120) 一起把内部堆切得七零八落。实测电台播放时内部只剩 1891 字节、
+ * 最大连续块仅 1024，而 WSS 的 websocket 任务要 4096 连续内部 RAM，于是那次建连
+ * 只能失败——用户的语音唤醒直接没反应。
+ *
+ * 能搬是因为 SPI 的 DMA 源根本不在这里：display_flush() -> st7789_draw_bitmap()
+ * 是把像素逐个转成字节填进 st7789_driver.c 里的 s_fill_buffer，那个缓冲留在内部
+ * RAM 不动，SPI 照旧从内部内存发 DMA。这里只多一次“从 PSRAM 读”的代价，
+ * 一帧 240×320×2 = 150 KB 满打满算多几毫秒，而 UI 任务本来就是 20 ms 一拍。 */
+static lv_color_t *s_draw_buffer;
 static ui_scene_t s_scene;
 
 bool ui_service_is_main_stable(void)
@@ -1868,11 +1882,21 @@ esp_err_t ui_service_init(void)
     if (err != ESP_OK)
         return err;
     lv_init();
+    /* 分配失败不静默：宁可让 UI 起不来把错误报上去，也不能带着 NULL 缓冲去渲染。 */
+    s_draw_buffer = heap_caps_malloc(LUMIDOCK_LVGL_DRAW_BUFFER_BYTES,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_draw_buffer == NULL)
+    {
+        ESP_LOGE("ui_service", "LVGL draw buffer allocation failed: %u bytes from PSRAM",
+                 (unsigned)LUMIDOCK_LVGL_DRAW_BUFFER_BYTES);
+        return ESP_ERR_NO_MEM;
+    }
     s_display = lv_display_create(ST7789_WIDTH, ST7789_HEIGHT);
     if (s_display == NULL)
         return ESP_ERR_NO_MEM;
     lv_display_set_color_format(s_display, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_buffers(s_display, s_draw_buffer, NULL, sizeof(s_draw_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(s_display, s_draw_buffer, NULL, LUMIDOCK_LVGL_DRAW_BUFFER_BYTES,
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(s_display, display_flush);
     lv_obj_t *root = lv_screen_active();
     create_startup_page(root);

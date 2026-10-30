@@ -79,6 +79,30 @@
  * stack"），所以唤醒后必须等电台真的停稳再建连，否则每一次"电台在播时唤醒"都直接
  * 吃一个连接失败。上限 300 ms，等不到就照常尝试，不把唤醒拖长。 */
 #define XIAOZHI_RADIO_PARK_WAIT_US (300LL * 1000LL)
+/* 建连前要求的最小内部连续块，以及为等到它愿意花的时间。
+ *
+ * esp_websocket_client_start() 里用的是普通的 xTaskCreatePinnedToCore，任务栈
+ * 4096 字节必然落在内部 RAM，而且必须是**连续**的一块。但内部堆的 largest 是
+ * 波动的：电台每 10 秒拉一次 HLS 分片，拉取期间最大连续块会掉到 832（实测在
+ * 832 和 5888 之间来回跳）；internet probe 每 30 秒又切一遍。正好撞上就建不
+ * 起来——现象是“叫了没反应”，因为失败发生在分配阶段，连日志以外的痕迹都没有。
+ *
+ * 关键是这个洞是**瞬时**的：电台拉完一片就把内存还回来，等几百毫秒就能过。
+ * 所以这里不降标准、不重试整条连接，只在分配前等一下连续块。等不到就照常
+ * 尝试，和原来的行为完全一样，不新增失败模式。
+ *
+ * 唤醒路径不能把人晾着：radio park 已经等了 300 ms，这里再给 300 ms 封顶。
+ * 空闲预连没有人在等，给 1500 ms，足够跨过两三次分片拉取。
+ *
+ * 阈值就是任务栈本身 4096，不再往上加余量。加过 5120，实测是白等：
+ *   W (102916) WSS internal block short after 2000 ms: largest=4096 (need 5120)
+ *   I (102926) WSS start memory: stack=4096 internal=13071 largest=4096
+ *   I (102926) websocket transport result=0 ...
+ * largest=4096 时建连四次全部成功。栈是唯一需要连续内部 RAM 的那一笔，
+ * 之后的小结构可以分散在碎片里，所以够不够的标准就是栈大小本身。 */
+#define XIAOZHI_WSS_BLOCK_WAIT_BYTES (4096U)
+#define XIAOZHI_WSS_BLOCK_WAIT_FOREGROUND_MS (300U)
+#define XIAOZHI_WSS_BLOCK_WAIT_PREWARM_MS (1500U)
 #define XIAOZHI_TRAFFIC_LOG_INTERVAL_US (1LL * 1000LL * 1000LL)
 #define XIAOZHI_OPUS_FRAME_INTERVAL_US (60LL * 1000LL)
 #define XIAOZHI_UPLINK_TAIL_FLUSH_FRAMES 2U
@@ -400,7 +424,17 @@ static volatile bool s_uplink_terminal_close_pending;
 static volatile bool s_uplink_terminal_listen_stop_started;
 static volatile int64_t s_uplink_main_wait_us;
 static const char *volatile s_uplink_tx_operation = "idle";
-static uint8_t s_terminal_tail_frames[XIAOZHI_UPLINK_TAIL_FLUSH_FRAMES][XIAOZHI_MAX_OPUS_FRAME_BYTES];
+/* 上行最后两帧的暂存区，放 PSRAM。
+ *
+ * 原来是 uint8_t[2][4096]，8192 字节内部 RAM，而且是 .bss 里的一整块连续区。
+ * 它只在“一轮对话结束”时被 memcpy 两次（capture_terminal_tail 存、
+ * send_terminal_tail 发），根本不在音频热路径上——放 PSRAM 多出来的那点读延迟
+ * 在每轮对话一次的量级上完全看不见。
+ *
+ * 而它占着的 8 KiB 连续内部区，恰好是 websocket 任务那个 4096 字节连续栈最想要的。
+ * 类型写成“指向数组的指针”而不是二维数组，s_terminal_tail_frames[i] 的下标语法
+ * 不变，用到的三处 memcpy/send 一行都不用改。 */
+static uint8_t (*s_terminal_tail_frames)[XIAOZHI_MAX_OPUS_FRAME_BYTES];
 static size_t s_terminal_tail_lengths[XIAOZHI_UPLINK_TAIL_FLUSH_FRAMES];
 static uint8_t s_terminal_tail_count;
 static uint32_t s_tts_frames;
@@ -726,6 +760,8 @@ static void cleanup_init_failure(void)
     s_pipeline_init_waiter = NULL;
     heap_caps_free(s_uplink_frame_buffer);
     s_uplink_frame_buffer = NULL;
+    heap_caps_free(s_terminal_tail_frames);
+    s_terminal_tail_frames = NULL;
     xiaozhi_audio_pipeline_deinit();
     if (s_client != NULL)
     {
@@ -2649,6 +2685,21 @@ static void release_deferred_cloud_tts_on_audio(uint32_t connection_seq)
     resume_deferred_cloud_tts();
 }
 
+/* 等一块够大的连续内部 RAM。见 XIAOZHI_WSS_BLOCK_WAIT_BYTES 处的注释。 */
+static bool wait_for_internal_block(size_t bytes, uint32_t budget_ms)
+{
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)budget_ms * 1000LL;
+    for (;;)
+    {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= bytes)
+            return true;
+        if (esp_timer_get_time() >= deadline_us)
+            return false;
+        /* 20 ms 一拍：比电台拉流循环的粒度细，又不至于把 CPU 烧在轮询上。 */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 static esp_err_t start_wss(bool foreground_session)
 {
     if (wss_link_usable())
@@ -2736,6 +2787,19 @@ static esp_err_t start_wss(bool foreground_session)
     if (s_client != NULL)
         close_channel(false);
 
+    /* 旧 client 已经销毁、内存也回来了，但堆的形状不一定好用：largest 可能还停在
+       832 上。先等一等再分配——这一等要么省下一次必然失败的建连，要么最多白等
+       一个预算，不会把本来能成的建连变成失败。 */
+    const uint32_t block_wait_ms = foreground_session ? XIAOZHI_WSS_BLOCK_WAIT_FOREGROUND_MS
+                                                     : XIAOZHI_WSS_BLOCK_WAIT_PREWARM_MS;
+    if (!wait_for_internal_block(XIAOZHI_WSS_BLOCK_WAIT_BYTES, block_wait_ms))
+    {
+        ESP_LOGW(TAG, "WSS internal block short after %u ms: largest=%u (need %u); trying anyway",
+                 (unsigned)block_wait_ms,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)XIAOZHI_WSS_BLOCK_WAIT_BYTES);
+    }
+
     const char *url = xiaozhi_activation_service_get_websocket_url();
     const char *token = xiaozhi_activation_service_get_websocket_token();
     const int authorization_len = snprintf(s_authorization, sizeof(s_authorization), "Bearer %s", token);
@@ -2753,6 +2817,23 @@ static esp_err_t start_wss(bool foreground_session)
         .task_core_id = 0,
         .task_prio = 3,
         .task_stack = 4096,
+        /* 保持 1024：别改成 4096。
+         *
+         * 看着很划算——1024 ≤ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL(2048)，rx/tx
+         * 两个缓冲被强制放进内部 RAM；抬到 4096 就过阈值改走 PSRAM，内部 RAM
+         * 每次建连少占 2048 字节。实测确实有效：电台播放中的 largest 从 832
+         * 升到 1152，free 从 2115 升到 2359。
+         *
+         * 但它把电台打坏了，而且是在同一个 350 秒窗口里当场打坏的：
+         *   buffer=1024  列表间隔 max 10.37s、PCM 队列最低 39 帧、underrun 0
+         *   buffer=4096  列表间隔 max 24.95s、PCM 队列跌到 0、underrun 1 次
+         * 内存明明是变好的，所以不是没内存，是 buffer_size 自己带来的开销：
+         * esp_websocket_new_buf() 每次收/发都 free() + calloc(1, 4096),
+         * 而 esp_transport_read() 一次读 4096 字节，改变的是 socket 层的读取
+         * 节奏——电台 HLS 分片和 WSS 共用同一条 WiFi/LWIP 通路，被拖慢的正是
+         * 拉分片那一侧。
+         *
+         * 所以这里维持 IDF 默认值。要省内部 RAM 得从别处省，不能动这个。 */
         .buffer_size = 1024,
         .reconnect_timeout_ms = 2000,
         .network_timeout_ms = 5000,
@@ -4763,6 +4844,15 @@ esp_err_t xiaozhi_voice_service_init(void)
     s_uplink_frame_buffer = heap_caps_malloc(XIAOZHI_MAX_OPUS_FRAME_BYTES,
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_uplink_frame_buffer == NULL)
+    {
+        cleanup_init_failure();
+        return ESP_ERR_NO_MEM;
+    }
+    /* 同 s_uplink_frame_buffer：存上行尾帧的暂存区也不占内部 RAM，理由见声明处。 */
+    s_terminal_tail_frames = heap_caps_malloc(
+        (size_t)XIAOZHI_UPLINK_TAIL_FLUSH_FRAMES * XIAOZHI_MAX_OPUS_FRAME_BYTES,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_terminal_tail_frames == NULL)
     {
         cleanup_init_failure();
         return ESP_ERR_NO_MEM;
