@@ -26,6 +26,11 @@ build/
 
 # ESP-IDF specific build outputs
 *.bin
+# 例外：main/assets 下的 .bin 是构建必需的源资产，不是编译产物。
+# 整点报时的 Opus 素材（prompt_chime_hour_*_opus.bin）就是这种格式，由
+# scripts/generate_prompt_tones.py 生成，main/CMakeLists.txt 用 EMBED_FILES
+# 直接嵌进固件。被 *.bin 挡掉的话，clone 下来一编译就找不到文件。
+!main/assets/**/*.bin
 *.elf
 *.map
 flasher_args.json # Generated in build directory

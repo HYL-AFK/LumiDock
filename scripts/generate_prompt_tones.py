@@ -85,6 +85,14 @@ TTS_VOICE = "zh-CN-XiaoxiaoNeural"
 #                  又不必牺牲三档区分度。
 TTS_RATE = "+18%"
 INTENT_RATE = "+35%"
+# 整点报时专用语速。报时只播一句，不像四段问候那样需要赶节奏：+18% 时
+# “现在是上午11点”只有 1.37 s，听感偏急；-33% 拉长到 2.45 s 才从容。
+# 这个值只作用于 prompt_chime_hour_* 这一套素材，开机问候不受影响。
+CHIME_RATE = "-33%"
+CHIME_BITRATE = 24000
+CHIME_FRAME_MS = 60
+CHIME_FIRST_HOUR = 7
+CHIME_LAST_HOUR = 21
 OUT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "main", "assets", "audio"))
 # A local prompt must stay short so it never blocks the turn it acknowledges.
 MAX_PHRASE_SECONDS = 3.0
@@ -369,6 +377,91 @@ def _placeholder_beep():
     return bytes(out)
 
 
+def _encode_opus_asset(pcm):
+    """PCM -> 设备端可直接播放的裸 Opus 资产。
+
+    格式：[u16 包数][u16 x N 包长][包数据连续存放]。
+
+    设备端 esp_opus_dec 吃的是裸包，不解析 Ogg 容器，所以这里把容器拆掉
+    只留包体。包长是变长的（静音段能被压到 3 字节），必须自带长度表。
+    60 ms 一包解出来正好 1920 字节，压在 audio_playback_service 单次入队
+    上限 2048 以内，所以设备端可以一包一入队。
+
+    av 不是硬依赖：装不上就返回 None，由调用方跳过这一条。
+    """
+    try:
+        import av
+    except Exception:
+        return None
+    try:
+        samples = SAMPLE_RATE * CHIME_FRAME_MS // 1000
+        stride = samples * 2
+        buf = io.BytesIO()
+        # libopus 默认按 20 ms 切帧，设备端的解码器配的是 60 ms，帧长必须对齐。
+        output = av.open(buf, "w", format="ogg")
+        stream = output.add_stream("libopus", rate=SAMPLE_RATE,
+                                   options={"frame_duration": str(CHIME_FRAME_MS)})
+        stream.layout = "mono"
+        stream.bit_rate = CHIME_BITRATE
+        pos = 0
+        while pos < len(pcm):
+            chunk = pcm[pos:pos + stride]
+            pos += stride
+            if len(chunk) < stride:
+                chunk += b"\x00" * (stride - len(chunk))
+            frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
+            frame.sample_rate = SAMPLE_RATE
+            frame.planes[0].update(chunk)
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode(None):
+            output.mux(packet)
+        output.close()
+
+        packets = []
+        container = av.open(io.BytesIO(buf.getvalue()))
+        for packet in container.demux():
+            if packet.size > 0:
+                packets.append(bytes(packet))
+        container.close()
+        if not packets:
+            return None
+
+        asset = bytearray()
+        asset += len(packets).to_bytes(2, "little")
+        for packet in packets:
+            asset += len(packet).to_bytes(2, "little")
+        for packet in packets:
+            asset += packet
+        return bytes(asset)
+    except Exception:
+        return None
+
+
+def _write_chime_assets():
+    """整点报时素材：单独一套慢速 Opus，与开机问候的 PCM 互不影响。"""
+    for hour in range(CHIME_FIRST_HOUR, CHIME_LAST_HOUR + 1):
+        text = HOUR_PHRASES[hour][1]
+        name = "prompt_chime_hour_%02d_16k_mono_opus.bin" % hour
+        data = _edge_tts_pcm(text, CHIME_RATE)
+        if data is None:
+            data = _pyttsx3_pcm(text, CHIME_RATE)
+        if data is None:
+            print("warning: no TTS engine for '%s'; skipping" % text)
+            continue
+        pcm = _trim_silence(data)
+        asset = _encode_opus_asset(pcm)
+        if asset is None:
+            print("warning: Opus encode failed for '%s'; skipping" % text)
+            continue
+        out = os.path.join(OUT_DIR, name)
+        with open(out, "wb") as f:
+            f.write(asset)
+        print("wrote %s: %d bytes (%.2f s PCM, %d packets)"
+              % (out, len(asset), len(pcm) / float(SAMPLE_RATE * 2),
+                 int.from_bytes(asset[0:2], "little")))
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     for name, text in PHRASES:
@@ -393,6 +486,10 @@ def main():
         if len(data) > int(SAMPLE_RATE * 2 * limit_s):
             print("warning: '%s' is %.2f s and exceeds the %.1f s budget; shorten the phrase"
                   % (text, len(data) / float(SAMPLE_RATE * 2), limit_s))
+
+    # 整点报时单独一套慢速 Opus：同一句话裸 PCM 要 78 KB，15 条就是 1.12 MB，
+    # Opus 只要 5.5 KB 一条。这套素材跟上面的问候片段完全独立。
+    _write_chime_assets()
 
 
 if __name__ == "__main__":
