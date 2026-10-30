@@ -481,8 +481,13 @@ static int hls_read(radio_hls_t *hls, uint8_t *buf, size_t len)
             /* 越过播放列表最后一片＝已经追平直播，那一片还没生成。不在这里判死的话
                会去 open 一个不存在的分片（见 hls_open_segment 的状态码检查），或者
                把一次 read 白挂到一个不会来的 body 上。交给外层去“等新片”，而不是
-               当成网络故障重连。 */
-            if (hls->last_index != 0U && hls->next_index > hls->last_index) {
+               当成网络故障重连。
+
+               注意这里是 >= 而不是 >：列表里最后一片通常刚出现在清单上，内容还在
+               服务器端写入。抢先拉它只会拿到半片——实测 16329138 拉了 11.3 秒都没
+               读完，重试一次后被当成网络故障跳过，用户少听 10 秒。多落后一片
+               （10 秒）换稳定，对直播电台完全划算。 */
+            if (hls->last_index != 0U && hls->next_index >= hls->last_index) {
                 hls->at_live_edge = true;
                 return 0;
             }
@@ -505,8 +510,8 @@ static int hls_read(radio_hls_t *hls, uint8_t *buf, size_t len)
                     if (!hls_read_playlist(hls, true)) return 0;
                     /* 重拉之后还是没片可拉：这就是追平了直播，不是网络故障。
                        （列表里已经多出新片的话 next_index 会落在窗口内，不会走
-                       这个分支。） */
-                    if (hls->next_index > hls->last_index) {
+                       这个分支。）这里同样留最后一片不拉，理由见上面的 >= 判断。 */
+                    if (hls->next_index >= hls->last_index) {
                         hls->at_live_edge = true;
                         return 0;
                     }

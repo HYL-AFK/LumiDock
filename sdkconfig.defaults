@@ -69,17 +69,29 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 # timer stack is too shallow for that call chain and stack-overflows into a
 # panic reboot. Keep it at 4096 so the timer callback can stop advertising.
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=4096
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_RX_BA_WIN=4
-# 接收侧已经顶到 RX_BA_WIN 的运行时限（(静态3+动态6)/2 = 4），再加缓冲数反而要
-# 从内部 DMA 内存里抠，是反方向；但发送侧从默认的 16 个一个没削过。电台是纯下行，
-# 上行只有 TCP ACK 和 WSS 那几十字节的 Opus 包，16 个 1.6 KB 的静态 TX 缓冲基本
-# 白占着——而那块内部 DMA 内存正是 WiFi 驱动分配接收侧网络缓冲（eb）的地方，
-# 拿不到就打 "wifi: m f null" 丢包，表现成电台一哑十几秒。留 8 个（加 32 深的
-# cache 队列）足够 ACK 和语音上行，省出来的还给接收路径。
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+# RX_BA_WIN 回到默认的 6。它原来是 4，连同接收缓冲一起被压掉过：当时在追“电台
+# 一哑十几秒”，把内部 DMA 内存全往接收路径推。但窗口 4 意味着一次只能连续收
+# 4 个帧，2.4G 一有干扰就得停下来重传，实际吞吐反而上不去。
+# ESP-IDF 的约束是 静态+动态 >= 2*RX_BA_WIN，所以缓冲数跟着一起抬（6+12 >= 12）。
+# 动态那 12 个走 PSRAM（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y），不多吃内部 RAM。
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+# 发送侧曾经为了给接收路径腾内部 DMA 内存被减到 8 个，现在恢复 16。理由是观测到
+# 的反向证据：新建 TCP 连接成片超时（esp-tls 报 "[sock=54] select() timeout"，
+# transport_base 32774，300 秒里 27 次），而已建立的连接仍能收数据——这不像对方
+# 不搭理，更像 SYN 自己没发出去。8 个 1.6 KB 的 TX 缓冲在同时有下行大流量（每片
+# 几十上百 KB 的 HLS）时是不够的：ACK 和新的 SYN 全在抢那几个位置。
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+# 主动关掉的短连接会在 TIME_WAIT 里挂 2×MSL。lwIP 默认 MSL=60 秒，于是一条连接
+# 要占着本地 PCB 和上游 NAT 映射整整 120 秒。而电台 HLS 每 10 秒就是一条新连接
+# （不做 keep-alive，理由见 radio_stream_service.c 的 hls_open_segment），光是
+# 续片就能同时攒出 12 条 TIME_WAIT，再叠上 probe、天气、定位。实测路由器
+# （192.168.1.10，手机热点级别）一满，新建连接就只会 select() 超时：日志里成对
+# 出现 "[sock=56] select() timeout" + transport_base 32774，5 秒白等一次，两次
+# 就把 STA 强制重连了。压到 6 秒（TIME_WAIT=12 秒）后同时挂着的只剩一两条。
+CONFIG_LWIP_TCP_MSL=6000
 CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
 CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
 CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000

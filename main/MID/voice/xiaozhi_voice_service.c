@@ -343,6 +343,17 @@ static int64_t s_prewarm_retry_us;
  * retries before the voice path settles. Reset to base after a successful
  * start or when a foreground session begins. */
 static int64_t s_prewarm_retry_delay_us;
+/* 空闲保温链路连续失败的次数（WSS ERROR 事件记账，CONNECTED 清零）。
+ *
+ * s_prewarm_retry_delay_us 管不到实际战场：它只在 prewarm_wss() 里 start_wss()
+ * 同步返回失败时抬倍，而 esp_websocket_client_start() 只要把 websocket 任务建起来就
+ * 返回 ESP_OK——DNS/TLS 失败是后面在 websocket 任务里异步报出来的，退避分支压根
+ * 不执行。实测连撞 20 次，每次都是 300 ms 一个来回。
+ *
+ * 代价不止于唤醒变慢：lwIP 的 DNS 等待表只有 4 个槽（DNS_TABLE_SIZE），连撞就能
+ * 把它占满，之后所有域名当场报 getaddrinfo 202，电台和天气一起断。所以这里必须
+ * 把指数退避接到真正能看见失败的地方。 */
+static uint32_t s_prewarm_link_fail_streak;
 static int64_t s_followup_deadline_us;
 /* 第一段聆听窗口没等到人说话时，已经播过一次“我没听清，可以再说一遍吗？”并重开。
    第二次到期仍走原来的退出流程——不设这个标记就会无限重开，设备永远不回待机。
@@ -1237,12 +1248,30 @@ static void schedule_idle_prewarm(bool radio_starting_after_close)
        在本次关闭之后才启动的，所以它也要算进来。 */
     const bool prewarm_radio_on =
         radio_starting_after_close || radio_stream_service_is_requested();
-    const int64_t prewarm_delay_us =
+    int64_t prewarm_delay_us =
         prewarm_radio_on ? XIAOZHI_PREWARM_RADIO_DELAY_US : XIAOZHI_PREWARM_IDLE_DELAY_US;
+    /* 连续失败要退避。300 ms 的电台档位是“电台占着资源，能早点建就早点建”，
+       前提是链路本身是好的；一旦建不起来还按 300 ms 重排，就是拿重连风暴去撞
+       已经出问题的解析器：实测每秒级连撞 20 次，把 lwIP 只有 4 个槽的 DNS 等待表
+       占满，之后电台、天气、probe 报的全部是 getaddrinfo 202。
+       按 2 的幂抬，封顶 XIAOZHI_PREWARM_RETRY_MAX_US；CONNECTED 时归零。 */
+    if (s_prewarm_link_fail_streak > 0U)
+    {
+        uint32_t shift = s_prewarm_link_fail_streak - 1U;
+        if (shift > 7U)
+            shift = 7U;
+        prewarm_delay_us <<= shift;
+        if (prewarm_delay_us > XIAOZHI_PREWARM_RETRY_MAX_US)
+            prewarm_delay_us = XIAOZHI_PREWARM_RETRY_MAX_US;
+    }
+    /* start_wss() 同步就失败时 prewarm_wss() 已经抬过一轮，这里取两者较大的。 */
+    if (s_prewarm_retry_delay_us > prewarm_delay_us)
+        prewarm_delay_us = s_prewarm_retry_delay_us;
     s_prewarm_retry_us = esp_timer_get_time() + prewarm_delay_us;
     s_prewarm_retry_delay_us = 0; /* fresh schedule: reset the backoff ramp */
-    ESP_LOGI(TAG, "WSS idle prewarm scheduled: delay_ms=%lld radio=%d",
-             (long long)(prewarm_delay_us / 1000LL), (int)prewarm_radio_on);
+    ESP_LOGI(TAG, "WSS idle prewarm scheduled: delay_ms=%lld radio=%d fails=%u",
+             (long long)(prewarm_delay_us / 1000LL), (int)prewarm_radio_on,
+             (unsigned)s_prewarm_link_fail_streak);
 }
 
 /* play_error_tone_then_close below may close the session directly when the
@@ -4473,6 +4502,9 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
         s_wss_last_pong_us = 0;
         s_wss_last_rx_us = s_wss_last_connected_us;
         s_wss_health = XIAOZHI_WSS_HEALTH_HEALTHY;
+        /* 链路真的立起来了才算翻篇：DNS 解析、TCP、TLS、WS 握手全部过了才会走到
+           这里，所以它是预连退避唯一可信的归零点。 */
+        s_prewarm_link_fail_streak = 0U;
         ESP_LOGI(TAG, "WSS heartbeat connected: seq=%u ping_interval_sec=%d pong_timeout_sec=%d",
                  (unsigned)connection_seq, XIAOZHI_WSS_PING_INTERVAL_SEC,
                  XIAOZHI_WSS_PONGPONG_TIMEOUT_SEC);
@@ -4525,6 +4557,13 @@ static void websocket_event(void *handler_args, esp_event_base_t base, int32_t e
         s_wss_health = event_id == WEBSOCKET_EVENT_ERROR
                            ? XIAOZHI_WSS_HEALTH_FAILED
                            : XIAOZHI_WSS_HEALTH_STALE;
+        /* 只给 ERROR 记账，DISCONNECTED/CLOSED 不算：正常收场（用户说完话、
+           服务器发 goodbye）也走那两个事件，把它们算进去会让下一次预连平白
+           变慢，而那不是故障。 */
+        if (event_id == WEBSOCKET_EVENT_ERROR && s_prewarm_link_fail_streak < 32U)
+        {
+            ++s_prewarm_link_fail_streak;
+        }
         ESP_LOGW(TAG, "WSS disconnect callback kind=%s event_id=%ld connection_seq=%u op=%s terminal_gen=%u",
                  wss_event_name(event_id), (long)event_id, (unsigned)connection_seq, s_uplink_tx_operation,
                  (unsigned)s_uplink_terminal_generation);

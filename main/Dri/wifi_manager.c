@@ -33,9 +33,12 @@
 /*
  * Wi-Fi APSTA 管理模块。
  *
- * 启动后固定工作在 WIFI_MODE_APSTA：
- * - AP 侧：始终提供设备热点，默认 ESP32S3-SETUP / 12345678。
+ * 启动时工作在 WIFI_MODE_APSTA：
+ * - AP 侧：先提供设备热点（默认 ESP32S3-SETUP / 12345678），方便手机直连；
+ *   一旦 STA 拿到 IP，热点就会关掉，降到 WIFI_MODE_STA。重新配网走 BLE，
+ *   不靠这个热点长期存在。
  * - STA 侧：根据 NVS 中保存的 Wi-Fi 列表，扫描环境并连接信号最强的可用 SSID。
+ *   信道范围是 1~13（country "CN"），不是驱动默认的 1~11。
  *
  * BLE 配网模块收到新配置后，只需要更新 app_config，再调用 wifi_manager_connect_sta()。
  */
@@ -78,9 +81,15 @@ static void internet_probe_delay(uint32_t delay_ms)
  * 实测表现是电台 11 次 http_open 全部报 28674、WSS 的 getaddrinfo 全部报 202，
  * 而界面依旧打印 wifi=1 internet=1，设备一直卡到重启。
  *
- * 在线时改成定时自醒巡检。取 10 秒是折中：探测自身失败还要耗掉 5 秒超时；再密会让
- * HTTP client 的分配/释放过于频繁，而内部 RAM 一向紧张。 */
-#define INTERNET_PROBE_ONLINE_POLL_INTERVAL_MS 10000
+ * 在线时改成定时自醒巡检。
+ *
+ * 间隔从 10 秒放到 30 秒，不是拿假死检测速度换资源——在线时它本来也测不出东西，
+ * 而每探测一次就是一条全新的 TCP 连接，关掉后还要在 TIME_WAIT 里挂 2×MSL，
+ * 占着上游 NAT 映射。实测路由器（手机热点级别）被 HLS 续片和这个探测一起磨满
+ * 之后，新建连接只会 select() 超时，反倒把真的故障引出来了。
+ * 真正的检疾速度在失败后的那一段：一旦失败计数不为零就切到下面的 2 秒节拍，
+ * 跟这个间隔无关。 */
+#define INTERNET_PROBE_ONLINE_POLL_INTERVAL_MS 30000
 /* 已经判为不健康之后的复测节拍。原来直接复用 5 秒的“离线重试”间隔，但假死期间每次
  * 探测要么耗满 5 秒超时、要么立刻失败，失败次数是唯一还能压缩的变量：间隔收到 2 秒，
  * 配合硬失败两次到线（分级见 internet_health_policy.h），判定时间能砍掉大半。
@@ -336,12 +345,37 @@ static void internet_probe_task(void *arg)
         }
 
         const bool was_online = get_internet_online();
+        /* 探测期间应用层收了多下行，用来给失败判决加一个旁证。
+         *
+         * probe 实际上只测了一件事：“现在能不能新建一条到 www.qq.com 的
+         * TCP 连接”，它测不出“网络死没死”。实测现场里这两件事经常相反：电台
+         * 正在稳定出声（每 10 秒一片、每片几十上百 KB），WSS 也在收发，可 probe
+         * 连续两次碰上 SYN 超时（日志里是 "[sock=54] select() timeout" +
+         * transport_base 32774），于是判活死、强制重连 STA，把好好的电台和
+         * 语音一起打断。一次 300 秒的抓取里这样的事发生了 4 次。
+         *
+         * 所以拿下行字节做主证：一次探测本身就要等 5 秒超时，这 5 秒里只要
+         * 应用层还收到过数据，链路就是活的，失败最多说明那个端点或那条新连接
+         * 走了背字。真的假死时电台也拉不到数据，这个计数一字节都不会动，
+         * 判定照旧生效。 */
+        device_data_traffic_t traffic = {0};
+        device_data_traffic_get(&traffic);
+        const uint64_t rx_before = traffic.boot_rx;
         const internet_probe_outcome_t outcome = probe_internet_once();
+        device_data_traffic_get(&traffic);
+        const bool downlink_alive = traffic.boot_rx > rx_before;
         const internet_health_action_t action = record_internet_probe(outcome);
         if (action == INTERNET_HEALTH_ONLINE && !was_online) {
             APP_LOGI(TAG, "internet probe online: %s", INTERNET_PROBE_URL);
             (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 1, 0, 0);
             notify_status_changed();
+        } else if (action == INTERNET_HEALTH_RECONNECT && downlink_alive) {
+            /* 只降级、不重连：接口层已经在报“不健康”了（界面/统计照旧），
+               但没有任何理由去断一条正在工作的链路。 */
+            APP_LOGW(TAG,
+                     "internet probe failed but %llu B came down meanwhile; keeping the link",
+                     (unsigned long long)(traffic.boot_rx - rx_before));
+            (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 0, 4U, 0);
         } else if (action == INTERNET_HEALTH_RECONNECT) {
             /* 硬失败两次就到线、软失败要三次，同一个“重连”背后是两件不同的事，
                日志必须分得开，否则下次复盘又会把它们当成同一种故障。 */
@@ -613,6 +647,55 @@ static void log_sta_network_info(const ip_event_got_ip_t *event)
                   gw_str,
                   dns1_str,
                   dns2_str);
+}
+
+/* DHCP 给的 DNS 要不要换掉，换完谁是主谁是备。
+ *
+ * 实测现场：DHCP 只发一个 DNS，就是路由器自己（dns1=192.168.1.10，dns2=0.0.0.0）。
+ * 路由器那头一限流或者歇卡，整机的解析会同时失败——同一秒里电台
+ * （ngcdn001.cnr.cn）、WSS（api.tenclass.net）、天气、定位、internet probe 一起报
+ * getaddrinfo 202。
+ *
+ * 只把公共 DNS 挂在 BACKUP 上并不够：lwIP 的等待表只有 DNS_TABLE_SIZE=4 个槽
+ * （components/lwip/lwip/src/core/dns.c，dns_enqueue 里满表直接 return ERR_MEM，
+ * 对应 getaddrinfo 的 202）。四个域名同时卡在这个不说话的服务器上，后来的查询
+ * 连排队都排不进，根本轮不到备用服务器——实测 WSS 每 300 ms 重连一次，20 次全部
+ * 在同一个毫秒里失败。所以主备要换过来：公共 DNS 当主，路由器降为备，lwIP 只在
+ * 首选超时后才切过去。
+ *
+ * 只在“网关自己就是 DNS”时换。DHCP 要是已经发了运营商或公网 DNS，那就说明这一
+ * 层本来就是好的，不去多事——换掉反而可能在段内域名或企业网里解析不了。 */
+static void apply_sta_dns_order(void)
+{
+    if (s_sta_netif == NULL) return;
+
+    esp_netif_dns_info_t current_main = {0};
+    if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &current_main) != ESP_OK) {
+        return;
+    }
+    if (current_main.ip.type != ESP_IPADDR_TYPE_V4 || current_main.ip.u_addr.ip4.addr == 0U) {
+        return;
+    }
+
+    esp_netif_ip_info_t ip_info = {0};
+    if (esp_netif_get_ip_info(s_sta_netif, &ip_info) != ESP_OK) return;
+    if (current_main.ip.u_addr.ip4.addr != ip_info.gw.addr) return;
+
+    /* 先把路由器的旧主 DNS 挪到备用，再覆盖主——顺序反了会把刚拿到的那份丢掉。 */
+    const esp_err_t backup_err =
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &current_main);
+    if (backup_err != ESP_OK) {
+        APP_LOGW(TAG, "keep router DNS as backup failed: %s", esp_err_to_name(backup_err));
+    }
+
+    esp_netif_dns_info_t public_dns = {0};
+    public_dns.ip.type = ESP_IPADDR_TYPE_V4;
+    public_dns.ip.u_addr.ip4.addr = ESP_IP4TOADDR(223, 5, 5, 5);
+    const esp_err_t main_err =
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &public_dns);
+    if (main_err != ESP_OK) {
+        APP_LOGW(TAG, "set public DNS as primary failed: %s", esp_err_to_name(main_err));
+    }
 }
 
 static void sta_reconnect_task(void *arg)
@@ -929,6 +1012,7 @@ static void process_wifi_event(network_coordinator_event_t *network_event)
         portEXIT_CRITICAL(&s_sta_state_lock);
         esp_ip4addr_ntoa(&event->ip_info.ip, s_sta_ip_str, sizeof(s_sta_ip_str));
         APP_LOGI(TAG, "STA got IP: %s", s_sta_ip_str);
+        apply_sta_dns_order();
         runtime_event_log_append(RUNTIME_EVENT_WIFI_CONNECTED,
                                  s_sta_rssi,
                                  s_sta_channel,
@@ -947,6 +1031,22 @@ static void process_wifi_event(network_coordinator_event_t *network_event)
         }
         log_sta_network_info(event);
         notify_status_changed();
+
+        /* 拿到 IP 就说明配网已经完成，热点没有继续开着的理由：它一直占着
+         * 射频，还让别人能搜到一个固定名字的热点。
+         *
+         * 关掉之后重新配网的入口是 BLE——STA 连续失败 3 次时 wifi_service
+         * 会自动重开 BLE 窗口，重启设备也会重新拉起 APSTA。所以这里只需要
+         * 在确认联网后关一次，不用在断开时反向恢复。 */
+        wifi_mode_t current_mode = WIFI_MODE_NULL;
+        if (esp_wifi_get_mode(&current_mode) == ESP_OK &&
+            (current_mode == WIFI_MODE_APSTA || current_mode == WIFI_MODE_AP)) {
+            if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+                APP_LOGI(TAG, "STA online, setup AP turned off");
+            } else {
+                APP_LOGW(TAG, "STA online, but turning off the setup AP failed");
+            }
+        }
     }
     else if (event_id == NETWORK_EVENT_STA_LOST_IP)
     {
@@ -1068,6 +1168,24 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
         return err;
     }
 
+    /* 不设 country 时驱动用默认值 "01"（world safe mode），只开放 1~11 信道，
+     * 国内路由器把 2.4G 设在 12/13 时会直接扫不到这个 SSID。显式声明中国区
+     * 才能用满 1~13。
+     *
+     * 用 AUTO 而不是 MANUAL：连上后跟随 AP 广播的 country IE，AP 说自己是
+     * 1~11 的地区就退回 11，不会出现“设备比路由器还宽”的情况。 */
+    const wifi_country_t wifi_country = {
+        .cc = "CN",
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_AUTO,
+    };
+    err = esp_wifi_set_country(&wifi_country);
+    if (err != ESP_OK) {
+        APP_LOG_ERR(TAG, err, "set Wi-Fi country failed");
+        return err;
+    }
+
     s_network_event_queue = xQueueCreate(16U, sizeof(network_coordinator_event_t));
     if (s_network_event_queue == NULL) {
         APP_LOGE(TAG, "create Wi-Fi async dispatch queue failed");
@@ -1107,6 +1225,15 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
     if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
         APP_LOG_ERR(TAG, err, "start Wi-Fi failed");
         return err;
+    }
+    /* 关掉 modem sleep。IDF 默认是 WIFI_PS_MIN_MODEM：空闲时把射频关掉，下一个包
+       得等 beacon 周期才能出去。对方是持续拉流的电台时，这条路径上的代价很具体——
+       信号 -55 dBm、HLS 一直在放，但每 80 秒左右就有一轮 internet probe 报
+       ESP_ERR_HTTP_CONNECT，连续两次后强制重连 STA，电台和 WSS 一起断 4 秒。
+       功耗会增加，但这是接市电的桌面设备，稳定优先。 */
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        APP_LOGW(TAG, "disable Wi-Fi power save failed: %s", esp_err_to_name(ps_err));
     }
 
     s_wifi_running = true;
