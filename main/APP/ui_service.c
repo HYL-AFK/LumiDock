@@ -66,12 +66,25 @@
 /* 律动幅度：相位 0..3 步，最高 12 + 3*6 = 30px，顶端到 y=70。 */
 #define UI_RADIO_BAR_STEP_HEIGHT 6
 #define UI_RADIO_LABEL_TOP 108
-/* 两侧各摆一个“下一台”图标（双箭头）。32px 的正方形取居中：这一组从电平表最高
-   时的 y=70 到台名底部的 y=132，中心 101，所以图标顶边在 101-16=85。 */
-#define UI_RADIO_ICON_SIZE 32
-#define UI_RADIO_ICON_LEFT_X 12
-#define UI_RADIO_ICON_RIGHT_X (ST7789_WIDTH - UI_RADIO_ICON_LEFT_X - UI_RADIO_ICON_SIZE)
-#define UI_RADIO_ICON_Y 85
+/* 两侧各摆一个“下一台”按钮。32px 的双箭头居中压在一块圆角底板上，底板再往右下
+   投一层柔影，让它看起来是能按下去的一块，而不是印在屏幕上的一个符号。
+
+   宽度 44 是给 32px 图标留的六格边距；再窄，双箭头的折角就贴到圆角上了。高度单独
+   拉到 62，对着中间那组取齐：电平表最高时顶到 y=70，台名底部落在 y=132，正好 62px。
+   上下等长之后，两侧按钮和中间的电平表、台名共享同一条上下边线，整屏看过去是一条
+   横带，而不是三个各自为政的小方块。
+
+   左右各留 8px：阴影是 offset(2,3) 配 6px 柔化，向左探出 4px、向右探出 8px，
+   留 8 才刚好不顶到屏幕边缘被裁掉一圈硬边。 */
+#define UI_RADIO_BUTTON_WIDTH 44
+#define UI_RADIO_BUTTON_HEIGHT 62
+#define UI_RADIO_BUTTON_RADIUS 8
+#define UI_RADIO_BUTTON_SHADOW_WIDTH 6
+#define UI_RADIO_BUTTON_SHADOW_OFS_X 2
+#define UI_RADIO_BUTTON_SHADOW_OFS_Y 3
+#define UI_RADIO_BUTTON_LEFT_X 8
+#define UI_RADIO_BUTTON_RIGHT_X (ST7789_WIDTH - UI_RADIO_BUTTON_LEFT_X - UI_RADIO_BUTTON_WIDTH)
+#define UI_RADIO_BUTTON_Y (101 - UI_RADIO_BUTTON_HEIGHT / 2)
 /* 台名最长 4 个汉字（12 字节），状态最长 3 个汉字（9 字节），加分隔符远不到 40。 */
 #define UI_RADIO_LABEL_MAX 48U
 /* 状态栏下面那条分隔线。状态栏图标占 6..29（24px 高，起点 6），主页面头部组
@@ -186,9 +199,11 @@ typedef struct
     lv_obj_t *voice_thinking_dots[3];
     lv_obj_t *voice_error_left;
     lv_obj_t *voice_error_right;
-    /* 电台驻留期间才出现的元素：两侧各一个“下一台”图标，中间一条电平表和
+    /* 电台驻留期间才出现的元素：两侧各一个“下一台”按钮，中间一条电平表和
        一行“台名 | 状态”。它们和语音表情共用同一页，由 update_radio_strip()
        一起显隐。 */
+    lv_obj_t *radio_button_left;
+    lv_obj_t *radio_button_right;
     lv_obj_t *radio_icon_left;
     lv_obj_t *radio_icon_right;
     lv_obj_t *radio_bars[UI_RADIO_BAR_COUNT];
@@ -875,6 +890,35 @@ static void create_activation_page(lv_obj_t *root)
     lv_obj_center(s_scene.activation_code);
 }
 
+/* 电台两侧按钮的底板。做成一块带柔影的圆角浅灰，而不是让双箭头直接浮在白底上：
+   白底白面的时候图标看着像印在屏幕上，垫一层投影才有按得下去的感觉。
+
+   底色和阴影都走 UI_INK 叠 alpha，不另算一组灰值。这台机器是 RGB565 16 位色，
+   手写的灰很容易悄悄带上色偏（界面里现成的 UI_MUTED 展开就是偏蓝的灰，不是中
+   性灰），同一种墨色配不同不透明度能保证整屏灰阶是一个色系，也省得为一个按钮
+   再引入三个色号。 */
+static lv_obj_t *make_radio_button(lv_obj_t *parent, lv_coord_t x)
+{
+    lv_obj_t *button = lv_obj_create(parent);
+    lv_obj_remove_style_all(button);
+    lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(button, UI_RADIO_BUTTON_WIDTH, UI_RADIO_BUTTON_HEIGHT);
+    lv_obj_set_pos(button, x, UI_RADIO_BUTTON_Y);
+    lv_obj_set_style_radius(button, UI_RADIO_BUTTON_RADIUS, 0);
+    lv_obj_set_style_bg_color(button, color(UI_INK), 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_10, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, color(UI_INK), 0);
+    lv_obj_set_style_border_opa(button, LV_OPA_10, 0);
+    lv_obj_set_style_shadow_width(button, UI_RADIO_BUTTON_SHADOW_WIDTH, 0);
+    lv_obj_set_style_shadow_color(button, color(UI_INK), 0);
+    lv_obj_set_style_shadow_opa(button, LV_OPA_30, 0);
+    lv_obj_set_style_shadow_offset_x(button, UI_RADIO_BUTTON_SHADOW_OFS_X, 0);
+    lv_obj_set_style_shadow_offset_y(button, UI_RADIO_BUTTON_SHADOW_OFS_Y, 0);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_HIDDEN);
+    return button;
+}
+
 static void create_voice_page(lv_obj_t *root)
 {
     s_scene.voice_page = lv_obj_create(root);
@@ -913,20 +957,21 @@ static void create_voice_page(lv_obj_t *root)
     lv_obj_set_pos(s_scene.voice_error_right, 198, 48);
     lv_obj_add_flag(s_scene.voice_error_left, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_scene.voice_error_right, LV_OBJ_FLAG_HIDDEN);
-    /* 电台两侧的“下一台”图标：同一个双箭头左右各摆一个，表示这边可以在频道
-       之间前后走。它们是位图而不是画出来的，因为那个双箭头的折角用矩形拼不出来。 */
-    s_scene.radio_icon_left = lv_image_create(s_scene.voice_page);
-    s_scene.radio_icon_right = lv_image_create(s_scene.voice_page);
+    /* 电台两侧的“下一台”按钮：同一个双箭头左右各摆一个，表示这边可以在频道
+       之间前后走。箭头是位图而不是画出来的，因为那个双箭头的折角用矩形拼不出来；
+       底板才是按钮本体，图标只是挂在它上面居中显示的子对象，跟着底板一起显隐。 */
+    s_scene.radio_button_left = make_radio_button(s_scene.voice_page, UI_RADIO_BUTTON_LEFT_X);
+    s_scene.radio_button_right = make_radio_button(s_scene.voice_page, UI_RADIO_BUTTON_RIGHT_X);
+    s_scene.radio_icon_left = lv_image_create(s_scene.radio_button_left);
+    s_scene.radio_icon_right = lv_image_create(s_scene.radio_button_right);
     /* 左边那张是右边那张的水平镜像（radio_next_left_icon 就是 radio_next_icon 逐像素翻
        面来的），单独一份位图而不是运行时转 180°。转出来的像素其实一样，但要过 LVGL
        的变换管线（每帧重新采样，还依赖全局的 LV_DRAW_SW_COMPLEX），哪天那个开关被关
        掉，左箭头会不声不响地又指回右边；镜像位图是死数据，零运行时成本也零依赖。 */
     lv_image_set_src(s_scene.radio_icon_left, &ui_icon_radio_next_left);
     lv_image_set_src(s_scene.radio_icon_right, &ui_icon_radio_next);
-    lv_obj_set_pos(s_scene.radio_icon_left, UI_RADIO_ICON_LEFT_X, UI_RADIO_ICON_Y);
-    lv_obj_set_pos(s_scene.radio_icon_right, UI_RADIO_ICON_RIGHT_X, UI_RADIO_ICON_Y);
-    lv_obj_add_flag(s_scene.radio_icon_left, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_scene.radio_icon_right, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(s_scene.radio_icon_left);
+    lv_obj_center(s_scene.radio_icon_right);
     /* 电台的电平表：五根圆角短条，底边对齐，高度由 update_radio_strip() 每帧改写。
        底边固定而不是顶边固定，条才会像电平表一样从中间往上蹿。 */
     for (size_t i = 0; i < UI_RADIO_BAR_COUNT; ++i)
@@ -1539,15 +1584,15 @@ static void update_radio_strip(bool radio_idle)
         {
             s_scene.radio_label_cache[0] = '\0';
             lv_obj_add_flag(s_scene.radio_label, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_scene.radio_icon_left, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_scene.radio_icon_right, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_scene.radio_button_left, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_scene.radio_button_right, LV_OBJ_FLAG_HIDDEN);
             for (size_t i = 0; i < UI_RADIO_BAR_COUNT; ++i)
                 lv_obj_add_flag(s_scene.radio_bars[i], LV_OBJ_FLAG_HIDDEN);
         }
         return;
     }
-    lv_obj_clear_flag(s_scene.radio_icon_left, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(s_scene.radio_icon_right, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_scene.radio_button_left, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_scene.radio_button_right, LV_OBJ_FLAG_HIDDEN);
     const bool paused = radio_stream_service_is_user_paused();
     /* 只有真在出声才让电平表律动。暂停和重连都压平——“没声音”就该看起来没声音，
        否则断流那几十秒里条还在跳，和“设备死了”一样让人摸不着头脑。 */

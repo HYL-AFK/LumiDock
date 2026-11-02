@@ -5,6 +5,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "fault_registry.h"
 #include "fan_control.h"
 #include "ntc_sensor.h"
 
@@ -138,6 +139,17 @@ static void apply_tier(thermal_tier_t tier)
         ESP_LOGI(TAG, "fan %s -> %s at %.2f C: %u%%", tier_name(s_tier), tier_name(tier),
                  (double)s_temperature_c, (unsigned)tier_percent(tier));
         s_tier = tier;
+        /* 60 °C 往上挂过温码。只在档位翻转时动故障表，不是每次采样都动——
+         * 这个函数被温度循环高频调用，拿锁拿到每一帧就是在白白制造竞争。
+         *
+         * 挂等级2 而不是等级1：风扇已经全开在压了，重启只会让它重新升温，
+         * 根本解决不了问题。等级2 的语义正是“可以一直挂着”的环境类故障。 */
+        if (tier >= THERMAL_TIER_HIGH) {
+            (void)fault_registry_raise(FAULT_P207_THERMAL_HIGH,
+                                       (int32_t)(s_temperature_c * 10.0f));
+        } else {
+            (void)fault_registry_clear(FAULT_P207_THERMAL_HIGH);
+        }
     }
     s_fan_percent = tier_percent(tier);
     /* 驱动层自己会忽略重复值，所以这里不需要再确认一次是否变化。 */

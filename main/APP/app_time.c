@@ -19,9 +19,11 @@
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
+#include "app_rtc.h"
 #include "app_weather.h"
 #include "app_log.h"
 #include "device_data.h"
+#include "fault_registry.h"
 #include "http_memory_log.h"
 #include "location_snapshot.h"
 #include "time_snapshot.h"
@@ -322,6 +324,11 @@ static void apply_sntp_time(void)
                              (int32_t)elapsed_ms,
                              (int32_t)now,
                              0);
+    /* 挂个待写标志，顺手写回 DS3231，下一次冷启动就能从芯片直接读。
+     * 真正的 I2C 事务在 app_rtc_poll() 里做，这里不能阻塞。 */
+    app_rtc_sync_from_system();
+    /* SNTP 成功就等于时间问题解决了，撤掉之前那个降级码。 */
+    (void)fault_registry_clear(FAULT_P204_TIME_UNSYNCED);
 }
 
 void app_time_apply_http_time(time_t utc_time)
@@ -341,6 +348,11 @@ void app_time_apply_http_time(time_t utc_time)
     APP_LOGI(TAG, "HTTP Date time applied: %04d-%02d-%02d %02d:%02d:%02d",
              local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
              local.tm_hour, local.tm_min, local.tm_sec);
+    /* wifi_manager 在这之前已经 settimeofday 过了，这里挂的写回是同一个值。
+     * 同上，I2C 留给 app_rtc_poll()。 */
+    app_rtc_sync_from_system();
+    /* HTTP Date 头也是可信的时钟源，同样足以撤掉未同步告警。 */
+    (void)fault_registry_clear(FAULT_P204_TIME_UNSYNCED);
 }
 
 void app_time_notify_internet_online(void)
@@ -364,6 +376,11 @@ static void schedule_sntp_retry(const char *reason)
         APP_LOGW(TAG,
                  "SNTP sync unavailable after %u attempts; keep current system time",
                  (unsigned)SNTP_MAX_ATTEMPTS);
+        /* 只在用尽的那一刻挂码。降级而不是致命：时钟不准会让 HTTPS 证书
+         * 校验失败、定时器拒绝设闹钟，但设备本身跑得好好的，而且再重启
+         * 一轮 SNTP 也未必能连上。 */
+        (void)fault_registry_raise(FAULT_P204_TIME_UNSYNCED,
+                                   (int32_t)SNTP_MAX_ATTEMPTS);
     }
 }
 
@@ -517,6 +534,10 @@ esp_err_t app_time_init(void)
 {
     esp_err_t err = app_time_prepare_timezone();
     if (err != ESP_OK) return err;
+    /* 尽早把时间从 DS3231 取回来：后面定位和天气都走 https，证书校验需要
+     * 一个正确的时钟，而 SNTP 要等公网探测通过才开始。这里只登记意图，
+     * 真正的 I2C 事务在 snapshot_bridge 的第一拍上做（app_main 栈不够）。 */
+    (void)app_rtc_init();
     if (location_snapshot_init() != ESP_OK) return ESP_ERR_NO_MEM;
 
     s_sntp_events = xEventGroupCreate();

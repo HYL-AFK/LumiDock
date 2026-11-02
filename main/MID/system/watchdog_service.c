@@ -38,6 +38,11 @@ static SemaphoreHandle_t s_lock;
 static bool s_initialized;
 static bool s_business_suspended;
 static bool s_failure_latched;
+/* Set by watchdog_service_request_reset(). Only a single word is read in the
+   supervisor loop, so a volatile flag is enough; the reason string must point
+   at a literal or other storage that outlives the call. */
+static volatile bool s_reset_requested;
+static const char *volatile s_reset_reason;
 
 static watchdog_slot_t *find_slot(TaskHandle_t handle)
 {
@@ -59,6 +64,17 @@ static void supervisor_task(void *arg)
         const int64_t now_us = esp_timer_get_time();
         bool stale = false;
         if (s_lock != NULL) xSemaphoreTake(s_lock, portMAX_DELAY);
+        /* An external request (fault registry, level-1 grace window expired)
+           takes the same latch as a dead heartbeat rather than calling
+           esp_restart(): the supervisor must be the only thing that stops
+           feeding, so the reset point stays deterministic. */
+        if (s_reset_requested && !s_failure_latched) {
+            s_reset_requested = false;
+            s_failure_latched = true;
+            stale = true;
+            ESP_LOGE(TAG, "reset request accepted: %s",
+                     s_reset_reason != NULL ? s_reset_reason : "unspecified");
+        }
         if (!s_business_suspended && !s_failure_latched) {
             for (size_t i = 0; i < WATCHDOG_MAX_TASKS; ++i) {
                 watchdog_slot_t *slot = &s_slots[i];
@@ -97,7 +113,7 @@ static void supervisor_task(void *arg)
         if (!s_failure_latched) {
             (void)esp_task_wdt_reset();
         } else if (stale) {
-            ESP_LOGE(TAG, "watchdog reset armed after heartbeat failure");
+            ESP_LOGE(TAG, "hardware watchdog left unfed; device will reset");
         }
         vTaskDelay(pdMS_TO_TICKS(WATCHDOG_SUPERVISOR_PERIOD_MS));
     }
@@ -205,4 +221,16 @@ void watchdog_service_set_business_suspended(bool suspended)
         }
     }
     xSemaphoreGive(s_lock);
+}
+
+esp_err_t watchdog_service_request_reset(const char *reason)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    /* Store the pointer, not a copy: this is only ever called with literals,
+       and the supervisor reads it from a 250 ms loop where a bounded strlcpy
+       into a shared buffer would just add a race for no benefit. */
+    s_reset_reason = reason;
+    s_reset_requested = true;
+    ESP_LOGE(TAG, "reset requested: %s", reason != NULL ? reason : "unspecified");
+    return ESP_OK;
 }

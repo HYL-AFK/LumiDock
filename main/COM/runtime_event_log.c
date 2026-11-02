@@ -76,6 +76,8 @@ static const char *event_type_name(runtime_event_type_t type)
     case RUNTIME_EVENT_BLE_TIMEOUT: return "BLE_TIMEOUT";
     case RUNTIME_EVENT_BLE_PROVISION_ACCEPTED: return "BLE_ACCEPTED";
     case RUNTIME_EVENT_WATCHDOG_FAILURE: return "WATCHDOG";
+    case RUNTIME_EVENT_FAULT_RAISED: return "FAULT_RAISE";
+    case RUNTIME_EVENT_FAULT_CLEARED: return "FAULT_CLEAR";
     default: return "UNKNOWN";
     }
 }

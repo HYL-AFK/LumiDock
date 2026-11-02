@@ -69,12 +69,21 @@ if ($driver -notmatch 'LUMIDOCK_WS2812_2_GPIO') {
     throw 'The SPI waveform must be routed to the second GPIO14 output.'
 }
 
-$faultPriority = $service.IndexOf('if (s_critical_fault) return STATUS_LED_FAULT;')
+# 故障抢占开机动画靠的是返回值位置，不再匹配整行条件：故障判定已经从单一
+# s_critical_fault 扩成“critical fault 或 fault_registry 的等级1”，整行字符串
+# 随语义演进是正常的，但“故障必须先于动画被判断”这条不能变。
+$faultPriority = $service.IndexOf('return STATUS_LED_FAULT;')
 $bootPriority = $service.IndexOf('if (s_boot_animation_active) return STATUS_LED_BOOT_ANIMATION;')
 $successPriority = $service.IndexOf('if (now_us < s_success_until_us) return STATUS_LED_SUCCESS;')
 if ($faultPriority -lt 0 -or $bootPriority -lt 0 -or $successPriority -lt 0 -or
     $faultPriority -gt $bootPriority -or $bootPriority -gt $successPriority) {
     throw 'Boot animation must hold the green trailing LED overlay for its full duration; only a critical fault may take priority.'
+}
+
+# s_critical_fault 仍然必须参与故障判定，且必须在 FAULT 返回之前被读到。
+$criticalRef = $service.IndexOf('s_critical_fault')
+if ($criticalRef -lt 0 -or $criticalRef -gt $faultPriority) {
+    throw 's_critical_fault must still gate the FAULT state ahead of the boot animation.'
 }
 
 Write-Output 'WS2812 status contract passed.'

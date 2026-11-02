@@ -48,6 +48,7 @@ LumiDock 是一台桌面智能终端固件，跑在 ESP32-S3（N8R2：8 MB Flash
 | LCD（SPI2） | SCLK=1, MOSI=2, RST=11, DC=4, CS=5, BL=6 |
 | 音频（I2S） | BCLK=10, LRCLK=9, MIC=8, AMP=7, MCLK=38 |
 | ES8311（I2C，400 kHz） | SDA=17, SCL=18 |
+| DS3231 RTC（I2C_NUM_1，400 kHz） | SDA=21, SCL=47（引脚已预留，模块未接，`LUMIDOCK_DS3231_ENABLE` 现为 0） |
 | 按键 | 12 |
 | WS2812 | 灯带=13/14（24 颗），板载=48 |
 | BMS（UART2） | TX=39, RX=40 |

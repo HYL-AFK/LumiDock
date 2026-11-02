@@ -23,6 +23,7 @@
 
 #include "app_log.h"
 #include "device_data.h"
+#include "fault_registry.h"
 #include "runtime_event_log.h"
 #include "internet_health_policy.h"
 #include "watchdog_service.h"
@@ -340,6 +341,10 @@ static void internet_probe_task(void *arg)
         watchdog_service_feed();
         if (!s_sta_connected) {
             reset_internet_health();
+            /* STA 都没连上，公网探测无从谈起。挂 P202 而不是 P203：这两个码
+             * 在界面上的含义不同，一个是本地链路断了，一个是链路通但公网
+             * 不可达，排查方向完全不一样。 */
+            (void)fault_registry_raise(FAULT_P202_WIFI_LOST, 0);
             internet_probe_wait_for_connection_change();
             continue;
         }
@@ -368,6 +373,10 @@ static void internet_probe_task(void *arg)
         if (action == INTERNET_HEALTH_ONLINE && !was_online) {
             APP_LOGI(TAG, "internet probe online: %s", INTERNET_PROBE_URL);
             (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 1, 0, 0);
+            /* 探测通过就同时撤掉两个降级故障。分不清刚才到底是 WiFi 掉了
+             * 还是只是公网不通，但既然能新建 TCP 连接，两个都不成立。 */
+            (void)fault_registry_clear(FAULT_P202_WIFI_LOST);
+            (void)fault_registry_clear(FAULT_P203_INTERNET_DOWN);
             notify_status_changed();
         } else if (action == INTERNET_HEALTH_RECONNECT && downlink_alive) {
             /* 只降级、不重连：接口层已经在报“不健康”了（界面/统计照旧），
@@ -385,6 +394,10 @@ static void internet_probe_task(void *arg)
                                  : "the endpoint kept answering with an unusable response");
             (void)runtime_event_log_append(RUNTIME_EVENT_INTERNET_PROBE, 0,
                                            unreachable ? 2U : 3U, 0);
+            /* 挂码放在这里而不是每次探测失败的地方：单次失败是信道抖动，
+             * internet_health_policy 已经用连中两次/三次把抖动滤掉了，走到
+             * 这一行说明链路确实不工作。 */
+            (void)fault_registry_raise(FAULT_P203_INTERNET_DOWN, (int32_t)outcome);
             notify_status_changed();
             wifi_manager_reconnect_sta();
         }
@@ -1240,7 +1253,12 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
     update_ap_ip_cache();
     s_inited = true;
     internet_health_policy_init(&s_internet_health);
-    if (xTaskCreatePinnedToCoreWithCaps(internet_probe_task, "internet_probe", 3072, NULL, 3,
+    /* 5120 而不是 3072：这个任务里 esp_http_client_perform() 本身就要吃掉
+     * 一大半，现在还要在探测结果上挂/撤故障码（APP_LOGW 的格式化加上
+     * runtime_event_log 的一次加锁写入）。之前 3072 在 HTTP Date 回调里
+     * 碰过一次 I2C 就爆过栈，这里不再赌边界。栈在 PSRAM，多出的 2 KB
+     * 不占内部 RAM。 */
+    if (xTaskCreatePinnedToCoreWithCaps(internet_probe_task, "internet_probe", 5120, NULL, 3,
                     &s_internet_probe_task, tskNO_AFFINITY,
                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_internet_probe_task = NULL;

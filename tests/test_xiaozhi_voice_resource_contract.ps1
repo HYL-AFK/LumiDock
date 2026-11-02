@@ -88,7 +88,7 @@ if ($sdkconfig -match '(?m)^CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y\r?$' -or
     @{ Content = $ui; Pattern = 'xTaskCreatePinnedToCore\(ui_task, "ui_service", 8192, NULL, 2, &s_task, 1\)'; Message = 'UI task must stay on core 1 below voice processing priority.' },
     @{ Content = $voice; Pattern = 'voice_session_task,\s+"voice_session",\s+6144,\s+NULL,\s+3,\s+&s_session_task,\s+0,\s+MALLOC_CAP_SPIRAM \| MALLOC_CAP_8BIT'; Message = 'The XiaoZhi session task must use a PSRAM stack.' },
     @{ Content = $manager; Pattern = 'xTaskCreatePinnedToCore\(audio_startup_task, "audio_startup", 4096, NULL, 2,\s+NULL, 0\)'; Message = 'The audio startup task must retain its confirmed internal stack while ESP-SR loads Flash models.' },
-    @{ Content = $manager; Pattern = 'xTaskCreatePinnedToCoreWithCaps\(snapshot_bridge_task, "snapshot_bridge", 3072, NULL, 2, NULL, 1,\s+MALLOC_CAP_SPIRAM \| MALLOC_CAP_8BIT\)'; Message = 'Service polling must stay on core 1 below voice processing priority.' }
+    @{ Content = $manager; Pattern = 'xTaskCreatePinnedToCoreWithCaps\(snapshot_bridge_task, "snapshot_bridge", 5120, NULL, 2, NULL, 1,\s+MALLOC_CAP_SPIRAM \| MALLOC_CAP_8BIT\)'; Message = 'Service polling must stay on core 1 below voice processing priority.' }
 ) | ForEach-Object {
     $matched = $_.Content -match $_.Pattern
     if (($_.Negate -and $matched) -or (-not $_.Negate -and -not $matched)) { throw $_.Message }

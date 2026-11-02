@@ -29,6 +29,7 @@ idf_component_register(
         "Dri/ws2812_driver.c"
         "Dri/onboard_led_driver.c"
         "Dri/i2s_audio_driver.c"
+        "Dri/ds3231.c"
         "Dri/button_driver.c"
         "Dri/ntc_sensor.c"
         "Dri/fan_control.c"
@@ -49,6 +50,7 @@ idf_component_register(
         "COM/device_data.c"
         "COM/location_snapshot.c"
         "COM/runtime_event_log.c"
+        "COM/fault_registry.c"
         "COM/time_snapshot.c"
         "COM/weather_snapshot.c"
         "Dri/wifi_manager.c"
@@ -56,6 +58,7 @@ idf_component_register(
         "MID/network/ble_provision.c"
         "MID/network/blufi_security.c"
         "APP/app_time.c"
+        "APP/app_rtc.c"
         "APP/app_weather.c"
     EMBED_FILES
         "assets/ui/main_scene.rgb565"

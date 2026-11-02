@@ -11,6 +11,7 @@
 
 #include "mid_snapshot.h"
 #include "board_pins.h"
+#include "fault_registry.h"
 #include "watchdog_service.h"
 #include "ws2812_driver.h"
 #include "onboard_led_driver.h"
@@ -32,6 +33,8 @@ typedef enum {
     STATUS_LED_WARNING,
     STATUS_LED_CHARGING,
     STATUS_LED_SUCCESS,
+    /* 等级3 故障：只在完全空闲时露一点，不打扰任何交互。 */
+    STATUS_LED_DIAGNOSTIC,
     STATUS_LED_NORMAL,
 } status_led_state_t;
 
@@ -71,7 +74,17 @@ static uint8_t color_scale(uint8_t base, uint8_t alpha)
 
 static status_led_state_t choose_state(const lumidock_snapshot_t *snapshot, int64_t now_us)
 {
-    if (s_critical_fault) return STATUS_LED_FAULT;
+    /* 故障等级决定灯效强度，三个等级的反馈全部落在这一条链上：
+     *   等级1  红急闪，压过一切，包括语音和开机动画
+     *   等级2  橙双闪，但让位给语音这类用户交互——通话到一半去腾灯效只会
+     *          让人觉得设备抽风
+     *   等级3  只在完全空闲时点亮最后一颗灯珠
+     *
+     * 等级判定读的是 fault_registry，和 UI、MCP 查询用的是同一份数据，
+     * 不会出现“界面说没事但灯在闪”这种对不上的情况。 */
+    const fault_level_t fault_level = fault_registry_highest_level();
+
+    if (s_critical_fault || fault_level == FAULT_LEVEL_1) return STATUS_LED_FAULT;
     if (s_boot_animation_active) return STATUS_LED_BOOT_ANIMATION;
     if (now_us < s_success_until_us) return STATUS_LED_SUCCESS;
     if (snapshot->voice_activation.activation_code[0] != '\0') return STATUS_LED_ACTIVATION;
@@ -80,6 +93,9 @@ static status_led_state_t choose_state(const lumidock_snapshot_t *snapshot, int6
         snapshot->voice_session.state != VOICE_UI_IDLE) {
         return STATUS_LED_VOICE;
     }
+    if (fault_level == FAULT_LEVEL_2) return STATUS_LED_WARNING;
+    /* 兜底：故障码还没来得及挂上时，仍然按快照里的探测失败次数点橙灯。
+     * 这条会在 P203 接入稳定后删掉，现阶段留着免得灯效倒退。 */
     if (snapshot->wifi.connected && !snapshot->wifi.internet_online &&
         (snapshot->wifi.internet_probe_failures > 0U || snapshot->voice_activation.request_failed)) {
         return STATUS_LED_WARNING;
@@ -91,6 +107,7 @@ static status_led_state_t choose_state(const lumidock_snapshot_t *snapshot, int6
     if (snapshot->bms.online && snapshot->bms.parsed_valid && snapshot->bms.current_ma > 500) {
         return STATUS_LED_CHARGING;
     }
+    if (fault_level == FAULT_LEVEL_3) return STATUS_LED_DIAGNOSTIC;
     return STATUS_LED_NORMAL;
 }
 
@@ -178,6 +195,14 @@ static void render_state(status_led_state_t state, const lumidock_snapshot_t *sn
     case STATUS_LED_SUCCESS:
         render_success_strip(now_us);
         break;
+    case STATUS_LED_DIAGNOSTIC: {
+        /* 只用最后一颗灯珠，暗琥珀慢呼吸。等级3 是“记录下来就好”的故障，
+         * 整条灯带一起亮会让用户以为出了大事。 */
+        const uint8_t k = breathe(72U, now_us);
+        set_pixel((uint8_t)(LUMIDOCK_WS2812_LED_COUNT - 1U),
+                  (status_led_color_t){color_scale(200U, k), color_scale(120U, k), 0U});
+        break;
+    }
     case STATUS_LED_NORMAL:
     default: {
         const uint8_t k = breathe(36U, now_us);
@@ -190,8 +215,10 @@ static void render_state(status_led_state_t state, const lumidock_snapshot_t *sn
 }
 
 /* Map the shared status selector onto the single on-board RGB LED:
- * boot -> blue breathe, fault -> red double-blink, everything else (working /
- * provisioning / voice / charging...) -> solid green. */
+ * boot -> blue breathe, level1 fault -> red double-blink, level2 -> amber slow
+ * blink, everything else (working / provisioning / voice / charging / level3)
+ * -> solid green. Level 3 deliberately keeps the normal green: it is a
+ * diagnostic record, not something worth pulling the user's eye. */
 static void render_onboard_led(status_led_state_t state, int64_t now_us)
 {
     switch (state) {
@@ -204,6 +231,14 @@ static void render_onboard_led(status_led_state_t state, int64_t now_us)
     case STATUS_LED_FAULT:
         if (double_blink(now_us)) {
             (void)onboard_led_driver_set_rgb(255U, 30U, 30U);
+        } else {
+            onboard_led_driver_clear();
+        }
+        break;
+    case STATUS_LED_WARNING:
+        /* 2 秒周期的短脉冲，比等级1 的红双闪慢一倍，余光里能分辨。 */
+        if (((now_us / 1000LL) % 2000LL) < 250LL) {
+            (void)onboard_led_driver_set_rgb(255U, 140U, 0U);
         } else {
             onboard_led_driver_clear();
         }
@@ -264,6 +299,13 @@ esp_err_t status_led_service_init(void)
 void status_led_service_set_critical_fault(bool active)
 {
     s_critical_fault = active;
+    /* 同步进故障寄存器，让等级判定、灯效、UI 和 MCP 查询都读同一份数据。
+     * 这个入口目前只被 watchdog_service 用，语义就是 P101。 */
+    if (active) {
+        (void)fault_registry_raise(FAULT_P101_WATCHDOG_LATCHED, 0);
+    } else {
+        (void)fault_registry_clear(FAULT_P101_WATCHDOG_LATCHED);
+    }
 }
 
 esp_err_t status_led_service_set_user_enabled(bool enabled)

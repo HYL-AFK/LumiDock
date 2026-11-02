@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "board_pins.h"
+#include "fault_registry.h"
 #include "stc_protocol.h"
 #include "watchdog_service.h"
 
@@ -153,6 +154,9 @@ static void parse_frames(void)
                                                     STC_PROTOCOL_FRAME_LEN_RESPONSE,
                                                     &response);
         if (err == ESP_OK) {
+            /* 只在掉线→在线翻转时撤码，不是每帧都拿一趟锁。STC 帧来得
+             * 比 100 ms 快，不加这个判断会把互斥量喂成热点。 */
+            if (!s_snapshot.online) (void)fault_registry_clear(FAULT_P208_STC_OFFLINE);
             s_snapshot.online = true;
             s_snapshot.parsed_valid = true;
             s_snapshot.timestamp_ms = response.timestamp_ms;
@@ -243,6 +247,9 @@ static void stc_task(void *arg)
             s_snapshot.parsed_valid = false;
             s_snapshot.timeout_count++;
             last_valid_us = esp_timer_get_time();
+            /* 快充管理离线降级处理：充电台得回到物理限流，但语音、天气、
+             * 电台这些都不受影响，没必要重启。 */
+            (void)fault_registry_raise(FAULT_P208_STC_OFFLINE, (int32_t)s_snapshot.timeout_count);
             publish();
         }
     }

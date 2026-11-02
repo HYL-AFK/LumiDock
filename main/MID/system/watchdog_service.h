@@ -23,3 +23,14 @@ void watchdog_service_set_current_task_blocking(bool blocking);
 
 /* Temporarily suppresses stale-heartbeat reporting during controlled startup/shutdown. */
 void watchdog_service_set_business_suspended(bool suspended);
+
+/* Asks the supervisor to stop feeding the hardware watchdog so the device
+ * resets itself. Used by the fault registry when a level-1 fault (core
+ * capability lost) has stayed mounted past its grace window.
+ *
+ * Deliberately routed through the same latch as a stale heartbeat instead of
+ * calling esp_restart() directly: the supervisor stops feeding only after it
+ * has taken the slot lock, so the panic path still runs with the rest of the
+ * system intact and the reason is visible in the log that precedes the reset.
+ * Returns ESP_ERR_INVALID_STATE before init. */
+esp_err_t watchdog_service_request_reset(const char *reason);

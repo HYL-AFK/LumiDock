@@ -12,6 +12,7 @@
 
 #include "board_pins.h"
 #include "bms_protocol.h"
+#include "fault_registry.h"
 #include "mid_snapshot.h"
 #include "watchdog_service.h"
 
@@ -21,6 +22,11 @@
 #define BMS_FRAME_BUFFER_SIZE (BMS_PROTOCOL_MAX_FRAME_LEN * 2)
 #define BMS_REQUEST_INTERVAL_MS 1000
 #define BMS_TIMEOUT_MS 5000
+
+/* 低电量告警阈值。20% 以下是用户该找充电器的时候，25% 以上才撤告警——
+ * 两者之间的 5% 是滞回带，防止 SOC 在阈值附近来回跳时灯效跟着闪。 */
+#define BMS_LOW_BATTERY_PERCENT 20U
+#define BMS_LOW_BATTERY_CLEAR_PERCENT 25U
 
 static const char *TAG = "bms_service";
 static bms_info_t s_info;
@@ -60,6 +66,20 @@ static void publish_snapshot(void)
         .crc_error_count = s_info.crc_error_count,
     };
     mid_snapshot_set_bms(&snapshot);
+
+    /* 低电量告警只在一份可信的解析结果上判。BMS 掉线时 parsed_valid 是
+     * false，此时 soc_percent 还停在掉线前最后的值，拿它判告警会在电池
+     * 通信断掉之后一直误报。
+     *
+     * 带 5% 的滞回：充到 25% 以上才算退出告警。在 20% 边上反复抖动时
+     * 灯效会一闪一闪，看起来像接触不良。 */
+    if (snapshot.parsed_valid) {
+        if (snapshot.soc_percent <= BMS_LOW_BATTERY_PERCENT) {
+            (void)fault_registry_raise(FAULT_P201_LOW_BATTERY, (int32_t)snapshot.soc_percent);
+        } else if (snapshot.soc_percent >= BMS_LOW_BATTERY_CLEAR_PERCENT) {
+            (void)fault_registry_clear(FAULT_P201_LOW_BATTERY);
+        }
+    }
 }
 
 static esp_err_t bms_uart_init(void)
@@ -277,6 +297,9 @@ static void bms_task(void *arg)
                                      pdMS_TO_TICKS(100));
         if (length > 0) {
             last_rx = xTaskGetTickCount();
+            /* 只在掉线→在线翻转时撤码，不是每收到一帧都去拿一次锁。
+             * BMS 帧来得比 100 ms 快，不加这个判断会把互斥量喂成热点。 */
+            if (!s_info.online) (void)fault_registry_clear(FAULT_P205_BMS_OFFLINE);
             s_info.online = true;
             s_info.last_rx_ms = (uint32_t)pdTICKS_TO_MS(last_rx);
             append_rx_bytes(chunk, (size_t)length);
@@ -290,6 +313,9 @@ static void bms_task(void *arg)
             s_frame_len = 0;
             last_rx = xTaskGetTickCount();
             ESP_LOGW(TAG, "BMS receive timeout count=%" PRIu32, s_info.timeout_count);
+            /* 挂降级码而不是致命码：电池通信断了就没法做充电策略，但设备
+             * 其他功能照旧能用。等级2 允许长期挂着，这正是它的用途。 */
+            (void)fault_registry_raise(FAULT_P205_BMS_OFFLINE, (int32_t)s_info.timeout_count);
             publish_snapshot();
         }
     }

@@ -19,6 +19,11 @@ typedef enum {
     RUNTIME_EVENT_BLE_TIMEOUT,
     RUNTIME_EVENT_BLE_PROVISION_ACCEPTED,
     RUNTIME_EVENT_WATCHDOG_FAILURE,
+    /* 故障寄存器的挂载/恢复。event 值 value1 存 16 位的 P 码，
+     * value2 存 fault_registry_raise() 带的现场数值。
+     * 这两个事件是流水，而当前还挂着什么以 fault_registry 的表为准。 */
+    RUNTIME_EVENT_FAULT_RAISED,
+    RUNTIME_EVENT_FAULT_CLEARED,
 } runtime_event_type_t;
 
 typedef struct __attribute__((packed)) {

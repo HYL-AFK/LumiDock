@@ -19,6 +19,7 @@
 #include "charge_strategy.h"
 #include "device_data.h"
 #include "device_settings_service.h"
+#include "fault_registry.h"
 #include "hourly_chime_service.h"
 #include "i2s_audio_driver.h"
 #include "mid_snapshot.h"
@@ -296,7 +297,15 @@ esp_err_t app_manager_start(void)
         runtime_event_log_dump_recent(16U);
     }
     if ((err = mid_snapshot_init()) != ESP_OK) return err;
-    if ((err = watchdog_service_init()) != ESP_OK) {
+    /* 故障表要早于一切可能报故障的服务：看门狗、UI、网络都会往里挂码，
+     * 而 NVS 里的历史挂载状态必须在第一个 raise 之前恢复完，否则会被
+     * 当成“首次出现”把 first_seen 重置掉。 */
+    if ((err = fault_registry_init()) != ESP_OK) {
+        ESP_LOGW(TAG, "fault registry init: %s", esp_err_to_name(err));
+    } else {
+        fault_registry_dump();
+    }
+if ((err = watchdog_service_init()) != ESP_OK) {
         ESP_LOGW(TAG, "watchdog init: %s", esp_err_to_name(err));
     }
     /* The boot animation must be running before optional peripherals or
@@ -381,7 +390,14 @@ esp_err_t app_manager_start(void)
         wifi_service_notify_services_ready();
     }
 
-    if (xTaskCreatePinnedToCoreWithCaps(snapshot_bridge_task, "snapshot_bridge", 3072, NULL, 2, NULL, 1,
+    /* 5120 而不是 3072：这个拍子上挂着 time_service_poll() → app_rtc_poll()，
+     * 后者会下 I2C 事务（i2c_master_probe / i2c_master_transmit_receive）。实测
+     * 3072 下只要 DS3231 没接、重试走到第二十秒左右，就会在这里报
+     * "A stack overflow in task snapshot_bridge" 并重启。
+     *
+     * RTC 现在用 LUMIDOCK_DS3231_ENABLE 关着（模块还没接），但栈先留好：
+     * 栈在 PSRAM，多出的 2 KB 不占内部 RAM，免得启用时再撞一次。 */
+    if (xTaskCreatePinnedToCoreWithCaps(snapshot_bridge_task, "snapshot_bridge", 5120, NULL, 2, NULL, 1,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
