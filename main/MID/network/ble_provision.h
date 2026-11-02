@@ -3,8 +3,11 @@
 /*
  * BLE provisioning interface based on standard BluFi.
  *
- * The BLE advertising/scan name is "ESPARK-XXXXXX", where XXXXXX
- * is the last six hexadecimal digits of the Bluetooth MAC address.
+ * The BLE advertising/scan name is "ESP32S3_XXXXXX", where XXXXXX is the last six
+ * hexadecimal digits of the Wi-Fi STA MAC address. It is the same string the
+ * SoftAP advertises, so a phone sees one name per device no matter which radio it
+ * scans. See COM/device_identity.h for why the STA MAC and not the Bluetooth one.
+ *
  * Wi-Fi credentials are provisioned through the standard BluFi profile,
  * not the old custom FFF0/FFF1/FFF2 command protocol.
  */

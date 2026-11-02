@@ -32,10 +32,14 @@ typedef struct {
     char last_wifi_ssid[WIFI_SSID_MAX_LEN + 1];
     bool has_last_wifi_ssid;
 
-    /* User display name. BLE advertising name stays fixed as ESPARK-XXXXXX. */
+    /* 已废弃，仅保留字段以维持 NVS 布局。
+     *
+     * 蓝牙广播名现在和热点名共用 device_identity 按 MAC 生成的那个字符串，不再
+     * 读这里。字段留着只是因为不值得为一个没人读的键去动 NVS 结构。 */
     char ble_name[BLE_NAME_MAX_LEN + 1];
 
-    /* SoftAP name and password. Passwords shorter than 8 are treated as open AP by ESP-IDF. */
+    /* SoftAP 密码。名字同理已废弃：热点名由 device_identity 生成，不再读这里，
+     * 老设备 NVS 里存着的 "ESP32S3-SETUP" 会被忽略。密码仍然有效。 */
     char ap_name[AP_NAME_MAX_LEN + 1];
     char ap_pass[AP_PASS_MAX_LEN + 1];
 

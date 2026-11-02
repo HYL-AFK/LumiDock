@@ -48,6 +48,7 @@ idf_component_register(
         "MID/system/charge_strategy.c"
         "COM/app_config.c"
         "COM/device_data.c"
+        "COM/device_identity.c"
         "COM/location_snapshot.c"
         "COM/runtime_event_log.c"
         "COM/fault_registry.c"

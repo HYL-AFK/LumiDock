@@ -24,9 +24,9 @@ static esp_err_t erase_optional_key(nvs_handle_t handle, const char *key)
  * 当前使用的 key：
  * - ssid0/pass0 ... ssid4/pass4：最多 5 组 STA Wi-Fi 配置。
  * - wifi_count：已保存 Wi-Fi 数量。
- * - ble_name：用户显示名，不再直接作为 BLE 广播名。
- * - ap_name：设备 SoftAP 热点名称。
- * - ap_pass：设备 SoftAP 热点密码。
+ * - ble_name：已废弃。蓝牙广播名改由 device_identity 按 MAC 生成，本键不再被读取。
+ * - ap_name：已废弃。热点名同样由 device_identity 生成，老设备里存的值会被忽略。
+ * - ap_pass：设备 SoftAP 热点密码，仍然有效。
  *
  * 维护原则：
  * - 其他模块不要直接读写这些 key。
@@ -58,8 +58,9 @@ void app_config_set_default(app_config_t *cfg)
     }
 
     memset(cfg, 0, sizeof(*cfg));
-    strlcpy(cfg->ble_name, "ESP32S3-BLE", sizeof(cfg->ble_name));
-    strlcpy(cfg->ap_name, "ESP32S3-SETUP", sizeof(cfg->ap_name));
+    /* ble_name / ap_name 不给默认值了：名字改由 device_identity 按 MAC 生成，这两个
+       字段没有任何读取方。memset 已经把它们清零，再塞一个 "ESP32S3-SETUP" 进去，
+       只会让下一个读代码的人以为它还生效。 */
     strlcpy(cfg->ap_pass, "12345678", sizeof(cfg->ap_pass));
     cfg->has_ap_pass = true;
 }

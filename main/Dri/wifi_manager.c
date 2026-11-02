@@ -23,6 +23,7 @@
 
 #include "app_log.h"
 #include "device_data.h"
+#include "device_identity.h"
 #include "fault_registry.h"
 #include "runtime_event_log.h"
 #include "internet_health_policy.h"
@@ -35,9 +36,9 @@
  * Wi-Fi APSTA 管理模块。
  *
  * 启动时工作在 WIFI_MODE_APSTA：
- * - AP 侧：先提供设备热点（默认 ESP32S3-SETUP / 12345678），方便手机直连；
- *   一旦 STA 拿到 IP，热点就会关掉，降到 WIFI_MODE_STA。重新配网走 BLE，
- *   不靠这个热点长期存在。
+ * - AP 侧：先提供设备热点（名称由 device_identity 按 MAC 生成，密码 12345678），
+ *   方便手机直连；一旦 STA 拿到 IP，热点就会关掉，降到 WIFI_MODE_STA。重新配网
+ *   走 BLE，不靠这个热点长期存在。热点名和蓝牙广播名是同一个字符串。
  * - STA 侧：根据 NVS 中保存的 Wi-Fi 列表，扫描环境并连接信号最强的可用 SSID。
  *   信道范围是 1~13（country "CN"），不是驱动默认的 1~11。
  *
@@ -123,7 +124,10 @@ static esp_netif_t *s_ap_netif = NULL;
 static char s_sta_ip_str[16] = "0.0.0.0";
 static char s_ap_ip_str[16] = "0.0.0.0";
 static char s_sta_ssid[WIFI_SSID_MAX_LEN + 1] = "";
-static char s_ap_name[AP_NAME_MAX_LEN + 1] = "ESP32S3-SETUP";
+/* 热点名不在这里给初值：它由 device_identity 按 MAC 算出来，在
+   wifi_manager_init() 里填。留空而不是留一个看着像真的默认名，是为了让"init 没
+   跑就用到它"这种顺序错误一眼看得出来。 */
+static char s_ap_name[AP_NAME_MAX_LEN + 1] = "";
 static char s_ap_pass[AP_PASS_MAX_LEN + 1] = "12345678";
 static int s_sta_rssi = -127;
 static int s_sta_channel = 0;
@@ -1128,7 +1132,7 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
      * Wi-Fi 初始化只执行一次。
      *
      * 初始化顺序：
-     * 1. 从配置恢复 AP 名称/密码。
+     * 1. 按 MAC 生成设备名（热点名与蓝牙广播名共用）；密码仍从配置恢复。
      * 2. 初始化 esp-netif 和默认事件循环。
      * 3. 创建 STA/AP 两个 netif。
      * 4. 注册 Wi-Fi/IP 事件回调。
@@ -1139,10 +1143,15 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
         return ESP_OK;
     }
 
-    if (cfg != NULL && cfg->has_ap_name && cfg->ap_name[0] != '\0')
-    {
-        strlcpy(s_ap_name, cfg->ap_name, sizeof(s_ap_name));
-    }
+    /* 热点名固定按 MAC 生成，不再读 cfg->ap_name。
+     *
+     * NVS 里多半还躺着上一版存下的 "ESP32S3-SETUP"（has_ap_name = true）。要是
+     * 照读回来，升级过的老机器会继续顶着一个不带 MAC 的旧名字，和新出厂的机器又
+     * 分成两批——这正是这次要消灭的那种混乱。
+     *
+     * 字段本身留在 app_config 里不动，只是不再参与命名。删字段要动 NVS 结构，
+     * 为一个不再使用的键付这个代价不值。 */
+    strlcpy(s_ap_name, device_identity_name(), sizeof(s_ap_name));
     if (cfg != NULL && cfg->has_ap_pass && cfg->ap_pass[0] != '\0')
     {
         strlcpy(s_ap_pass, cfg->ap_pass, sizeof(s_ap_pass));
@@ -1172,6 +1181,34 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
     if (s_sta_netif == NULL || s_ap_netif == NULL) {
         APP_LOGE(TAG, "create Wi-Fi netif failed");
         return ESP_ERR_NO_MEM;
+    }
+
+    /* DHCP 主机名 —— 路由器后台"在线设备"列表里显示的那一栏就是它。
+     *
+     * 不设的时候 esp_netif 用 sdkconfig 的 CONFIG_LWIP_LOCAL_HOSTNAME，默认值就是
+     * "espressif"。一台路由器底下挂几台 LumiDock，后台里全是同一个名字，想限速
+     * 哪台、想把哪台踢下线都得先猜 MAC。它和蓝牙广播名、SoftAP 名取的是同一个
+     * device_identity_name()，三个地方指回同一台机器。
+     *
+     * 必须在这一步设：DHCP 一开始协商，Option 12 里的主机名就发出去了，之后再改
+     * 只影响下一次租约——而设备一旦连上通常一直挂着，不一定会重新拿地址。 */
+    const char *hostname = device_identity_name();
+    esp_err_t host_err = esp_netif_set_hostname(s_sta_netif, hostname);
+    if (host_err != ESP_OK) {
+        /* 名字没设上不该挡住上网，记一笔继续。 */
+        APP_LOG_ERR(TAG, host_err, "set STA DHCP hostname failed");
+    }
+    /* AP 侧也设一份：手机连上热点后，有些系统会拿它的主机名当设备名显示。 */
+    host_err = esp_netif_set_hostname(s_ap_netif, hostname);
+    if (host_err != ESP_OK) {
+        APP_LOG_ERR(TAG, host_err, "set AP hostname failed");
+    }
+    /* 回读一次。set_hostname 只写 netif 字段，回读能证明它确实落到了会被 DHCP
+     * 拿去用的那个位置，而不是被后面的初始化覆盖回去。 */
+    const char *hostname_applied = NULL;
+    if (esp_netif_get_hostname(s_sta_netif, &hostname_applied) == ESP_OK &&
+        hostname_applied != NULL) {
+        APP_LOGI(TAG, "DHCP hostname: %s", hostname_applied);
     }
 
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -1268,53 +1305,16 @@ esp_err_t wifi_manager_init(const app_config_t *cfg)
     return ESP_OK;
 }
 /*
- * 动态修改 AP 名称。
- * 注意：如果手机已经连着旧 AP，改名后可能需要手机重新扫描/重连。
+ * 改名接口已经删掉，热点名固定来自 device_identity。
+ *
+ * 以前这里能把热点改成任意名字，BluFi 的 SoftAP 字段直接通到它。领导要的是
+ * "一排机器摆在一起也分得清"，而可改的名字迟早会被改成重名的两台，到时候除了
+ * 翻 MAC 没有别的办法认机器——名字里带着 MAC 后六位，改了只会更乱。
+ *
+ * 不保留一个"接受参数但什么都不做"的空实现：那种函数会让下一个调用它的人以为
+ * 设置已经生效，等到现场扫不到那个名字才回头查。删掉它，谁还想改名，编译就报错，
+ * 顺着报错能找到这段说明。
  */
-void wifi_manager_set_ap_name(const char *ap_name)
-{
-
-    if (ap_name == NULL || ap_name[0] == '\0')
-    {
-        return;
-    }
-
-    if (strncmp(s_ap_name, ap_name, sizeof(s_ap_name)) == 0)
-    {
-        return;
-    }
-
-    char previous_name[sizeof(s_ap_name)];
-    strlcpy(previous_name, s_ap_name, sizeof(previous_name));
-    strlcpy(s_ap_name, ap_name, sizeof(s_ap_name));
-    wifi_config_t ap_cfg = {0};
-    build_ap_config(&ap_cfg);
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    if (err != ESP_OK) {
-        strlcpy(s_ap_name, previous_name, sizeof(s_ap_name));
-        APP_LOG_ERR(TAG, err, "set AP name failed");
-        return;
-    }
-    update_ap_channel_from_config(&ap_cfg);
-
-    if (!s_wifi_running)
-    {
-        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-        if (err != ESP_OK) {
-            APP_LOG_ERR(TAG, err, "set APSTA mode while applying AP name failed");
-            return;
-        }
-        err = esp_wifi_start();
-        if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
-            APP_LOG_ERR(TAG, err, "start Wi-Fi while applying AP name failed");
-            return;
-        }
-        s_wifi_running = true;
-    }
-
-    update_ap_ip_cache();
-}
-
 void wifi_manager_set_ap_password(const char *ap_pass)
 {
     /*

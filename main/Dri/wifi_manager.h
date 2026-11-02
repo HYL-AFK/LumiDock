@@ -72,8 +72,11 @@ void wifi_manager_enable_sta_reconnect(bool enable);
 /* 注册统一状态回调，供 BLE 广播/UI/云端服务联动刷新。 */
 void wifi_manager_set_status_cb(wifi_status_cb_t cb);
 
-/* 动态修改 SoftAP 名称和密码。密码长度小于 8 时不会被接受。 */
-void wifi_manager_set_ap_name(const char *ap_name);
+/* 动态修改 SoftAP 密码。密码长度小于 8 时不会被接受。
+ *
+ * 没有配套的 set_ap_name：热点名固定为 device_identity 生成的那个字符串，和蓝牙
+ * 广播名逐字符相同。可改的名字迟早会被两台机器改成同一个，那时柜台上就再没人分
+ * 得清谁是谁。 */
 void wifi_manager_set_ap_password(const char *ap_pass);
 
 /* 状态查询接口，主要给 BLE 广播状态位、App 查询和日志使用。 */

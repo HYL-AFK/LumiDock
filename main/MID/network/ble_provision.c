@@ -7,6 +7,7 @@
 
 #include "app_log.h"
 #include "blufi_security.h"
+#include "device_identity.h"
 #include "esp_blufi.h"
 #include "esp_blufi_api.h"
 #include "esp_bt.h"
@@ -35,7 +36,6 @@ static const char *TAG = "ble_provision";
 
 void ble_store_config_init(void);
 
-#define BLE_FIXED_ADV_NAME "ESPARK"
 #define BLUFI_SCAN_LIST_MAX_AP 20
 #define BLE_PROVISION_WINDOW_MS (5 * 60 * 1000)
 #define BLE_BOOT_WINDOW_MS (60 * 1000)
@@ -189,13 +189,17 @@ static void blufi_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+/* 广播名与 SoftAP 热点名取同一个字符串，都由 device_identity 从 STA MAC 生成。
+ *
+ * 两边以前各写各的：蓝牙是硬编码前缀 ESPARK 配自己那三字节 MAC，热点是一串不带
+ * MAC 的固定名。柜台上一排机器同时上电时，手机扫描列表里看着像两批不同的产品，
+ * 挑一台配网得靠猜。现在两边逐字符相同，看到哪个就配哪个。
+ *
+ * 不再从 ESP_MAC_BT 读地址：蓝牙 MAC 是 base + 2，而热点那边对不上，各读各的
+ * 反而会让后缀差两位。详见 device_identity.h。 */
 static void make_adv_name(void)
 {
-    uint8_t mac[6];
-
-    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_BT));
-    snprintf(s_adv_name, sizeof(s_adv_name), "%s-%02X%02X%02X",
-             BLE_FIXED_ADV_NAME, mac[3], mac[4], mac[5]);
+    strlcpy(s_adv_name, device_identity_name(), sizeof(s_adv_name));
 }
 
 static int blufi_gap_event(struct ble_gap_event *event, void *arg)
@@ -585,20 +589,17 @@ static void blufi_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_
         break;
 
     case ESP_BLUFI_EVENT_RECV_SOFTAP_SSID: {
-        if (param->softap_ssid.ssid_len <= 0 || param->softap_ssid.ssid_len > AP_NAME_MAX_LEN) {
-            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
-            break;
-        }
-        memcpy(s_cfg.ap_name, param->softap_ssid.ssid, (size_t)param->softap_ssid.ssid_len);
-        s_cfg.ap_name[param->softap_ssid.ssid_len] = '\0';
-        s_cfg.has_ap_name = true;
-        esp_err_t save_err = app_config_save(&s_cfg);
-        if (save_err != ESP_OK) {
-            APP_LOG_ERR(TAG, save_err, "save SoftAP SSID to NVS failed");
-            break;
-        }
-        wifi_manager_set_ap_name(s_cfg.ap_name);
-        APP_LOGI(TAG, "BluFi recv SoftAP SSID=%s", s_cfg.ap_name);
+        /* 热点名固定按 MAC 生成，这里不再受理 App 下发的名字。
+         *
+         * 领导的出发点是"一排机器摆在一起要分得清"，而允许改名恰恰会把这件事毁
+         * 掉——两台设备被改成同一个名字只是时间问题，真到那时候现场的人除了翻
+         * MAC 没有别的办法认机器。名字里本来就带着 MAC 后六位，改掉反而更认不出。
+         *
+         * 不回 DATA_FORMAT_ERROR：格式本身没有问题，只是这台设备不接受这个字段。
+         * 报错会让配网 App 卡在一个不影响使用的设置上，而热点名无论配不配都是对的。 */
+        APP_LOGW(TAG,
+                 "SoftAP SSID is fixed to %s, ignoring the requested name",
+                 device_identity_name());
         break;
     }
 
