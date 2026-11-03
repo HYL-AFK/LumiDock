@@ -28,6 +28,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
+#include "radio_stream_service.h"
 #include "runtime_event_log.h"
 #include "startup_gate.h"
 #include "wifi_manager.h"
@@ -253,6 +254,16 @@ static void blufi_start_advertising(void)
     adv_fields.uuids16 = (ble_uuid16_t[]) { BLE_UUID16_INIT(BLUFI_APP_UUID) };
     adv_fields.num_uuids16 = 1;
     adv_fields.uuids16_is_complete = 1;
+    /* 名字也进广播包本体，不能只留在 scan response 里。scan response 得等扫描方先
+     * 发 SCAN_REQ 才会回，被动扫描的一方永远收不到：Windows 的 BLE 扫描器在实测里
+     * 只报出地址、名字为空，手机上的调试助手同理，于是"改名字"这件事在最需要它的
+     * 地方——扫描列表——看不见。
+     *
+     * 空间够：flags(3) + tx_pwr(2) + 16 位 UUID(4) = 9 字节，名字固定 13 字符加上
+     * 头部 15 字节，合计 24，没超过 31 字节的上限。前缀是常量，长度不会失控。 */
+    adv_fields.name = (uint8_t *)s_adv_name;
+    adv_fields.name_len = strlen(s_adv_name);
+    adv_fields.name_is_complete = 1;
     rc = ble_gap_adv_set_fields(&adv_fields);
     if (rc != 0) {
         APP_LOGE(TAG, "BLE advertisement setup failed: rc=%d", rc);
@@ -269,8 +280,11 @@ static void blufi_start_advertising(void)
        写不出去”全部落在这 60 s 内，窗口结束后同样时长、同样码率的语音会话一次
        都没复现过。改成 1000~2000 ms 后射频占用从约 2% 降到 0.07%，手机扫描最多
        多等两秒就能看到设备，代价远低于一次唤醒对话被打断。 */
-    adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(1000);
-    adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(2000);
+    /* 1000~2000 ms 实测太慢：手机调试助手要盯着列表等好几秒，扫描动作稍短就什么
+       都看不到。收到 500~800 ms 折中——射频占用约 0.15%，仍比默认档 30~60 ms 的
+       2% 低一个数量级，同时手机扫两三秒就能刷出设备。 */
+    adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(500);
+    adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(800);
     int64_t remaining_ms = (s_window_deadline_us - esp_timer_get_time()) / 1000;
     if (remaining_ms <= 0) {
         ble_window_expire();
@@ -286,6 +300,20 @@ static void blufi_start_advertising(void)
 
     s_advertising = true;
     APP_LOGI(TAG, "BluFi advertising, name=%s", s_adv_name);
+    /* 调试通道和手机端都要靠这个地址直连，而广播名只有人眼看得到。ESP32-S3 的蓝牙
+       地址并不保证等于 STA MAC + 2（取决于 eFuse 的地址分配方案），所以以这里打出来
+       的为准，别照着 STA MAC 去推。 */
+    uint8_t addr[6] = {0};
+    int is_nrpa = 0;
+    int addr_rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, addr, &is_nrpa);
+    if (addr_rc != 0) {
+        addr_rc = ble_hs_id_copy_addr(BLE_ADDR_RANDOM, addr, &is_nrpa);
+    }
+    if (addr_rc == 0) {
+        /* NimBLE 的地址按小端存，倒序打印才是人读的 MAC 写法。 */
+        APP_LOGI(TAG, "BLE address %02X:%02X:%02X:%02X:%02X:%02X",
+                 addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+    }
 }
 
 static int softap_get_current_connection_number(void)
@@ -717,6 +745,150 @@ static esp_err_t blufi_controller_init(void)
     return ESP_FAIL;
 }
 
+/* ===== 电台调试通道 =====================================================
+ *
+ * BluFi 要先过 DH 协商再 AES 加密，手机上的蓝牙调试助手发的是裸 GATT 报文，连
+ * 握手那一步都过不去；BluFi 自带的 custom data 事件同样要求对端按它的帧格式组
+ * 包，只有专门写的 App 能用。所以在 BluFi 旁边再挂一个不打招呼的 service：一个
+ * 可写 characteristic，写进来什么就当命令解析，不握手、不组帧、不校验。
+ *
+ * UUID 取 0xFFE0/0xFFE1，是 HM-10、JDY 那类透传模块的默认值——多数调试助手把它
+ * 当预设条目，连上就能看见，不必手工敲一串 128 位 UUID。
+ *
+ * 边界：这个通道只能在下标上挪，命令最终调用的仍是 radio_stream_service 那几个
+ * 入口，和语音说"换一个台"走的是同一行代码。频道表写死在 radio_stream_service.c
+ * 里，这里既不收地址也不收台名，写错了最多回一条 ERR。 */
+#define DEBUG_SVC_UUID 0xFFE0
+#define DEBUG_CMD_UUID 0xFFE1
+
+static uint16_t s_debug_cmd_handle;
+
+static void debug_reply(uint16_t conn_handle, const char *text)
+{
+    if (s_debug_cmd_handle == 0) return;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(text, (uint16_t)strlen(text));
+    if (om == NULL) {
+        APP_LOGW(TAG, "debug reply dropped: no mbuf");
+        return;
+    }
+    /* 回执发不出去不算错：手机可能已经走了，或者对方没使能通知。切台动作本身已经
+       完成，调试通道不该因为回执失败去改变它的结果。 */
+    (void)ble_gatts_notify_custom(conn_handle, s_debug_cmd_handle, om);
+}
+
+static bool cmd_is(const char *cmd, const char *long_form, const char *short_form)
+{
+    if (strcmp(cmd, long_form) == 0) return true;
+    return short_form != NULL && strcmp(cmd, short_form) == 0;
+}
+
+static int debug_cmd_access(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)attr_handle;
+    (void)arg;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    char cmd[33];
+    uint16_t len = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, cmd, sizeof(cmd) - 1U, &len) != 0) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    cmd[len] = '\0';
+
+    /* 调试助手发文本时常带 \r\n，HEX 模式又可能补空格，统一削掉再比。 */
+    while (len > 0 && (cmd[len - 1U] == '\r' || cmd[len - 1U] == '\n' || cmd[len - 1U] == ' ')) {
+        cmd[--len] = '\0';
+    }
+    for (char *p = cmd; *p != '\0'; ++p) {
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    }
+    if (len == 0) return 0;
+
+    char reply[64];
+    esp_err_t err = ESP_OK;
+    if (cmd_is(cmd, "next", "n")) {
+        err = radio_stream_service_play_next();
+        snprintf(reply, sizeof(reply), "OK next %s", radio_stream_service_station_name());
+    } else if (cmd_is(cmd, "play", "p")) {
+        err = radio_stream_service_play_default();
+        snprintf(reply, sizeof(reply), "OK play %s", radio_stream_service_station_name());
+    } else if (cmd_is(cmd, "stop", "s")) {
+        err = radio_stream_service_stop();
+        snprintf(reply, sizeof(reply), "OK stop");
+    } else if (cmd_is(cmd, "pause", NULL)) {
+        err = radio_stream_service_pause();
+        snprintf(reply, sizeof(reply), "OK pause");
+    } else if (cmd_is(cmd, "resume", NULL)) {
+        err = radio_stream_service_resume();
+        snprintf(reply, sizeof(reply), "OK resume");
+    } else if (cmd_is(cmd, "status", "?")) {
+        /* 这一条是为了先确认"到底播没播"。电台还在联网、还没出声时 is_active()
+           就是假的，对着不出声的设备反复按切台，光看屏幕分辨不出是没切还是没连上。 */
+        snprintf(reply, sizeof(reply), "ST %s %s",
+                 radio_stream_service_station_name(),
+                 radio_stream_service_is_active() ? "playing" : "idle");
+    } else {
+        snprintf(reply, sizeof(reply), "ERR unknown \"%s\"", cmd);
+    }
+
+    if (err != ESP_OK) {
+        snprintf(reply, sizeof(reply), "ERR %s", esp_err_to_name(err));
+    }
+
+    APP_LOGI(TAG, "debug cmd \"%s\" -> %s", cmd, reply);
+    debug_reply(conn_handle, reply);
+    return 0;
+}
+
+static const struct ble_gatt_svc_def s_debug_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(DEBUG_SVC_UUID),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(DEBUG_CMD_UUID),
+                .access_cb = debug_cmd_access,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP |
+                         BLE_GATT_CHR_F_NOTIFY,
+            },
+            {0},
+        },
+    },
+    {0},
+};
+
+/* BluFi 原来的注册回调只打日志、不留状态，这里转一层只为顺手记下可写 characteristic
+   的 value handle——notify 要它，而它是运行时分配的，编不出来。 */
+static void blufi_gatt_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg)
+{
+    esp_blufi_gatt_svr_register_cb(ctxt, arg);
+
+    if (ctxt->op == BLE_GATT_REGISTER_OP_CHR && ctxt->chr.chr_def->uuid->type == BLE_UUID_TYPE_16 &&
+        BLE_UUID16(ctxt->chr.chr_def->uuid)->value == DEBUG_CMD_UUID) {
+        s_debug_cmd_handle = ctxt->chr.val_handle;
+    }
+}
+
+static int register_debug_gatt(void)
+{
+    int rc = ble_gatts_count_cfg(s_debug_svcs);
+    if (rc != 0) {
+        APP_LOGE(TAG, "ble_gatts_count_cfg(debug) failed: %d", rc);
+        return rc;
+    }
+    rc = ble_gatts_add_svcs(s_debug_svcs);
+    if (rc != 0) {
+        /* 注册失败不让配网跟着起不来：BluFi 才是开机路径上的必需品，调试通道只是
+           便利设施，它挂了顶多这次手机连上去看不到 0xFFE0。 */
+        APP_LOGE(TAG, "ble_gatts_add_svcs(debug) failed: %d", rc);
+    }
+    return rc;
+}
+
 static esp_err_t blufi_host_init(void)
 {
     esp_err_t err = blufi_controller_init();
@@ -732,7 +904,7 @@ static esp_err_t blufi_host_init(void)
 
     ble_hs_cfg.reset_cb = blufi_on_reset;
     ble_hs_cfg.sync_cb = blufi_on_sync;
-    ble_hs_cfg.gatts_register_cb = esp_blufi_gatt_svr_register_cb;
+    ble_hs_cfg.gatts_register_cb = blufi_gatt_register_cb;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_hs_cfg.sm_io_cap = 4;
     ble_hs_cfg.sm_sc = 0;
@@ -744,6 +916,11 @@ static esp_err_t blufi_host_init(void)
         APP_LOGE(TAG, "esp_blufi_gatt_svr_init failed: %d", rc);
         return ESP_FAIL;
     }
+
+    /* 必须排在 BluFi 之后：ble_gatts_count_cfg() 只在本 service 自己的表上累加句柄数，
+       先注册谁不影响结果，但把调试通道放后面能让它的句柄不打断 BluFi 原本的连续编号，
+       万一以后要对着日志核对 handle 更省事。 */
+    (void)register_debug_gatt();
 
     ble_store_config_init();
     esp_blufi_btc_init();

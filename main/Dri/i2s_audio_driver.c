@@ -177,6 +177,13 @@ static esp_err_t init_i2s_channels(void)
     if ((err = i2s_channel_init_std_mode(s_i2s_rx, &std_cfg)) != ESP_OK) goto failed;
     if ((err = i2s_channel_enable(s_i2s_tx)) != ESP_OK) goto failed;
     if ((err = i2s_channel_enable(s_i2s_rx)) != ESP_OK) goto failed;
+    /* 时钟和数据的边沿越陡，往模拟端串的高频成分越重，而这一路最终要送进一个
+       没有使能脚、常开着的功放。I2S 只有 16 kHz 帧率，MCLK 也才 4.096 MHz，最弱
+       驱动能力翻这些脚绰绰有余，所以用信号完整性的余量换掉一部分喇叭里的滋滋声。 */
+    (void)gpio_set_drive_capability(LUMIDOCK_I2S_MCLK_GPIO, GPIO_DRIVE_CAP_0);
+    (void)gpio_set_drive_capability(LUMIDOCK_I2S_BCLK_GPIO, GPIO_DRIVE_CAP_0);
+    (void)gpio_set_drive_capability(LUMIDOCK_I2S_LRCLK_GPIO, GPIO_DRIVE_CAP_0);
+    (void)gpio_set_drive_capability(LUMIDOCK_I2S_AMP_DIN_GPIO, GPIO_DRIVE_CAP_0);
     return ESP_OK;
 
 failed:
@@ -342,7 +349,14 @@ esp_err_t i2s_audio_driver_set_output_volume(float percent)
     const int result = esp_codec_dev_set_out_vol(s_codec, percent);
     if (result == ESP_CODEC_DEV_OK) {
         s_output_volume_percent = percent;
-        ESP_LOGI(TAG, "ES8311 output volume set: %.0f%%", (double)percent);
+        /* esp_codec_dev_set_out_vol() 不看底层写寄存器的返回值，I2C 写失败它也报
+           OK，所以上面这行"设置成功"证明不了音量真的落到芯片上。读回 ES8311 的
+           DAC 音量寄存器（0x32）才是实锤：0x00 对应 -95.5 dB，写失败则停在上电
+           默认值上，那时 0% 只是日志里的一个数字。 */
+        int dac_vol = -1;
+        const int read_rc = esp_codec_dev_read_reg(s_codec, 0x32, &dac_vol);
+        ESP_LOGI(TAG, "ES8311 output volume set: %.0f%% (DAC volume reg=0x%02X read_rc=%d)",
+                 (double)percent, (unsigned)dac_vol & 0xFFU, read_rc);
     }
     if (s_ctrl_lock != NULL) xSemaphoreGive(s_ctrl_lock);
     return result == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
